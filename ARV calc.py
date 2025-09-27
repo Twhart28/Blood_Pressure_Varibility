@@ -8,8 +8,9 @@ import math
 import tkinter as tk
 import tkinter.font as tkfont
 from dataclasses import dataclass, asdict
-from tkinter import ttk, filedialog, messagebox, simpledialog
 from statistics import mean as _pymean
+from tkinter import ttk, filedialog, messagebox, simpledialog
+from typing import Dict, Any, Optional, Tuple
 
 # ----------------------------- Core parsing & ARV -----------------------------
 
@@ -95,6 +96,20 @@ def load_series(filepath, layout_config=None):
     n_channels = len(channel_titles)
     series_map = {name: [] for name in channel_titles}
 
+    comment_key = None
+    if layout_config is not None:
+        try:
+            comment_column = getattr(layout_config, "comment_column", None)
+        except AttributeError:
+            comment_column = None
+        if comment_column:
+            try:
+                mapped_index = int(comment_column) - 2
+            except (TypeError, ValueError):
+                mapped_index = None
+            if mapped_index is not None and 0 <= mapped_index < len(channel_titles):
+                comment_key = channel_titles[mapped_index]
+
     # IMPORTANT: No artificial limit here — reads the ENTIRE dataset
     for ln in lines[data_start:]:
         row_txt = ln.rstrip("\r\n")
@@ -109,20 +124,12 @@ def load_series(filepath, layout_config=None):
 
         vals = row[1:1 + n_channels]
         for name, val in zip(channel_titles, vals):
-            series_map[name].append(safe_float(val, decimal=decimal))
+            if comment_key is not None and name == comment_key:
+                series_map[name].append(val)
+            else:
+                series_map[name].append(safe_float(val, decimal=decimal))
 
     return interval_s, series_map, channel_titles
-
-
-def select_window(series, interval_s, start_s, end_s):
-    n = len(series)
-    if n == 0:
-        return []
-    start_idx = 0 if start_s is None else max(0, int(start_s // interval_s))
-    end_idx = n if end_s is None else min(n, int(math.ceil(end_s / interval_s)))
-    if end_idx - start_idx <= 1:
-        return []
-    return series[start_idx:end_idx]
 
 
 def arv(values):
@@ -262,7 +269,7 @@ def compute_metrics(series, use_filter=False, filter_method="rolling", interval_
     }
 
 
-def compute_all_for_file(path, start_s, end_s, use_filter, filter_method,
+def compute_all_for_file(path, window_spec, use_filter, filter_method,
                          k_sd, window_s, k_mad, layout_config=None):
     interval_s, series_map, channel_titles = load_series(path, layout_config=layout_config)
 
@@ -286,9 +293,27 @@ def compute_all_for_file(path, start_s, end_s, use_filter, filter_method,
     dbp_key = resolve_column(getattr(layout_cfg, "dbp_column", 3), "DBP")
     map_key = resolve_column(getattr(layout_cfg, "map_column", 4), "MAP")
 
-    sbp = select_window(series_map[sbp_key], interval_s, start_s, end_s)
-    dbp = select_window(series_map[dbp_key], interval_s, start_s, end_s)
-    mapp = select_window(series_map[map_key], interval_s, start_s, end_s)
+    comment_series = None
+    comment_column = getattr(layout_cfg, "comment_column", None)
+    if comment_column:
+        try:
+            comment_key = resolve_column(comment_column, "Comment")
+        except KeyError:
+            comment_key = None
+        if comment_key and comment_key in series_map:
+            comment_series = series_map[comment_key]
+
+    n_samples = len(series_map[sbp_key])
+    start_idx, end_idx, start_time, end_time = resolve_window_spec(
+        window_spec,
+        interval_s,
+        n_samples,
+        comment_series,
+    )
+
+    sbp = series_map[sbp_key][start_idx:end_idx]
+    dbp = series_map[dbp_key][start_idx:end_idx]
+    mapp = series_map[map_key][start_idx:end_idx]
 
     ms_sbp = compute_metrics(
         sbp, use_filter, filter_method, interval_s, k_sd, window_s, k_mad
@@ -303,8 +328,8 @@ def compute_all_for_file(path, start_s, end_s, use_filter, filter_method,
     return {
         "file": os.path.basename(path),
         "interval_s": interval_s,
-        "start_s": 0.0 if start_s is None else float(start_s),
-        "end_s": None if end_s is None else float(end_s),
+        "start_s": float(start_time),
+        "end_s": None if end_time is None else float(end_time),
 
         # SBP
         "n_SBP_raw": ms_sbp["n_raw"],
@@ -357,6 +382,129 @@ def parse_time_any(s):
         return int(h) * 3600 + int(m) * 60 + float(sec)
     raise ValueError("Time format must be seconds, mm:ss, or hh:mm:ss")
 
+
+def _time_to_index(time_s: Optional[float], interval_s: float, n_samples: int, is_start: bool) -> int:
+    if time_s is None:
+        return 0 if is_start else n_samples
+    if interval_s <= 0:
+        return 0 if is_start else n_samples
+    if is_start:
+        idx = int(math.floor(time_s / interval_s))
+    else:
+        idx = int(math.ceil(time_s / interval_s))
+    if idx < 0:
+        return 0
+    if idx > n_samples:
+        return n_samples
+    return idx
+
+
+def _find_comment_index(comments, text: str, find_last: bool = False) -> Optional[int]:
+    if not comments:
+        return None
+    needle = text.lower()
+    indices = range(len(comments) - 1, -1, -1) if find_last else range(len(comments))
+    for idx in indices:
+        comment = comments[idx]
+        if comment is None:
+            continue
+        if needle in str(comment).lower():
+            return idx
+    return None
+
+
+def resolve_window_spec(
+    window_spec: Dict[str, Dict[str, Any]],
+    interval_s: float,
+    series_length: int,
+    comments,
+) -> Tuple[int, int, float, Optional[float]]:
+    total_time = max(0.0, interval_s * series_length)
+
+    def resolve_endpoint(spec: Dict[str, Any], is_start: bool) -> Tuple[int, float]:
+        mode = (spec.get("mode") or "none").lower()
+        default_idx = 0 if is_start else series_length
+        default_time = 0.0 if is_start else total_time
+
+        if mode in ("none",):
+            return default_idx, (0.0 if is_start else total_time)
+
+        if mode == "time":
+            time_val = spec.get("value")
+            if time_val is None:
+                return default_idx, (0.0 if is_start else total_time)
+            time_val = float(time_val)
+            if time_val < 0:
+                time_val = 0.0
+            if time_val > total_time:
+                time_val = total_time
+            idx = _time_to_index(time_val, interval_s, series_length, is_start)
+            return idx, time_val
+
+        if mode == "epoch":
+            epoch_val = spec.get("value")
+            if epoch_val is None:
+                return default_idx, (0.0 if is_start else total_time)
+            epoch_val = int(epoch_val)
+            if is_start:
+                idx = max(0, min(series_length, epoch_val - 1))
+            else:
+                idx = max(0, min(series_length, epoch_val))
+            time_val = idx * interval_s
+            if time_val > total_time:
+                time_val = total_time
+            return idx, time_val
+
+        if mode == "comment":
+            if not comments:
+                raise ValueError("No comment column is configured for comment-anchored windows.")
+            text = (spec.get("text") or "").strip()
+            if not text:
+                raise ValueError("Comment text is required for comment-anchored windows.")
+            offset = float(spec.get("offset") or 0.0)
+            idx = _find_comment_index(comments, text, find_last=not is_start)
+            if idx is None:
+                raise ValueError(f"Could not locate a comment containing '{text}'.")
+            time_val = idx * interval_s + offset
+            if time_val < 0:
+                time_val = 0.0
+            if time_val > total_time:
+                time_val = total_time
+            idx = _time_to_index(time_val, interval_s, series_length, is_start)
+            return idx, time_val
+
+        raise ValueError(f"Unsupported window mode '{mode}'.")
+
+    start_spec = window_spec.get("start", {}) if window_spec else {}
+    end_spec = window_spec.get("end", {}) if window_spec else {}
+    start_idx, start_time = resolve_endpoint(start_spec, True)
+    end_idx, end_time = resolve_endpoint(end_spec, False)
+
+    start_mode = (start_spec.get("mode") or "none").lower()
+    end_mode = (end_spec.get("mode") or "none").lower()
+    start_explicit = start_mode == "comment" or (
+        start_mode in ("time", "epoch") and start_spec.get("value") is not None
+    )
+    end_explicit = end_mode == "comment" or (
+        end_mode in ("time", "epoch") and end_spec.get("value") is not None
+    )
+
+    if end_idx < start_idx or (end_idx == start_idx and start_explicit and end_explicit):
+        raise ValueError("End boundary occurs before start boundary after resolving the window specification.")
+
+    if end_idx >= series_length and (end_spec.get("mode") in (None, "", "none") or end_spec.get("value") is None):
+        end_time = None
+    else:
+        if end_time is not None and end_time > total_time:
+            end_time = total_time
+
+    if start_time is None:
+        start_time = 0.0
+    if end_time is not None and end_time < 0:
+        end_time = 0.0
+
+    return start_idx, end_idx, start_time, end_time
+
 def fmt_float(x, digits=6):
     if x is None:
         return ""
@@ -380,6 +528,7 @@ class LayoutConfig:
     sbp_column: int = 2
     dbp_column: int = 3
     map_column: int = 4
+    comment_column: Optional[int] = None
 
     @classmethod
     def default(cls):
@@ -393,6 +542,7 @@ class LayoutConfig:
             sbp_column=2,
             dbp_column=3,
             map_column=4,
+            comment_column=None,
         )
 
     @classmethod
@@ -412,6 +562,9 @@ class LayoutConfig:
         sbp_column = parse_int(data.get("sbp_column"), 2)
         dbp_column = parse_int(data.get("dbp_column"), 3)
         map_column = parse_int(data.get("map_column"), 4)
+        comment_column = parse_int(data.get("comment_column"), None)
+        if comment_column is not None and comment_column < 2:
+            comment_column = None
 
         return cls(
             name=data.get("name", "Unnamed"),
@@ -423,6 +576,7 @@ class LayoutConfig:
             sbp_column=sbp_column,
             dbp_column=dbp_column,
             map_column=map_column,
+            comment_column=comment_column,
         )
 
     def to_dict(self):
@@ -450,6 +604,14 @@ class ARVApp(tk.Tk):
         # Preference state variables
         self.start_var = tk.StringVar(value="")
         self.end_var = tk.StringVar(value="")
+        self.start_mode_var = tk.StringVar(value="Time")
+        self.end_mode_var = tk.StringVar(value="Time")
+        self.start_epoch_var = tk.StringVar(value="")
+        self.end_epoch_var = tk.StringVar(value="")
+        self.start_comment_var = tk.StringVar(value="")
+        self.end_comment_var = tk.StringVar(value="")
+        self.start_offset_var = tk.StringVar(value="0")
+        self.end_offset_var = tk.StringVar(value="0")
         self.filter_on = tk.BooleanVar(value=False)
         self.filter_method = tk.StringVar(value="rolling")
         self.k_sd_var = tk.StringVar(value="3.0")
@@ -457,6 +619,9 @@ class ARVApp(tk.Tk):
         self.k_mad_var = tk.StringVar(value="4.0")
 
         self._preferences_window = None
+        self._preferences_snapshot = None
+        self._start_mode_frames = {}
+        self._end_mode_frames = {}
         self._layout_window = None
         self._layout_preview_tree = None
         self._layout_preview_row_tree = None
@@ -830,6 +995,22 @@ class ARVApp(tk.Tk):
         dbp_column = parse_column("dbp_column", "DBP", 2)
         map_column = parse_column("map_column", "MAP", 2)
 
+        comment_raw = self._layout_field_vars["comment_column"].get().strip()
+        comment_column = None
+        if comment_raw:
+            try:
+                comment_column = int(comment_raw)
+            except ValueError:
+                if quiet:
+                    return None
+                messagebox.showerror("Layout", "Comment column must be an integer or left blank.")
+                return None
+            if comment_column < 2:
+                if quiet:
+                    return None
+                messagebox.showerror("Layout", "Comment column must be 2 or greater.")
+                return None
+
         if None in (time_column, sbp_column, dbp_column, map_column):
             return None
 
@@ -843,6 +1024,7 @@ class ARVApp(tk.Tk):
             sbp_column=sbp_column,
             dbp_column=dbp_column,
             map_column=map_column,
+            comment_column=comment_column,
         )
 
     def _apply_layout_config_to_fields(self, layout):
@@ -858,6 +1040,10 @@ class ARVApp(tk.Tk):
         self._layout_field_vars["sbp_column"].set(str(layout.sbp_column))
         self._layout_field_vars["dbp_column"].set(str(layout.dbp_column))
         self._layout_field_vars["map_column"].set(str(layout.map_column))
+        if getattr(layout, "comment_column", None) is None:
+            self._layout_field_vars["comment_column"].set("")
+        else:
+            self._layout_field_vars["comment_column"].set(str(layout.comment_column))
 
     def _on_layout_config_selected(self, *_event):
         selected = self.layout_config_var.get()
@@ -949,7 +1135,8 @@ class ARVApp(tk.Tk):
         win.transient(self)
         win.resizable(False, False)
         self._preferences_window = win
-        win.protocol("WM_DELETE_WINDOW", lambda: self._close_preferences(win))
+        self._preferences_snapshot = self._export_preferences()
+        win.protocol("WM_DELETE_WINDOW", lambda: self._cancel_preferences(win))
 
         content = ttk.Frame(win, padding=16)
         content.pack(fill=tk.BOTH, expand=True)
@@ -957,11 +1144,105 @@ class ARVApp(tk.Tk):
         # Time window
         time_frame = ttk.LabelFrame(content, text="Time window")
         time_frame.pack(fill=tk.X, expand=True, pady=(0, 12))
+        time_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(time_frame, text="Start (s or mm:ss)").grid(row=0, column=0, sticky="w")
-        ttk.Entry(time_frame, textvariable=self.start_var, width=12).grid(row=0, column=1, padx=(8, 0))
-        ttk.Label(time_frame, text="End (s or mm:ss)").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(time_frame, textvariable=self.end_var, width=12).grid(row=1, column=1, padx=(8, 0), pady=(8, 0))
+        ttk.Label(
+            time_frame,
+            text="Choose how the analysis window boundaries should be resolved.",
+            foreground="gray",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        ttk.Label(time_frame, text="Start anchor").grid(row=1, column=0, sticky="w")
+        start_mode_combo = ttk.Combobox(
+            time_frame,
+            textvariable=self.start_mode_var,
+            values=["Time", "Epoch", "Comment", "None"],
+            state="readonly",
+            width=14,
+        )
+        start_mode_combo.grid(row=1, column=1, sticky="ew")
+
+        start_fields = ttk.Frame(time_frame)
+        start_fields.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 12))
+        start_fields.columnconfigure(0, weight=1)
+
+        start_time_frame = ttk.Frame(start_fields)
+        ttk.Label(start_time_frame, text="Time (s or mm:ss)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(start_time_frame, textvariable=self.start_var, width=14).grid(row=0, column=1, padx=(8, 0))
+
+        start_epoch_frame = ttk.Frame(start_fields)
+        ttk.Label(start_epoch_frame, text="Epoch # (1-based)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(start_epoch_frame, textvariable=self.start_epoch_var, width=14).grid(row=0, column=1, padx=(8, 0))
+
+        start_comment_frame = ttk.Frame(start_fields)
+        start_comment_frame.columnconfigure(1, weight=1)
+        ttk.Label(start_comment_frame, text="Comment contains").grid(row=0, column=0, sticky="w")
+        ttk.Entry(start_comment_frame, textvariable=self.start_comment_var).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        ttk.Label(start_comment_frame, text="Offset (s)").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(start_comment_frame, textvariable=self.start_offset_var, width=14).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+
+        self._start_mode_frames = {
+            "Time": start_time_frame,
+            "Epoch": start_epoch_frame,
+            "Comment": start_comment_frame,
+            "None": ttk.Frame(start_fields),
+        }
+        # Placeholder for "None" mode
+        self._start_mode_frames["None"].grid_columnconfigure(0, weight=1)
+
+        ttk.Label(time_frame, text="End anchor").grid(row=3, column=0, sticky="w")
+        end_mode_combo = ttk.Combobox(
+            time_frame,
+            textvariable=self.end_mode_var,
+            values=["Time", "Epoch", "Comment", "None"],
+            state="readonly",
+            width=14,
+        )
+        end_mode_combo.grid(row=3, column=1, sticky="ew")
+
+        end_fields = ttk.Frame(time_frame)
+        end_fields.grid(row=4, column=0, columnspan=2, sticky="ew")
+        end_fields.columnconfigure(0, weight=1)
+
+        end_time_frame = ttk.Frame(end_fields)
+        ttk.Label(end_time_frame, text="Time (s or mm:ss)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(end_time_frame, textvariable=self.end_var, width=14).grid(row=0, column=1, padx=(8, 0))
+
+        end_epoch_frame = ttk.Frame(end_fields)
+        ttk.Label(end_epoch_frame, text="Epoch # (1-based)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(end_epoch_frame, textvariable=self.end_epoch_var, width=14).grid(row=0, column=1, padx=(8, 0))
+
+        end_comment_frame = ttk.Frame(end_fields)
+        end_comment_frame.columnconfigure(1, weight=1)
+        ttk.Label(end_comment_frame, text="Comment contains").grid(row=0, column=0, sticky="w")
+        ttk.Entry(end_comment_frame, textvariable=self.end_comment_var).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        ttk.Label(end_comment_frame, text="Offset (s)").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(end_comment_frame, textvariable=self.end_offset_var, width=14).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+
+        self._end_mode_frames = {
+            "Time": end_time_frame,
+            "Epoch": end_epoch_frame,
+            "Comment": end_comment_frame,
+            "None": ttk.Frame(end_fields),
+        }
+        self._end_mode_frames["None"].grid_columnconfigure(0, weight=1)
+
+        ttk.Label(
+            time_frame,
+            text="Comment offsets accept positive seconds (after) and negative seconds (before) the comment.",
+            foreground="gray",
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        def _on_start_mode_change(*_args):
+            self._update_window_mode_frames()
+
+        def _on_end_mode_change(*_args):
+            self._update_window_mode_frames()
+
+        start_mode_combo.bind("<<ComboboxSelected>>", _on_start_mode_change)
+        end_mode_combo.bind("<<ComboboxSelected>>", _on_end_mode_change)
+
+        self._update_window_mode_frames()
 
         # Calculations
         calc_frame = ttk.LabelFrame(content, text="Calculations")
@@ -984,10 +1265,155 @@ class ARVApp(tk.Tk):
         for child in calc_frame.winfo_children():
             child.grid_configure(padx=(0, 8))
 
-        ttk.Button(content, text="Close", command=lambda: self._close_preferences(win)).pack(anchor="e")
+        buttons = ttk.Frame(content)
+        buttons.pack(fill=tk.X, expand=True)
+        ttk.Button(buttons, text="Cancel", command=lambda: self._cancel_preferences(win)).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(buttons, text="Save", command=lambda: self._save_preferences(win)).pack(side=tk.RIGHT)
 
         win.grab_set()
 
+    def _update_window_mode_frames(self):
+        start_mode = (self.start_mode_var.get() or "Time").title()
+        if self._start_mode_frames:
+            for frame in self._start_mode_frames.values():
+                frame.grid_forget()
+            active = self._start_mode_frames.get(start_mode) or self._start_mode_frames.get("Time")
+            if active is not None:
+                active.grid(row=0, column=0, sticky="ew")
+
+        end_mode = (self.end_mode_var.get() or "Time").title()
+        if self._end_mode_frames:
+            for frame in self._end_mode_frames.values():
+                frame.grid_forget()
+            active_end = self._end_mode_frames.get(end_mode) or self._end_mode_frames.get("Time")
+            if active_end is not None:
+                active_end.grid(row=0, column=0, sticky="ew")
+
+    def _export_preferences(self) -> Dict[str, Any]:
+        return {
+            "start_mode": self.start_mode_var.get(),
+            "start_time": self.start_var.get(),
+            "start_epoch": self.start_epoch_var.get(),
+            "start_comment": self.start_comment_var.get(),
+            "start_offset": self.start_offset_var.get(),
+            "end_mode": self.end_mode_var.get(),
+            "end_time": self.end_var.get(),
+            "end_epoch": self.end_epoch_var.get(),
+            "end_comment": self.end_comment_var.get(),
+            "end_offset": self.end_offset_var.get(),
+            "filter_on": bool(self.filter_on.get()),
+            "filter_method": self.filter_method.get(),
+            "k_sd": self.k_sd_var.get(),
+            "window_s": self.window_s_var.get(),
+            "k_mad": self.k_mad_var.get(),
+        }
+
+    def _restore_preferences(self, snapshot: Optional[Dict[str, Any]]):
+        if not snapshot:
+            return
+        self.start_mode_var.set(snapshot.get("start_mode", "Time"))
+        self.start_var.set(snapshot.get("start_time", ""))
+        self.start_epoch_var.set(snapshot.get("start_epoch", ""))
+        self.start_comment_var.set(snapshot.get("start_comment", ""))
+        self.start_offset_var.set(snapshot.get("start_offset", "0"))
+        self.end_mode_var.set(snapshot.get("end_mode", "Time"))
+        self.end_var.set(snapshot.get("end_time", ""))
+        self.end_epoch_var.set(snapshot.get("end_epoch", ""))
+        self.end_comment_var.set(snapshot.get("end_comment", ""))
+        self.end_offset_var.set(snapshot.get("end_offset", "0"))
+        self.filter_on.set(bool(snapshot.get("filter_on", False)))
+        self.filter_method.set(snapshot.get("filter_method", "rolling"))
+        self.k_sd_var.set(snapshot.get("k_sd", "3.0"))
+        self.window_s_var.set(snapshot.get("window_s", "15"))
+        self.k_mad_var.set(snapshot.get("k_mad", "4.0"))
+        self._update_window_mode_frames()
+
+    def _parse_offset_seconds(self, value: str) -> float:
+        text = (value or "").strip()
+        if not text:
+            return 0.0
+        sign = 1.0
+        if text[0] in "+-":
+            if text[0] == "-":
+                sign = -1.0
+            text = text[1:].strip()
+        if not text:
+            return 0.0
+        if ":" in text:
+            seconds = parse_time_any(text)
+        else:
+            seconds = float(text)
+        return sign * float(seconds)
+
+    def _parse_window_endpoint(
+        self,
+        label: str,
+        mode_var: tk.StringVar,
+        time_var: tk.StringVar,
+        epoch_var: tk.StringVar,
+        comment_var: tk.StringVar,
+        offset_var: tk.StringVar,
+    ) -> Dict[str, Any]:
+        mode = (mode_var.get() or "None").strip().lower()
+        if mode == "time":
+            raw = (time_var.get() or "").strip()
+            if not raw:
+                return {"mode": "time", "value": None}
+            try:
+                value = parse_time_any(raw)
+            except Exception as exc:
+                raise ValueError(f"{label} time: {exc}") from exc
+            return {"mode": "time", "value": value}
+        if mode == "epoch":
+            raw_epoch = (epoch_var.get() or "").strip()
+            if not raw_epoch:
+                return {"mode": "epoch", "value": None}
+            try:
+                epoch_val = int(raw_epoch)
+            except ValueError as exc:
+                raise ValueError(f"{label} epoch must be an integer.") from exc
+            if epoch_val < 1:
+                raise ValueError(f"{label} epoch must be 1 or greater.")
+            return {"mode": "epoch", "value": epoch_val}
+        if mode == "comment":
+            comment_text = (comment_var.get() or "").strip()
+            if not comment_text:
+                raise ValueError(f"{label} comment text is required to anchor the window.")
+            offset_raw = (offset_var.get() or "").strip()
+            try:
+                offset_val = self._parse_offset_seconds(offset_raw)
+            except Exception as exc:
+                raise ValueError(f"{label} comment offset is invalid: {exc}") from exc
+            return {"mode": "comment", "text": comment_text, "offset": offset_val}
+        return {"mode": "none"}
+
+    def _build_window_spec(self) -> Dict[str, Dict[str, Any]]:
+        start_spec = self._parse_window_endpoint(
+            "Start",
+            self.start_mode_var,
+            self.start_var,
+            self.start_epoch_var,
+            self.start_comment_var,
+            self.start_offset_var,
+        )
+        end_spec = self._parse_window_endpoint(
+            "End",
+            self.end_mode_var,
+            self.end_var,
+            self.end_epoch_var,
+            self.end_comment_var,
+            self.end_offset_var,
+        )
+        return {"start": start_spec, "end": end_spec}
+
+    def _save_preferences(self, window):
+        self._preferences_snapshot = None
+        self._close_preferences(window)
+
+    def _cancel_preferences(self, window):
+        if self._preferences_snapshot is not None:
+            self._restore_preferences(self._preferences_snapshot)
+        self._close_preferences(window)
     def open_layout_dialog(self):
         if self._layout_window is not None and self._layout_window.winfo_exists():
             self._layout_window.lift()
@@ -1063,6 +1489,7 @@ class ARVApp(tk.Tk):
             "sbp_column",
             "dbp_column",
             "map_column",
+            "comment_column",
         ]
         for name in field_names:
             self._layout_field_vars[name] = tk.StringVar()
@@ -1160,6 +1587,17 @@ class ARVApp(tk.Tk):
         )
         map_spin.grid(row=3, column=1, sticky="w", pady=(0, 6))
 
+        ttk.Label(mapping_frame, text="Comment column").grid(row=4, column=0, sticky="w", pady=(0, 6))
+        comment_spin = spinbox_cls(
+            mapping_frame,
+            from_=2,
+            to=9999,
+            width=10,
+            textvariable=self._layout_field_vars["comment_column"],
+            increment=1,
+        )
+        comment_spin.grid(row=4, column=1, sticky="w", pady=(0, 6))
+
         ttk.Label(
             mapping_frame,
             text="Columns are 1-based. Use the preview below to verify how delimiters split your file.",
@@ -1223,9 +1661,16 @@ class ARVApp(tk.Tk):
         self._update_layout_preview()
 
     def _close_preferences(self, window):
-        if window.winfo_exists():
+        try:
+            exists = window.winfo_exists()
+        except Exception:
+            exists = False
+        if exists:
             window.destroy()
         self._preferences_window = None
+        self._preferences_snapshot = None
+        self._start_mode_frames = {}
+        self._end_mode_frames = {}
 
     def _close_layout(self, window):
         if window.winfo_exists():
@@ -1382,13 +1827,9 @@ class ARVApp(tk.Tk):
             return
 
         try:
-            start_s = parse_time_any(self.start_var.get())
-            end_s = parse_time_any(self.end_var.get())
-            if start_s is not None and end_s is not None and end_s <= start_s:
-                messagebox.showwarning("Time window", "End time must be greater than start time.")
-                return
-        except Exception as e:
-            messagebox.showerror("Invalid time", f"Could not parse time: {e}")
+            window_spec = self._build_window_spec()
+        except ValueError as exc:
+            messagebox.showerror("Time window", str(exc))
             return
 
         # parse filter params
@@ -1417,7 +1858,7 @@ class ARVApp(tk.Tk):
         for p in self.filepaths:
             try:
                 res = compute_all_for_file(
-                    p, start_s, end_s,
+                    p, window_spec,
                     use_filter=use_filter,
                     filter_method=method,
                     k_sd=k_sd,
