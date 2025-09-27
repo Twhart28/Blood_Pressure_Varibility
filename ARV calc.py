@@ -371,12 +371,17 @@ class ARVApp(tk.Tk):
         root_pane = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         root_pane.pack(fill=tk.BOTH, expand=True)
         self._root_pane = root_pane
+        self._initial_sash_positioned = False
+        self._sash_bind_id = None
 
         self.left_frame = ttk.Frame(root_pane, padding=8)
         root_pane.add(self.left_frame, weight=1)
 
         self.right_frame = ttk.Frame(root_pane, padding=(4, 8, 8, 8))
         root_pane.add(self.right_frame, weight=4)
+
+        # Ensure the left pane starts at a reasonable default width.
+        self._sash_bind_id = root_pane.bind("<Configure>", self._ensure_initial_sash)
 
         # Left panel
         ttk.Label(self.left_frame, text="Loaded files", anchor="w").pack(fill=tk.X, pady=(0, 4))
@@ -488,6 +493,22 @@ class ARVApp(tk.Tk):
         for path in self.filepaths:
             self.files_list.insert(tk.END, os.path.basename(path))
         self._update_layout_preview()
+
+    def _ensure_initial_sash(self, event=None):
+        if self._initial_sash_positioned:
+            return
+        # Avoid trying to position before the widget has a meaningful size.
+        if event is not None and getattr(event, "width", 0) <= 1:
+            return
+        try:
+            self._root_pane.sashpos(0, 250)
+        except tk.TclError:
+            return
+        self._initial_sash_positioned = True
+        # Stop listening once the sash has been positioned.
+        if self._sash_bind_id is not None:
+            self._root_pane.unbind("<Configure>", self._sash_bind_id)
+            self._sash_bind_id = None
 
     # --------------------------- Dialog windows --------------------------
     def open_preferences(self):
