@@ -41,7 +41,7 @@ def parse_header(lines, separator="\t", data_start_override=None):
             channel_titles = [t.strip() for t in titles.split("\t") if t.strip()]
 
         if data_start_idx is None:
-            row = ln.rstrip("\n")
+            row = ln.rstrip("\r\n")
             if separator == " ":
                 parts = row.split()
             else:
@@ -97,7 +97,7 @@ def load_series(filepath, layout_config=None):
 
     # IMPORTANT: No artificial limit here — reads the ENTIRE dataset
     for ln in lines[data_start:]:
-        row_txt = ln.rstrip("\n")
+        row_txt = ln.rstrip("\r\n")
         if separator == " ":
             row = row_txt.split()
         else:
@@ -1258,7 +1258,7 @@ class ARVApp(tk.Tk):
         parsed_rows = []
         max_cols = 0
         for lineno, raw in enumerate(snippet, start=1):
-            text = raw.rstrip("\n")
+            text = raw.rstrip("\r\n")
             if separator == " ":
                 cells = text.split()
             else:
