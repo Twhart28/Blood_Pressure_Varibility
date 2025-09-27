@@ -421,7 +421,7 @@ def resolve_window_spec(
 ) -> Tuple[int, int, float, Optional[float]]:
     total_time = max(0.0, interval_s * series_length)
 
-    def resolve_endpoint(spec: Dict[str, Any], is_start: bool) -> Tuple[int, float]:
+    def resolve_endpoint(spec: Dict[str, Any], is_start: bool, label: str) -> Tuple[int, float]:
         mode = (spec.get("mode") or "none").lower()
         default_idx = 0 if is_start else series_length
         default_time = 0.0 if is_start else total_time
@@ -456,20 +456,20 @@ def resolve_window_spec(
             return idx, time_val
 
         if mode == "comment":
-            if not comments:
-                raise ValueError("No comment column is configured for comment-anchored windows.")
+            if comments is None:
+                raise ValueError(f"{label} comment anchor requires a comment column to be configured.")
             text = (spec.get("text") or "").strip()
             if not text:
-                raise ValueError("Comment text is required for comment-anchored windows.")
+                raise ValueError(f"{label} comment text is required to anchor the window.")
             offset = float(spec.get("offset") or 0.0)
             idx = _find_comment_index(comments, text, find_last=not is_start)
             if idx is None:
-                raise ValueError(f"Could not locate a comment containing '{text}'.")
+                raise ValueError(f"{label} comment containing '{text}' was not found.")
             time_val = idx * interval_s + offset
-            if time_val < 0:
-                time_val = 0.0
-            if time_val > total_time:
-                time_val = total_time
+            if time_val < -1e-9:
+                raise ValueError(f"{label} comment offset places the window before the start of the data.")
+            if time_val > total_time + 1e-9:
+                raise ValueError(f"{label} comment offset places the window beyond the end of the data.")
             idx = _time_to_index(time_val, interval_s, series_length, is_start)
             return idx, time_val
 
@@ -477,8 +477,8 @@ def resolve_window_spec(
 
     start_spec = window_spec.get("start", {}) if window_spec else {}
     end_spec = window_spec.get("end", {}) if window_spec else {}
-    start_idx, start_time = resolve_endpoint(start_spec, True)
-    end_idx, end_time = resolve_endpoint(end_spec, False)
+    start_idx, start_time = resolve_endpoint(start_spec, True, "Start")
+    end_idx, end_time = resolve_endpoint(end_spec, False, "End")
 
     start_mode = (start_spec.get("mode") or "none").lower()
     end_mode = (end_spec.get("mode") or "none").lower()
@@ -617,11 +617,17 @@ class ARVApp(tk.Tk):
         self.k_sd_var = tk.StringVar(value="3.0")
         self.window_s_var = tk.StringVar(value="15")
         self.k_mad_var = tk.StringVar(value="4.0")
+        self.output_std = tk.BooleanVar(value=True)
+        self.output_cov = tk.BooleanVar(value=True)
+        self.output_arv = tk.BooleanVar(value=True)
 
         self._preferences_window = None
         self._preferences_snapshot = None
         self._start_mode_frames = {}
         self._end_mode_frames = {}
+        self._filter_method_frames = {}
+        self._filter_method_combo = None
+        self._filter_method_inputs = []
         self._layout_window = None
         self._layout_preview_tree = None
         self._layout_preview_row_tree = None
@@ -677,7 +683,7 @@ class ARVApp(tk.Tk):
         ttk.Button(controls, text="Save CSV…", command=self.save_csv).pack(side=tk.RIGHT, padx=(0, 8))
 
         # Results table
-        cols = (
+        self._tree_columns = (
             "file", "interval_s", "start_s", "end_s",
             "n_SBP_raw", "n_SBP_kept", "Mean_SBP", "SD_SBP", "CV_SBP_pct", "ARV_SBP",
             "n_DBP_raw", "n_DBP_kept", "Mean_DBP", "SD_DBP", "CV_DBP_pct", "ARV_DBP",
@@ -688,8 +694,8 @@ class ARVApp(tk.Tk):
         tree_container.rowconfigure(0, weight=1)
         tree_container.columnconfigure(0, weight=1)
 
-        self.tree = ttk.Treeview(tree_container, columns=cols, show="headings", height=18)
-        for c in cols:
+        self.tree = ttk.Treeview(tree_container, columns=self._tree_columns, show="headings", height=18)
+        for c in self._tree_columns:
             self.tree.heading(c, text=c)
             base_w = 100
             if c == "file":
@@ -706,6 +712,8 @@ class ARVApp(tk.Tk):
         tree_x_scroll = ttk.Scrollbar(tree_container, orient=tk.HORIZONTAL, command=self.tree.xview)
         tree_x_scroll.grid(row=1, column=0, sticky="ew")
         self.tree.configure(yscrollcommand=tree_y_scroll.set, xscrollcommand=tree_x_scroll.set)
+
+        self._apply_result_column_preferences()
 
         # Status bar
         self.status = tk.StringVar(value="Ready")
@@ -800,6 +808,11 @@ class ARVApp(tk.Tk):
             columns = (columns,)
         if not columns:
             return
+        display_columns = tree.cget("displaycolumns")
+        if display_columns not in (None, "", "#all"):
+            if isinstance(display_columns, str):
+                display_columns = (display_columns,)
+            columns = display_columns
 
         try:
             body_font = tkfont.nametofont(tree.cget("font"))
@@ -1140,6 +1153,9 @@ class ARVApp(tk.Tk):
 
         content = ttk.Frame(win, padding=16)
         content.pack(fill=tk.BOTH, expand=True)
+        self._filter_method_frames = {}
+        self._filter_method_inputs = []
+        self._filter_method_combo = None
 
         # Time window
         time_frame = ttk.LabelFrame(content, text="Time window")
@@ -1178,7 +1194,7 @@ class ARVApp(tk.Tk):
         start_comment_frame.columnconfigure(1, weight=1)
         ttk.Label(start_comment_frame, text="Comment contains").grid(row=0, column=0, sticky="w")
         ttk.Entry(start_comment_frame, textvariable=self.start_comment_var).grid(row=0, column=1, sticky="ew", padx=(8, 0))
-        ttk.Label(start_comment_frame, text="Offset (s)").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(start_comment_frame, text="Offset (s or mm:ss)").grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Entry(start_comment_frame, textvariable=self.start_offset_var, width=14).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
 
         self._start_mode_frames = {
@@ -1216,7 +1232,7 @@ class ARVApp(tk.Tk):
         end_comment_frame.columnconfigure(1, weight=1)
         ttk.Label(end_comment_frame, text="Comment contains").grid(row=0, column=0, sticky="w")
         ttk.Entry(end_comment_frame, textvariable=self.end_comment_var).grid(row=0, column=1, sticky="ew", padx=(8, 0))
-        ttk.Label(end_comment_frame, text="Offset (s)").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(end_comment_frame, text="Offset (s or mm:ss)").grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Entry(end_comment_frame, textvariable=self.end_offset_var, width=14).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
 
         self._end_mode_frames = {
@@ -1229,7 +1245,7 @@ class ARVApp(tk.Tk):
 
         ttk.Label(
             time_frame,
-            text="Comment offsets accept positive seconds (after) and negative seconds (before) the comment.",
+            text="Comment offsets accept positive seconds (after) and negative seconds (before) the comment, in s or mm:ss format.",
             foreground="gray",
         ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
@@ -1244,26 +1260,84 @@ class ARVApp(tk.Tk):
 
         self._update_window_mode_frames()
 
-        # Calculations
-        calc_frame = ttk.LabelFrame(content, text="Calculations")
-        calc_frame.pack(fill=tk.X, expand=True, pady=(0, 12))
+        # Raw measures filtering
+        filter_frame = ttk.LabelFrame(content, text="Raw measures filtering")
+        filter_frame.pack(fill=tk.X, expand=True, pady=(0, 12))
+        filter_frame.columnconfigure(1, weight=1)
 
-        ttk.Checkbutton(calc_frame, text="Apply artifact filtering", variable=self.filter_on).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(
+            filter_frame,
+            text="Apply artifact filtering",
+            variable=self.filter_on,
+            command=self._update_filter_controls_state,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
 
-        ttk.Label(calc_frame, text="Filter method").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Combobox(calc_frame, textvariable=self.filter_method, values=["rolling", "global"], state="readonly", width=12).grid(row=1, column=1, padx=(12, 0), pady=(8, 0), sticky="w")
+        ttk.Label(filter_frame, text="Filter method").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        method_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.filter_method,
+            values=["rolling", "global"],
+            state="readonly",
+            width=12,
+        )
+        method_combo.grid(row=1, column=1, padx=(12, 0), pady=(8, 0), sticky="w")
+        method_combo.bind("<<ComboboxSelected>>", self._update_filter_setting_frames)
+        self._filter_method_combo = method_combo
 
-        ttk.Label(calc_frame, text="k_SD (global)").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(calc_frame, textvariable=self.k_sd_var, width=8).grid(row=2, column=1, padx=(12, 0), pady=(8, 0), sticky="w")
+        rolling_frame = ttk.Frame(filter_frame)
+        rolling_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(rolling_frame, text="Window seconds").grid(row=0, column=0, sticky="w")
+        window_entry = ttk.Entry(rolling_frame, textvariable=self.window_s_var, width=8)
+        window_entry.grid(row=0, column=1, sticky="w", padx=(12, 0))
+        ttk.Label(rolling_frame, text="k_MAD").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        k_mad_entry = ttk.Entry(rolling_frame, textvariable=self.k_mad_var, width=8)
+        k_mad_entry.grid(row=1, column=1, sticky="w", padx=(12, 0), pady=(6, 0))
 
-        ttk.Label(calc_frame, text="Window seconds (rolling)").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(calc_frame, textvariable=self.window_s_var, width=8).grid(row=3, column=1, padx=(12, 0), pady=(8, 0), sticky="w")
+        global_frame = ttk.Frame(filter_frame)
+        global_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(global_frame, text="k_SD").grid(row=0, column=0, sticky="w")
+        k_sd_entry = ttk.Entry(global_frame, textvariable=self.k_sd_var, width=8)
+        k_sd_entry.grid(row=0, column=1, sticky="w", padx=(12, 0))
 
-        ttk.Label(calc_frame, text="k_MAD (rolling)").grid(row=4, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(calc_frame, textvariable=self.k_mad_var, width=8).grid(row=4, column=1, padx=(12, 0), pady=(8, 12), sticky="w")
+        self._filter_method_frames = {
+            "rolling": rolling_frame,
+            "global": global_frame,
+        }
+        self._filter_method_inputs = [window_entry, k_mad_entry, k_sd_entry]
+        for frame in self._filter_method_frames.values():
+            frame.grid_remove()
 
-        for child in calc_frame.winfo_children():
-            child.grid_configure(padx=(0, 8))
+        self._update_filter_setting_frames()
+        self._update_filter_controls_state()
+
+        # Output metrics
+        metrics_frame = ttk.LabelFrame(content, text="Output metrics")
+        metrics_frame.pack(fill=tk.X, expand=True, pady=(0, 12))
+        for col_idx in range(3):
+            metrics_frame.columnconfigure(col_idx, weight=1)
+        ttk.Label(
+            metrics_frame,
+            text="Choose which variability metrics should be included in tables and exports.",
+            foreground="gray",
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Checkbutton(
+            metrics_frame,
+            text="STD",
+            variable=self.output_std,
+            command=self._on_metric_preference_changed,
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(
+            metrics_frame,
+            text="CoV",
+            variable=self.output_cov,
+            command=self._on_metric_preference_changed,
+        ).grid(row=1, column=1, sticky="w", pady=(8, 0), padx=(16, 0))
+        ttk.Checkbutton(
+            metrics_frame,
+            text="ARV",
+            variable=self.output_arv,
+            command=self._on_metric_preference_changed,
+        ).grid(row=1, column=2, sticky="w", pady=(8, 0), padx=(16, 0))
 
         buttons = ttk.Frame(content)
         buttons.pack(fill=tk.X, expand=True)
@@ -1289,6 +1363,116 @@ class ARVApp(tk.Tk):
             if active_end is not None:
                 active_end.grid(row=0, column=0, sticky="ew")
 
+    def _result_display_columns(self):
+        columns = [
+            "file", "interval_s", "start_s", "end_s",
+            "n_SBP_raw", "n_SBP_kept", "Mean_SBP",
+        ]
+        if self.output_std.get():
+            columns.append("SD_SBP")
+        if self.output_cov.get():
+            columns.append("CV_SBP_pct")
+        if self.output_arv.get():
+            columns.append("ARV_SBP")
+
+        columns.extend(["n_DBP_raw", "n_DBP_kept", "Mean_DBP"])
+        if self.output_std.get():
+            columns.append("SD_DBP")
+        if self.output_cov.get():
+            columns.append("CV_DBP_pct")
+        if self.output_arv.get():
+            columns.append("ARV_DBP")
+
+        columns.extend(["n_MAP_raw", "n_MAP_kept", "Mean_MAP"])
+        if self.output_std.get():
+            columns.append("SD_MAP")
+        if self.output_cov.get():
+            columns.append("CV_MAP_pct")
+        if self.output_arv.get():
+            columns.append("ARV_MAP")
+
+        return columns
+
+    def _csv_headers(self):
+        headers = [
+            "file", "interval_s", "start_s", "end_s",
+            "n_SBP_raw", "n_SBP_kept", "Mean_SBP",
+        ]
+        if self.output_std.get():
+            headers.append("SD_SBP")
+        if self.output_cov.get():
+            headers.append("CV_SBP_pct")
+        if self.output_arv.get():
+            headers.append("ARV_SBP")
+
+        headers.extend(["n_DBP_raw", "n_DBP_kept", "Mean_DBP"])
+        if self.output_std.get():
+            headers.append("SD_DBP")
+        if self.output_cov.get():
+            headers.append("CV_DBP_pct")
+        if self.output_arv.get():
+            headers.append("ARV_DBP")
+
+        headers.extend(["n_MAP_raw", "n_MAP_kept", "Mean_MAP"])
+        if self.output_std.get():
+            headers.append("SD_MAP")
+        if self.output_cov.get():
+            headers.append("CV_MAP_pct")
+        if self.output_arv.get():
+            headers.append("ARV_MAP")
+
+        headers.append("error")
+        return headers
+
+    def _apply_result_column_preferences(self):
+        if getattr(self, "tree", None) is None:
+            return
+        display_columns = self._result_display_columns()
+        try:
+            self.tree.configure(displaycolumns=display_columns)
+        except tk.TclError:
+            return
+
+    def _on_metric_preference_changed(self, *_args):
+        self._apply_result_column_preferences()
+        self._autofit_tree_columns(self.tree, min_width=90, padding=28, max_width=None)
+
+    def _update_filter_setting_frames(self, *_args):
+        if not self._filter_method_frames:
+            return
+        method = (self.filter_method.get() or "rolling").lower()
+        for frame in self._filter_method_frames.values():
+            frame.grid_remove()
+        selected = self._filter_method_frames.get(method)
+        if selected is not None:
+            selected.grid()
+
+    def _update_filter_controls_state(self, *_args):
+        enabled = bool(self.filter_on.get())
+        if self._filter_method_combo is not None:
+            try:
+                self._filter_method_combo.configure(state="readonly" if enabled else "disabled")
+            except tk.TclError:
+                pass
+        state = "normal" if enabled else "disabled"
+        for widget in getattr(self, "_filter_method_inputs", []):
+            try:
+                widget.configure(state=state)
+            except tk.TclError:
+                pass
+
+    def _format_result_row(self, result: Dict[str, Any]):
+        values = []
+        error_text = result.get("error")
+        for col in self._tree_columns:
+            if col == "file":
+                values.append(result.get("file", ""))
+            elif error_text:
+                values.append("ERROR")
+            else:
+                values.append(fmt_float(result.get(col), 6))
+        return values
+
     def _export_preferences(self) -> Dict[str, Any]:
         return {
             "start_mode": self.start_mode_var.get(),
@@ -1306,6 +1490,9 @@ class ARVApp(tk.Tk):
             "k_sd": self.k_sd_var.get(),
             "window_s": self.window_s_var.get(),
             "k_mad": self.k_mad_var.get(),
+            "show_std": bool(self.output_std.get()),
+            "show_cov": bool(self.output_cov.get()),
+            "show_arv": bool(self.output_arv.get()),
         }
 
     def _restore_preferences(self, snapshot: Optional[Dict[str, Any]]):
@@ -1326,7 +1513,13 @@ class ARVApp(tk.Tk):
         self.k_sd_var.set(snapshot.get("k_sd", "3.0"))
         self.window_s_var.set(snapshot.get("window_s", "15"))
         self.k_mad_var.set(snapshot.get("k_mad", "4.0"))
+        self.output_std.set(bool(snapshot.get("show_std", True)))
+        self.output_cov.set(bool(snapshot.get("show_cov", True)))
+        self.output_arv.set(bool(snapshot.get("show_arv", True)))
         self._update_window_mode_frames()
+        self._update_filter_setting_frames()
+        self._update_filter_controls_state()
+        self._apply_result_column_preferences()
 
     def _parse_offset_seconds(self, value: str) -> float:
         text = (value or "").strip()
@@ -1337,6 +1530,10 @@ class ARVApp(tk.Tk):
             if text[0] == "-":
                 sign = -1.0
             text = text[1:].strip()
+        if not text:
+            return 0.0
+        if text.lower().endswith("s"):
+            text = text[:-1].strip()
         if not text:
             return 0.0
         if ":" in text:
@@ -1604,7 +1801,7 @@ class ARVApp(tk.Tk):
             foreground="gray",
             wraplength=520,
             justify=tk.LEFT,
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         preview_frame = ttk.LabelFrame(container, text="Preview of data file")
         preview_frame.grid(row=2, column=0, sticky="nsew", pady=(16, 0))
@@ -1854,6 +2051,8 @@ class ARVApp(tk.Tk):
         for i in self.tree.get_children():
             self.tree.delete(i)
 
+        self._apply_result_column_preferences()
+
         errors = 0
         for p in self.filepaths:
             try:
@@ -1866,37 +2065,17 @@ class ARVApp(tk.Tk):
                     k_mad=k_mad,
                     layout_config=self._get_active_layout(),
                 )
+                res["error"] = ""
                 self.results.append(res)
-                self.tree.insert("", tk.END, values=(
-                    res["file"],
-                    fmt_float(res["interval_s"]),
-                    fmt_float(res["start_s"]),
-                    fmt_float(res["end_s"]),
-
-                    fmt_float(res["n_SBP_raw"], 6), fmt_float(res["n_SBP_kept"], 6),
-                    fmt_float(res["Mean_SBP"], 6), fmt_float(res["SD_SBP"], 6),
-                    fmt_float(res["CV_SBP_pct"], 6), fmt_float(res["ARV_SBP"], 6),
-
-                    fmt_float(res["n_DBP_raw"], 6), fmt_float(res["n_DBP_kept"], 6),
-                    fmt_float(res["Mean_DBP"], 6), fmt_float(res["SD_DBP"], 6),
-                    fmt_float(res["CV_DBP_pct"], 6), fmt_float(res["ARV_DBP"], 6),
-
-                    fmt_float(res["n_MAP_raw"], 6), fmt_float(res["n_MAP_kept"], 6),
-                    fmt_float(res["Mean_MAP"], 6), fmt_float(res["SD_MAP"], 6),
-                    fmt_float(res["CV_MAP_pct"], 6), fmt_float(res["ARV_MAP"], 6),
-                ))
+                self.tree.insert("", tk.END, values=self._format_result_row(res))
             except Exception as e:
                 errors += 1
-                self.tree.insert("", tk.END, values=(
-                    os.path.basename(p), "", "", "",
-                    "", "", "", "", "", "ERROR",
-                    "", "", "", "", "", "ERROR",
-                    "", "", "", "", "", "ERROR",
-                ))
-                self.results.append({
+                error_entry = {
                     "file": os.path.basename(p),
                     "error": str(e),
-                })
+                }
+                self.results.append(error_entry)
+                self.tree.insert("", tk.END, values=self._format_result_row(error_entry))
 
         self._autofit_tree_columns(self.tree, min_width=90, padding=28, max_width=None)
 
@@ -1917,13 +2096,7 @@ class ARVApp(tk.Tk):
         if not path:
             return
 
-        headers = [
-            "file", "interval_s", "start_s", "end_s",
-            "n_SBP_raw", "n_SBP_kept", "Mean_SBP", "SD_SBP", "CV_SBP_pct", "ARV_SBP",
-            "n_DBP_raw", "n_DBP_kept", "Mean_DBP", "SD_DBP", "CV_DBP_pct", "ARV_DBP",
-            "n_MAP_raw", "n_MAP_kept", "Mean_MAP", "SD_MAP", "CV_MAP_pct", "ARV_MAP",
-            "error"
-        ]
+        headers = self._csv_headers()
 
         rows = []
         for r in self.results:
