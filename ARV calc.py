@@ -338,74 +338,78 @@ def fmt_float(x, digits=6):
 class ARVApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("BP Variability (ARV/SD/CV) with Optional Artifact Filtering")
+        self.title("Blood Pressure Variability Tool")
         self.geometry("1180x640")
-        self.minsize(980, 560)
+        self.minsize(1024, 600)
 
         self.filepaths = []
         self.results = []
 
-        # Top: file controls
-        top = ttk.Frame(self, padding=8)
-        top.pack(side=tk.TOP, fill=tk.X)
-
-        ttk.Label(top, text="Files:").pack(side=tk.LEFT)
-        self.files_var = tk.StringVar(value="")
-        self.files_entry = ttk.Entry(top, textvariable=self.files_var)
-        self.files_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
-
-        ttk.Button(top, text="Add Files…", command=self.add_files).pack(side=tk.LEFT, padx=(0,6))
-        ttk.Button(top, text="Clear", command=self.clear_files).pack(side=tk.LEFT)
-
-        # Time window + filtering controls row
-        tw = ttk.Frame(self, padding=(8,0,8,8))
-        tw.pack(side=tk.TOP, fill=tk.X, pady=(4,4))
-
-        ttk.Label(tw, text="Start (s or mm:ss):").pack(side=tk.LEFT)
+        # Preference state variables
         self.start_var = tk.StringVar(value="")
-        ttk.Entry(tw, width=10, textvariable=self.start_var).pack(side=tk.LEFT, padx=(6,16))
-
-        ttk.Label(tw, text="End (s or mm:ss):").pack(side=tk.LEFT)
         self.end_var = tk.StringVar(value="")
-        ttk.Entry(tw, width=10, textvariable=self.end_var).pack(side=tk.LEFT, padx=(6,20))
-
-        # Filter enable
         self.filter_on = tk.BooleanVar(value=False)
-        ttk.Checkbutton(tw, text="Filter BP artifacts", variable=self.filter_on).pack(side=tk.LEFT, padx=(0,14))
-
-        # Method dropdown
-        ttk.Label(tw, text="Method:").pack(side=tk.LEFT)
-        self.filter_method = tk.StringVar(value="rolling")  # 'rolling' or 'global'
-        ttk.Combobox(tw, width=10, textvariable=self.filter_method,
-                     values=["rolling", "global"], state="readonly").pack(side=tk.LEFT, padx=(6,14))
-
-        # Params
-        # Global: k_sd
-        ttk.Label(tw, text="k_SD (global):").pack(side=tk.LEFT)
+        self.filter_method = tk.StringVar(value="rolling")
         self.k_sd_var = tk.StringVar(value="3.0")
-        ttk.Entry(tw, width=6, textvariable=self.k_sd_var).pack(side=tk.LEFT, padx=(6,16))
-
-        # Rolling: window_s, k_mad
-        ttk.Label(tw, text="Window s (rolling):").pack(side=tk.LEFT)
         self.window_s_var = tk.StringVar(value="15")
-        ttk.Entry(tw, width=6, textvariable=self.window_s_var).pack(side=tk.LEFT, padx=(6,16))
-
-        ttk.Label(tw, text="k_MAD (rolling):").pack(side=tk.LEFT)
         self.k_mad_var = tk.StringVar(value="4.0")
-        ttk.Entry(tw, width=6, textvariable=self.k_mad_var).pack(side=tk.LEFT, padx=(6,16))
 
-        ttk.Button(tw, text="Compute", command=self.compute).pack(side=tk.LEFT, padx=(10,0))
-        ttk.Button(tw, text="Save CSV…", command=self.save_csv).pack(side=tk.LEFT, padx=(8,0))
+        self._preferences_window = None
+        self._layout_window = None
+        self._layout_preview_box = None
+
+        # Styling (optional nicer look)
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        self.configure(menu=self._build_menubar())
+
+        # Layout: left file list, right results
+        root_pane = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        root_pane.pack(fill=tk.BOTH, expand=True)
+        self._root_pane = root_pane
+
+        self.left_frame = ttk.Frame(root_pane, padding=8)
+        root_pane.add(self.left_frame, weight=1)
+
+        self.right_frame = ttk.Frame(root_pane, padding=(4, 8, 8, 8))
+        root_pane.add(self.right_frame, weight=4)
+
+        # Left panel
+        ttk.Label(self.left_frame, text="Loaded files", anchor="w").pack(fill=tk.X, pady=(0, 4))
+        list_frame = ttk.Frame(self.left_frame)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.files_list = tk.Listbox(list_frame, height=20, exportselection=False)
+        self.files_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.files_list.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.files_list.configure(yscrollcommand=scrollbar.set)
+        self.files_list.bind("<<ListboxSelect>>", self._update_layout_preview)
+
+        # Right panel top controls
+        controls = ttk.Frame(self.right_frame)
+        controls.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Button(controls, text="Compute", command=self.compute).pack(side=tk.RIGHT)
+        ttk.Button(controls, text="Save CSV…", command=self.save_csv).pack(side=tk.RIGHT, padx=(0, 8))
 
         # Results table
         cols = (
             "file", "interval_s", "start_s", "end_s",
-
             "n_SBP_raw", "n_SBP_kept", "Mean_SBP", "SD_SBP", "CV_SBP_pct", "ARV_SBP",
             "n_DBP_raw", "n_DBP_kept", "Mean_DBP", "SD_DBP", "CV_DBP_pct", "ARV_DBP",
             "n_MAP_raw", "n_MAP_kept", "Mean_MAP", "SD_MAP", "CV_MAP_pct", "ARV_MAP",
         )
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=14)
+        tree_container = ttk.Frame(self.right_frame)
+        tree_container.pack(fill=tk.BOTH, expand=True)
+        tree_container.rowconfigure(0, weight=1)
+        tree_container.columnconfigure(0, weight=1)
+
+        self.tree = ttk.Treeview(tree_container, columns=cols, show="headings", height=18)
         for c in cols:
             self.tree.heading(c, text=c)
             base_w = 100
@@ -416,39 +420,239 @@ class ARVApp(tk.Tk):
             else:
                 w = base_w
             self.tree.column(c, width=w, anchor=tk.CENTER)
-        self.tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(4,8))
+        self.tree.grid(row=0, column=0, sticky="nsew")
+
+        tree_y_scroll = ttk.Scrollbar(tree_container, orient=tk.VERTICAL, command=self.tree.yview)
+        tree_y_scroll.grid(row=0, column=1, sticky="ns")
+        tree_x_scroll = ttk.Scrollbar(tree_container, orient=tk.HORIZONTAL, command=self.tree.xview)
+        tree_x_scroll.grid(row=1, column=0, sticky="ew")
+        self.tree.configure(yscrollcommand=tree_y_scroll.set, xscrollcommand=tree_x_scroll.set)
 
         # Status bar
         self.status = tk.StringVar(value="Ready")
-        ttk.Label(self, textvariable=self.status, anchor="w").pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0,6))
+        ttk.Label(self, textvariable=self.status, anchor="w").pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 6))
 
-        # Styling (optional nicer look)
-        style = ttk.Style(self)
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
+    # --------------------------- Menu construction ------------------------
+    def _build_menubar(self):
+        menubar = tk.Menu(self)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Add files", command=self.add_files)
+        file_menu.add_command(label="Clear file list", command=self.clear_files)
+        file_menu.add_separator()
+        file_menu.add_command(label="Format file layout", command=self.open_layout_dialog)
+        menubar.add_cascade(label="Files", menu=file_menu)
+
+        menubar.add_command(label="Preferences", command=self.open_preferences)
+        menubar.add_command(label="About", command=self.open_about)
+
+        return menubar
 
     def add_files(self):
         paths = filedialog.askopenfilenames(
-            title="Select TXT files",
+            title="Select files",
             filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
         )
+        added = 0
         if not paths:
-            return
-        for p in paths:
-            if p not in self.filepaths:
-                self.filepaths.append(p)
-        self.files_var.set("; ".join(self.filepaths))
-        self.status.set(f"Added {len(paths)} file(s). Total: {len(self.filepaths)}")
+            folder = filedialog.askdirectory(title="Select folder with files")
+            if folder:
+                for entry in sorted(os.listdir(folder)):
+                    full = os.path.join(folder, entry)
+                    if os.path.isfile(full):
+                        if full not in self.filepaths:
+                            self.filepaths.append(full)
+                            added += 1
+            else:
+                return
+        else:
+            for p in paths:
+                if p not in self.filepaths:
+                    self.filepaths.append(p)
+                    added += 1
+
+        if added:
+            self.update_file_list()
+        self.status.set(f"Added {added} file(s). Total: {len(self.filepaths)}")
 
     def clear_files(self):
         self.filepaths = []
-        self.files_var.set("")
         self.results = []
+        self.update_file_list()
         for i in self.tree.get_children():
             self.tree.delete(i)
         self.status.set("Cleared files and results.")
+
+    def update_file_list(self):
+        self.files_list.delete(0, tk.END)
+        for path in self.filepaths:
+            self.files_list.insert(tk.END, os.path.basename(path))
+        self._update_layout_preview()
+
+    # --------------------------- Dialog windows --------------------------
+    def open_preferences(self):
+        if self._preferences_window is not None and self._preferences_window.winfo_exists():
+            self._preferences_window.lift()
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Preferences")
+        win.transient(self)
+        win.resizable(False, False)
+        self._preferences_window = win
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_preferences(win))
+
+        content = ttk.Frame(win, padding=16)
+        content.pack(fill=tk.BOTH, expand=True)
+
+        # Time window
+        time_frame = ttk.LabelFrame(content, text="Time window")
+        time_frame.pack(fill=tk.X, expand=True, pady=(0, 12))
+
+        ttk.Label(time_frame, text="Start (s or mm:ss)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(time_frame, textvariable=self.start_var, width=12).grid(row=0, column=1, padx=(8, 0))
+        ttk.Label(time_frame, text="End (s or mm:ss)").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(time_frame, textvariable=self.end_var, width=12).grid(row=1, column=1, padx=(8, 0), pady=(8, 0))
+
+        # Calculations
+        calc_frame = ttk.LabelFrame(content, text="Calculations")
+        calc_frame.pack(fill=tk.X, expand=True, pady=(0, 12))
+
+        ttk.Checkbutton(calc_frame, text="Apply artifact filtering", variable=self.filter_on).grid(row=0, column=0, sticky="w")
+
+        ttk.Label(calc_frame, text="Filter method").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Combobox(calc_frame, textvariable=self.filter_method, values=["rolling", "global"], state="readonly", width=12).grid(row=1, column=1, padx=(12, 0), pady=(8, 0), sticky="w")
+
+        ttk.Label(calc_frame, text="k_SD (global)").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(calc_frame, textvariable=self.k_sd_var, width=8).grid(row=2, column=1, padx=(12, 0), pady=(8, 0), sticky="w")
+
+        ttk.Label(calc_frame, text="Window seconds (rolling)").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(calc_frame, textvariable=self.window_s_var, width=8).grid(row=3, column=1, padx=(12, 0), pady=(8, 0), sticky="w")
+
+        ttk.Label(calc_frame, text="k_MAD (rolling)").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(calc_frame, textvariable=self.k_mad_var, width=8).grid(row=4, column=1, padx=(12, 0), pady=(8, 12), sticky="w")
+
+        for child in calc_frame.winfo_children():
+            child.grid_configure(padx=(0, 8))
+
+        ttk.Button(content, text="Close", command=lambda: self._close_preferences(win)).pack(anchor="e")
+
+        win.grab_set()
+
+    def open_layout_dialog(self):
+        if self._layout_window is not None and self._layout_window.winfo_exists():
+            self._layout_window.lift()
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Format file layout")
+        win.geometry("600x560")
+        win.transient(self)
+        self._layout_window = win
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_layout(win))
+
+        container = ttk.Frame(win, padding=16)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        spec_frame = ttk.LabelFrame(container, text="Data specifications")
+        spec_frame.pack(fill=tk.X, pady=(0, 12))
+
+        labels = [
+            ("Header lines", "9"),
+            ("Data type", "RR"),
+            ("Time units", "s"),
+            ("Data units", "mmHg"),
+            ("Column separator", "Tab"),
+            ("Time index column", "None"),
+        ]
+        for i, (label, default) in enumerate(labels):
+            ttk.Label(spec_frame, text=label).grid(row=i, column=0, sticky="w", pady=4, padx=4)
+            entry = ttk.Entry(spec_frame, width=24)
+            entry.grid(row=i, column=1, sticky="w", pady=4, padx=4)
+            entry.insert(0, default)
+
+        update_frame = ttk.LabelFrame(container, text="Update/add additional columns")
+        update_frame.pack(fill=tk.X, pady=(0, 12))
+
+        fields = ["Date", "Time", "Age/Gender", "Weight", "Height"]
+        for i, name in enumerate(fields):
+            ttk.Label(update_frame, text=f"{name}:").grid(row=i, column=0, sticky="w", pady=4, padx=4)
+            ttk.Entry(update_frame, width=24).grid(row=i, column=1, sticky="w", pady=4, padx=4)
+
+        preview_frame = ttk.LabelFrame(container, text="Preview of data file")
+        preview_frame.pack(fill=tk.BOTH, expand=True)
+
+        preview_container = ttk.Frame(preview_frame)
+        preview_container.pack(fill=tk.BOTH, expand=True)
+        preview_container.rowconfigure(0, weight=1)
+        preview_container.columnconfigure(0, weight=1)
+
+        preview_box = tk.Text(preview_container, height=10, wrap="none")
+        preview_box.grid(row=0, column=0, sticky="nsew")
+
+        preview_y_scroll = ttk.Scrollbar(preview_container, orient=tk.VERTICAL, command=preview_box.yview)
+        preview_y_scroll.grid(row=0, column=1, sticky="ns")
+        preview_x_scroll = ttk.Scrollbar(preview_container, orient=tk.HORIZONTAL, command=preview_box.xview)
+        preview_x_scroll.grid(row=1, column=0, sticky="ew")
+        preview_box.configure(yscrollcommand=preview_y_scroll.set, xscrollcommand=preview_x_scroll.set)
+        self._layout_preview_box = preview_box
+
+        signal_frame = ttk.LabelFrame(container, text="Signal preview")
+        signal_frame.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
+        ttk.Label(signal_frame, text="Data can not be imported with selected settings", foreground="gray")\
+            .pack(fill=tk.BOTH, expand=True, pady=12)
+
+        ttk.Button(container, text="Close", command=lambda: self._close_layout(win)).pack(anchor="e", pady=(12, 0))
+
+        self._update_layout_preview()
+
+    def _close_preferences(self, window):
+        if window.winfo_exists():
+            window.destroy()
+        self._preferences_window = None
+
+    def _close_layout(self, window):
+        if window.winfo_exists():
+            window.destroy()
+        self._layout_window = None
+        self._layout_preview_box = None
+
+    def _update_layout_preview(self, *_event):
+        if not self._layout_preview_box:
+            return
+        if not (self._layout_window and self._layout_window.winfo_exists()):
+            return
+
+        preview_box = self._layout_preview_box
+        preview_box.configure(state="normal")
+        preview_box.delete("1.0", tk.END)
+
+        if not self.filepaths:
+            preview_box.insert("1.0", "No files loaded. Add files to preview their layout.")
+        else:
+            selection = self.files_list.curselection()
+            index = selection[0] if selection else 0
+            path = self.filepaths[index]
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                    snippet = fh.readlines()[:100]
+                if not snippet:
+                    preview_box.insert("1.0", f"{os.path.basename(path)} is empty.")
+                else:
+                    preview_box.insert("1.0", "".join(snippet))
+            except Exception as exc:
+                preview_box.insert("1.0", f"Could not load preview for {os.path.basename(path)}:\n{exc}")
+
+        preview_box.configure(state="disabled")
+
+    def open_about(self):
+        win = tk.Toplevel(self)
+        win.title("About")
+        win.transient(self)
+        win.resizable(False, False)
+        ttk.Label(win, text="Blood Pressure Variability Tool\n(About information coming soon)", padding=20).pack()
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 12))
+        win.grab_set()
 
     def compute(self):
         if not self.filepaths:
