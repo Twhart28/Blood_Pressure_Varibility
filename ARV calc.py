@@ -1204,7 +1204,9 @@ class ARVApp(tk.Tk):
         tree.delete(*tree.get_children())
 
         if not self.filepaths:
-            tree["columns"] = ("message",)
+            columns = ("message",)
+            tree["columns"] = columns
+            tree["displaycolumns"] = columns
             tree.heading("message", text="Preview")
             tree.column("message", anchor=tk.W, stretch=True)
             tree.insert("", tk.END, values=("No files loaded. Add files to preview their layout.",))
@@ -1230,7 +1232,9 @@ class ARVApp(tk.Tk):
             with open(path, "r", encoding="utf-8", errors="ignore") as fh:
                 snippet = fh.readlines()[:200]
         except Exception as exc:
-            tree["columns"] = ("message",)
+            columns = ("message",)
+            tree["columns"] = columns
+            tree["displaycolumns"] = columns
             tree.heading("message", text="Preview")
             tree.column("message", anchor=tk.W, stretch=True)
             tree.insert(
@@ -1242,7 +1246,9 @@ class ARVApp(tk.Tk):
             return
 
         if not snippet:
-            tree["columns"] = ("message",)
+            columns = ("message",)
+            tree["columns"] = columns
+            tree["displaycolumns"] = columns
             tree.heading("message", text="Preview")
             tree.column("message", anchor=tk.W, stretch=True)
             tree.insert("", tk.END, values=(f"{os.path.basename(path)} is empty.",))
@@ -1263,6 +1269,7 @@ class ARVApp(tk.Tk):
 
         columns = ["row"] + [f"col_{i}" for i in range(1, max_cols + 1)]
         tree["columns"] = columns
+        tree["displaycolumns"] = columns
 
         tree.heading("row", text="Row")
         tree.column("row", anchor=tk.E, stretch=False)
