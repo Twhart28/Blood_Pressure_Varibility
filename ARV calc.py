@@ -26,20 +26,21 @@ def parse_header(lines, separator="\t", data_start_override=None):
     data_start_idx = None
 
     for i, ln in enumerate(lines):
-        l = ln.strip()
+        line = ln.rstrip("\r\n")
+        stripped = line.lstrip()
 
-        if l.startswith("Interval="):
+        if stripped.startswith("Interval="):
             # Often "Interval=\t1 s"
-            parts = [p for p in l.split("\t") if p]
+            parts = [p for p in stripped.split("\t") if p]
             try:
                 val = parts[1] if len(parts) > 1 else parts[0].split("=", 1)[-1]
                 interval_s = float(val.split()[0])
             except Exception:
                 pass
 
-        if l.startswith("ChannelTitle="):
-            titles = l.split("=", 1)[-1].strip()
-            channel_titles = [t.strip() for t in titles.split("\t") if t.strip()]
+        if stripped.startswith("ChannelTitle="):
+            titles = stripped.split("=", 1)[-1]
+            channel_titles = [t.strip() for t in titles.split("\t")]
 
         if data_start_idx is None:
             row = ln.rstrip("\r\n")
@@ -88,11 +89,27 @@ def load_series(filepath, layout_config=None):
         if layout_config.first_data_row:
             data_start_override = layout_config.first_data_row - 1
 
-    interval_s, channel_titles, data_start = parse_header(
+    interval_s, raw_channel_titles, data_start = parse_header(
         lines,
         separator=separator,
         data_start_override=data_start_override,
     )
+    channel_titles = []
+    name_counts: Dict[str, int] = {}
+    for idx, raw_name in enumerate(raw_channel_titles):
+        if raw_name:
+            base_name = raw_name
+        else:
+            base_name = f"__unnamed_column_{idx + 2}"
+
+        count = name_counts.get(base_name, 0)
+        if count:
+            resolved_name = f"{base_name}__{count + 1}"
+        else:
+            resolved_name = base_name
+        name_counts[base_name] = count + 1
+        channel_titles.append(resolved_name)
+
     n_channels = len(channel_titles)
     series_map = {name: [] for name in channel_titles}
 
@@ -300,7 +317,7 @@ def compute_all_for_file(path, window_spec, use_filter, filter_method,
             comment_key = resolve_column(comment_column, "Comment")
         except KeyError:
             comment_key = None
-        if comment_key and comment_key in series_map:
+        if comment_key is not None and comment_key in series_map:
             comment_series = series_map[comment_key]
 
     n_samples = len(series_map[sbp_key])
