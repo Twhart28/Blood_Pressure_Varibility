@@ -459,15 +459,18 @@ class ARVApp(tk.Tk):
         self._preferences_window = None
         self._layout_window = None
         self._layout_preview_tree = None
+        self._layout_preview_row_tree = None
+        self._preview_y_scrollbar = None
+        self._preview_scroll_syncing = False
         self._layout_file_label_var = None
         self._layout_field_vars = {}
         self._layout_field_traces = []
         self._layout_config_combo = None
 
         # Styling (optional nicer look)
-        style = ttk.Style(self)
+        self.style = ttk.Style(self)
         try:
-            style.theme_use("clam")
+            self.style.theme_use("clam")
         except Exception:
             pass
 
@@ -530,7 +533,7 @@ class ARVApp(tk.Tk):
                 w = 110
             else:
                 w = base_w
-            self.tree.column(c, width=w, anchor=tk.CENTER)
+            self.tree.column(c, width=w, anchor=tk.CENTER, stretch=False)
         self.tree.grid(row=0, column=0, sticky="nsew")
 
         tree_y_scroll = ttk.Scrollbar(tree_container, orient=tk.VERTICAL, command=self.tree.yview)
@@ -653,7 +656,33 @@ class ARVApp(tk.Tk):
             target_width = max(min_width, content_width + padding)
             if max_width is not None:
                 target_width = min(target_width, max_width)
-            tree.column(col, width=int(target_width))
+            tree.column(col, width=int(target_width), stretch=False)
+
+    def _scroll_preview_y(self, *args):
+        if self._layout_preview_tree is not None:
+            self._layout_preview_tree.yview(*args)
+
+    def _on_preview_y_scroll(self, source, first, last):
+        if self._preview_y_scrollbar is not None:
+            self._preview_y_scrollbar.set(first, last)
+
+        if self._preview_scroll_syncing:
+            return
+
+        other = self._layout_preview_row_tree if source == "data" else self._layout_preview_tree
+        if other is None:
+            return
+
+        try:
+            fraction = float(first)
+        except (TypeError, ValueError):
+            return
+
+        try:
+            self._preview_scroll_syncing = True
+            other.yview_moveto(fraction)
+        finally:
+            self._preview_scroll_syncing = False
 
     # --------------------------- Layout config logic ---------------------
 
@@ -1147,19 +1176,43 @@ class ARVApp(tk.Tk):
         preview_container = ttk.Frame(preview_frame)
         preview_container.grid(row=0, column=0, sticky="nsew")
         preview_container.rowconfigure(0, weight=1)
-        preview_container.columnconfigure(0, weight=1)
+        preview_container.columnconfigure(1, weight=1)
 
-        preview_tree = ttk.Treeview(preview_container, show="headings")
-        preview_tree.grid(row=0, column=0, sticky="nsew")
+        style = self.style
+        style.configure("Preview.RowNumbers.Treeview", background="#f3f4f6", fieldbackground="#f3f4f6")
+        style.configure("Preview.RowNumbers.Treeview.Heading", background="#e5e7eb", foreground="#111827")
 
-        preview_y_scroll = ttk.Scrollbar(preview_container, orient=tk.VERTICAL, command=preview_tree.yview)
-        preview_y_scroll.grid(row=0, column=1, sticky="ns")
+        row_tree = ttk.Treeview(
+            preview_container,
+            columns=("row",),
+            show="headings",
+            selectmode="none",
+            style="Preview.RowNumbers.Treeview",
+            height=18,
+        )
+        row_tree.heading("row", text="#")
+        row_tree.column("row", width=60, anchor=tk.E, stretch=False)
+        row_tree.grid(row=0, column=0, sticky="ns")
+        row_tree.tag_configure("header", background="#eef2ff")
+        row_tree.tag_configure("data_start", background="#e6ffef")
+
+        preview_tree = ttk.Treeview(preview_container, show="headings", height=18)
+        preview_tree.grid(row=0, column=1, sticky="nsew")
+
+        preview_y_scroll = ttk.Scrollbar(preview_container, orient=tk.VERTICAL, command=self._scroll_preview_y)
+        preview_y_scroll.grid(row=0, column=2, sticky="ns")
         preview_x_scroll = ttk.Scrollbar(preview_container, orient=tk.HORIZONTAL, command=preview_tree.xview)
-        preview_x_scroll.grid(row=1, column=0, sticky="ew")
-        preview_tree.configure(yscrollcommand=preview_y_scroll.set, xscrollcommand=preview_x_scroll.set)
+        preview_x_scroll.grid(row=1, column=1, sticky="ew")
+        preview_tree.configure(
+            yscrollcommand=lambda f, l: self._on_preview_y_scroll("data", f, l),
+            xscrollcommand=preview_x_scroll.set,
+        )
+        row_tree.configure(yscrollcommand=lambda f, l: self._on_preview_y_scroll("row", f, l))
         preview_tree.tag_configure("header", background="#eef2ff")
         preview_tree.tag_configure("data_start", background="#e6ffef")
         self._layout_preview_tree = preview_tree
+        self._layout_preview_row_tree = row_tree
+        self._preview_y_scrollbar = preview_y_scroll
 
         buttons = ttk.Frame(container)
         buttons.grid(row=3, column=0, sticky="e", pady=(16, 0))
@@ -1179,6 +1232,9 @@ class ARVApp(tk.Tk):
             window.destroy()
         self._layout_window = None
         self._layout_preview_tree = None
+        self._layout_preview_row_tree = None
+        self._preview_y_scrollbar = None
+        self._preview_scroll_syncing = False
         for var, trace in self._layout_field_traces:
             try:
                 var.trace_remove("write", trace)
@@ -1196,8 +1252,11 @@ class ARVApp(tk.Tk):
             return
 
         tree = self._layout_preview_tree
+        row_tree = self._layout_preview_row_tree
         tree.configure(columns=(), displaycolumns=())
         tree.delete(*tree.get_children())
+        if row_tree is not None:
+            row_tree.delete(*row_tree.get_children())
 
         if not self.filepaths:
             columns = ("message",)
@@ -1208,6 +1267,8 @@ class ARVApp(tk.Tk):
             if self._layout_file_label_var is not None:
                 self._layout_file_label_var.set("No file selected.")
             self._autofit_tree_columns(tree, min_width=200, padding=24, max_width=None)
+            if row_tree is not None:
+                self._autofit_tree_columns(row_tree, min_width=40, padding=18, max_width=80)
             return
 
         selection = self.files_list.curselection()
@@ -1237,6 +1298,8 @@ class ARVApp(tk.Tk):
                 values=(f"Could not load preview for {os.path.basename(path)}: {exc}",),
             )
             self._autofit_tree_columns(tree, min_width=200, padding=24, max_width=None)
+            if row_tree is not None:
+                self._autofit_tree_columns(row_tree, min_width=40, padding=18, max_width=80)
             return
 
         if not snippet:
@@ -1246,6 +1309,8 @@ class ARVApp(tk.Tk):
             tree.column("message", anchor=tk.W, stretch=True)
             tree.insert("", tk.END, values=(f"{os.path.basename(path)} is empty.",))
             self._autofit_tree_columns(tree, min_width=200, padding=24, max_width=None)
+            if row_tree is not None:
+                self._autofit_tree_columns(row_tree, min_width=40, padding=18, max_width=80)
             return
 
         try:
@@ -1271,28 +1336,36 @@ class ARVApp(tk.Tk):
                 values=(f"Could not parse preview for {os.path.basename(path)}: {exc}",),
             )
             self._autofit_tree_columns(tree, min_width=200, padding=24, max_width=None)
+            if row_tree is not None:
+                self._autofit_tree_columns(row_tree, min_width=40, padding=18, max_width=80)
             return
 
-        columns = ["row"] + [f"col_{i}" for i in range(1, max_cols + 1)]
+        if max_cols == 0:
+            max_cols = 1
+
+        columns = [f"col_{i}" for i in range(1, max_cols + 1)]
         tree.configure(columns=columns, displaycolumns=columns)
 
-        tree.heading("row", text="Row")
-        tree.column("row", anchor=tk.E, stretch=False)
         for idx in range(1, max_cols + 1):
             col_id = f"col_{idx}"
-            tree.heading(col_id, text=f"Col {idx}")
-            tree.column(col_id, anchor=tk.W, stretch=True)
+            tree.heading(col_id, text=str(idx))
+            tree.column(col_id, anchor=tk.W, stretch=False)
 
         for lineno, cells in parsed_rows:
-            values = [str(lineno)] + [cell for cell in cells] + [""] * (max_cols - len(cells))
-            tags = []
+            row_tags = []
             if header_lines and lineno <= header_lines:
-                tags.append("header")
+                row_tags.append("header")
             if first_data_row and lineno == first_data_row:
-                tags.append("data_start")
-            tree.insert("", tk.END, values=values, tags=tags)
+                row_tags.append("data_start")
+
+            padded_cells = [cell for cell in cells] + [""] * (max_cols - len(cells))
+            if row_tree is not None:
+                row_tree.insert("", tk.END, values=(str(lineno),), tags=row_tags)
+            tree.insert("", tk.END, values=padded_cells, tags=row_tags)
 
         self._autofit_tree_columns(tree, min_width=60, padding=24, max_width=None)
+        if row_tree is not None:
+            self._autofit_tree_columns(row_tree, min_width=40, padding=18, max_width=80)
 
     def open_about(self):
         win = tk.Toplevel(self)
