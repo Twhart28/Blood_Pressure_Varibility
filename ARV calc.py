@@ -1196,17 +1196,12 @@ class ARVApp(tk.Tk):
             return
 
         tree = self._layout_preview_tree
-        existing_columns = tree["columns"]
-        if isinstance(existing_columns, str):
-            existing_columns = (existing_columns,)
-        for col in existing_columns:
-            tree.heading(col, text="")
+        tree.configure(columns=(), displaycolumns=())
         tree.delete(*tree.get_children())
 
         if not self.filepaths:
             columns = ("message",)
-            tree["columns"] = columns
-            tree["displaycolumns"] = columns
+            tree.configure(columns=columns, displaycolumns=columns)
             tree.heading("message", text="Preview")
             tree.column("message", anchor=tk.W, stretch=True)
             tree.insert("", tk.END, values=("No files loaded. Add files to preview their layout.",))
@@ -1233,8 +1228,7 @@ class ARVApp(tk.Tk):
                 snippet = fh.readlines()[:200]
         except Exception as exc:
             columns = ("message",)
-            tree["columns"] = columns
-            tree["displaycolumns"] = columns
+            tree.configure(columns=columns, displaycolumns=columns)
             tree.heading("message", text="Preview")
             tree.column("message", anchor=tk.W, stretch=True)
             tree.insert(
@@ -1247,29 +1241,40 @@ class ARVApp(tk.Tk):
 
         if not snippet:
             columns = ("message",)
-            tree["columns"] = columns
-            tree["displaycolumns"] = columns
+            tree.configure(columns=columns, displaycolumns=columns)
             tree.heading("message", text="Preview")
             tree.column("message", anchor=tk.W, stretch=True)
             tree.insert("", tk.END, values=(f"{os.path.basename(path)} is empty.",))
             self._autofit_tree_columns(tree, min_width=200, padding=24, max_width=None)
             return
 
-        parsed_rows = []
-        max_cols = 0
-        for lineno, raw in enumerate(snippet, start=1):
-            text = raw.rstrip("\r\n")
-            if separator == " ":
-                cells = text.split()
-            else:
-                cells = text.split(separator)
-            parsed_rows.append((lineno, cells))
-            if len(cells) > max_cols:
-                max_cols = len(cells)
+        try:
+            parsed_rows = []
+            max_cols = 0
+            for lineno, raw in enumerate(snippet, start=1):
+                text = raw.rstrip("\r\n")
+                if separator == " ":
+                    cells = text.split()
+                else:
+                    cells = text.split(separator)
+                parsed_rows.append((lineno, cells))
+                if len(cells) > max_cols:
+                    max_cols = len(cells)
+        except Exception as exc:
+            columns = ("message",)
+            tree.configure(columns=columns, displaycolumns=columns)
+            tree.heading("message", text="Preview")
+            tree.column("message", anchor=tk.W, stretch=True)
+            tree.insert(
+                "",
+                tk.END,
+                values=(f"Could not parse preview for {os.path.basename(path)}: {exc}",),
+            )
+            self._autofit_tree_columns(tree, min_width=200, padding=24, max_width=None)
+            return
 
         columns = ["row"] + [f"col_{i}" for i in range(1, max_cols + 1)]
-        tree["columns"] = columns
-        tree["displaycolumns"] = columns
+        tree.configure(columns=columns, displaycolumns=columns)
 
         tree.heading("row", text="Row")
         tree.column("row", anchor=tk.E, stretch=False)
