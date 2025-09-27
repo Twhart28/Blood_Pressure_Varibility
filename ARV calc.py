@@ -71,7 +71,7 @@ def safe_float(x: str, decimal: str = ".") -> float:
 
 def load_series(filepath, layout_config=None):
     """
-    Reads the file, returns (interval_s, {channel_name: [values...]})
+    Reads the file, returns (interval_s, {channel_name: [values...]}, channel_titles)
     Only channels listed in ChannelTitle= are returned.
     """
     with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
@@ -110,7 +110,7 @@ def load_series(filepath, layout_config=None):
         for name, val in zip(channel_titles, vals):
             series_map[name].append(safe_float(val, decimal=decimal))
 
-    return interval_s, series_map
+    return interval_s, series_map, channel_titles
 
 
 def select_window(series, interval_s, start_s, end_s):
@@ -263,30 +263,27 @@ def compute_metrics(series, use_filter=False, filter_method="rolling", interval_
 
 def compute_all_for_file(path, start_s, end_s, use_filter, filter_method,
                          k_sd, window_s, k_mad, layout_config=None):
-    interval_s, series_map = load_series(path, layout_config=layout_config)
+    interval_s, series_map, channel_titles = load_series(path, layout_config=layout_config)
 
-    def resolve(name):
-        # exact, case-insensitive, or contains
-        if name in series_map:
-            return name
-        for k in series_map.keys():
-            if k.lower() == name.lower():
-                return k
-        for k in series_map.keys():
-            if name.lower() in k.lower():
-                return k
-        raise KeyError(f"Channel '{name}' not found. Available: {list(series_map.keys())}")
+    layout_cfg = layout_config or LayoutConfig.default()
 
-    def fallback(name, default):
-        return name if name else default
+    def resolve_column(column_number, label):
+        try:
+            idx = int(column_number)
+        except (TypeError, ValueError):
+            raise KeyError(f"{label} column is not a valid number: {column_number!r}")
+        if idx < 2:
+            raise KeyError(f"{label} column must be 2 or greater (column 1 is typically time).")
+        mapped_index = idx - 2
+        if mapped_index < 0 or mapped_index >= len(channel_titles):
+            raise KeyError(
+                f"{label} column {idx} is out of range for available data columns 2-{len(channel_titles) + 1}."
+            )
+        return channel_titles[mapped_index]
 
-    target_sbp = fallback(getattr(layout_config, "sbp_channel", None), "reSYS")
-    target_dbp = fallback(getattr(layout_config, "dbp_channel", None), "reDIA")
-    target_map = fallback(getattr(layout_config, "map_channel", None), "reMAP")
-
-    sbp_key = resolve(target_sbp)
-    dbp_key = resolve(target_dbp)
-    map_key = resolve(target_map)
+    sbp_key = resolve_column(getattr(layout_cfg, "sbp_column", 2), "SBP")
+    dbp_key = resolve_column(getattr(layout_cfg, "dbp_column", 3), "DBP")
+    map_key = resolve_column(getattr(layout_cfg, "map_column", 4), "MAP")
 
     sbp = select_window(series_map[sbp_key], interval_s, start_s, end_s)
     dbp = select_window(series_map[dbp_key], interval_s, start_s, end_s)
@@ -378,10 +375,10 @@ class LayoutConfig:
     first_data_row: int = 10
     separator: str = "\t"
     decimal: str = "."
-    sbp_channel: str = "reSYS"
-    dbp_channel: str = "reDIA"
-    map_channel: str = "reMAP"
-    time_column: str = ""
+    time_column: int = 1
+    sbp_column: int = 2
+    dbp_column: int = 3
+    map_column: int = 4
 
     @classmethod
     def default(cls):
@@ -391,26 +388,40 @@ class LayoutConfig:
             first_data_row=10,
             separator="\t",
             decimal=".",
-            sbp_channel="reSYS",
-            dbp_channel="reDIA",
-            map_channel="reMAP",
-            time_column="",
+            time_column=1,
+            sbp_column=2,
+            dbp_column=3,
+            map_column=4,
         )
 
     @classmethod
     def from_dict(cls, data):
         if data is None:
             return cls.default()
+        def parse_int(value, default):
+            if value in (None, ""):
+                return default
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        # Allow legacy configs that stored channel names instead of column numbers.
+        time_column = parse_int(data.get("time_column"), 1)
+        sbp_column = parse_int(data.get("sbp_column"), 2)
+        dbp_column = parse_int(data.get("dbp_column"), 3)
+        map_column = parse_int(data.get("map_column"), 4)
+
         return cls(
             name=data.get("name", "Unnamed"),
             header_lines=int(data.get("header_lines", 0) or 0),
             first_data_row=int(data.get("first_data_row", 1) or 1),
             separator=data.get("separator", "\t") or "\t",
             decimal=data.get("decimal", ".") or ".",
-            sbp_channel=data.get("sbp_channel", "reSYS") or "reSYS",
-            dbp_channel=data.get("dbp_channel", "reDIA") or "reDIA",
-            map_channel=data.get("map_channel", "reMAP") or "reMAP",
-            time_column=data.get("time_column", "") or "",
+            time_column=time_column,
+            sbp_column=sbp_column,
+            dbp_column=dbp_column,
+            map_column=map_column,
         )
 
     def to_dict(self):
@@ -446,9 +457,8 @@ class ARVApp(tk.Tk):
 
         self._preferences_window = None
         self._layout_window = None
-        self._layout_preview_box = None
+        self._layout_preview_tree = None
         self._layout_file_label_var = None
-        self._layout_summary_var = None
         self._layout_field_vars = {}
         self._layout_field_traces = []
         self._layout_config_combo = None
@@ -724,16 +734,48 @@ class ARVApp(tk.Tk):
 
         name = target_name or self.layout_config_var.get() or self.active_layout_name or "Custom"
 
+        def parse_column(field_key, label, minimum):
+            raw = self._layout_field_vars[field_key].get().strip()
+            if not raw:
+                if quiet:
+                    return None
+                messagebox.showerror("Layout", f"{label} column is required and must be a number.")
+                return None
+            try:
+                value = int(raw)
+            except ValueError:
+                if quiet:
+                    return None
+                messagebox.showerror("Layout", f"{label} column must be an integer.")
+                return None
+            if value < minimum:
+                if quiet:
+                    return None
+                messagebox.showerror(
+                    "Layout",
+                    f"{label} column must be {minimum} or greater.",
+                )
+                return None
+            return value
+
+        time_column = parse_column("time_column", "Time", 1)
+        sbp_column = parse_column("sbp_column", "SBP", 2)
+        dbp_column = parse_column("dbp_column", "DBP", 2)
+        map_column = parse_column("map_column", "MAP", 2)
+
+        if None in (time_column, sbp_column, dbp_column, map_column):
+            return None
+
         return LayoutConfig(
             name=name,
             header_lines=header_lines,
             first_data_row=first_data_row,
             separator=separator,
             decimal=decimal,
-            sbp_channel=self._layout_field_vars["sbp_channel"].get().strip() or "reSYS",
-            dbp_channel=self._layout_field_vars["dbp_channel"].get().strip() or "reDIA",
-            map_channel=self._layout_field_vars["map_channel"].get().strip() or "reMAP",
-            time_column=self._layout_field_vars["time_column"].get().strip(),
+            time_column=time_column,
+            sbp_column=sbp_column,
+            dbp_column=dbp_column,
+            map_column=map_column,
         )
 
     def _apply_layout_config_to_fields(self, layout):
@@ -746,31 +788,10 @@ class ARVApp(tk.Tk):
         self._layout_field_vars["first_data_row"].set(str(layout.first_data_row))
         self._layout_field_vars["separator"].set(self._separator_display(layout.separator))
         self._layout_field_vars["decimal"].set(self._decimal_display(layout.decimal))
-        self._layout_field_vars["sbp_channel"].set(layout.sbp_channel)
-        self._layout_field_vars["dbp_channel"].set(layout.dbp_channel)
-        self._layout_field_vars["map_channel"].set(layout.map_channel)
-        self._layout_field_vars["time_column"].set(layout.time_column)
-        self._refresh_layout_summary()
-
-    def _refresh_layout_summary(self):
-        if self._layout_summary_var is None:
-            return
-        cfg = self._collect_layout_from_fields(quiet=True)
-        if cfg is None:
-            self._layout_summary_var.set("Adjust the options on the left to describe your data layout.")
-            return
-        lines = [
-            f"Header lines: {cfg.header_lines}",
-            f"First data row: {cfg.first_data_row}",
-            f"Separator: {self._separator_display(cfg.separator)}",
-            f"Decimal symbol: {self._decimal_display(cfg.decimal)}",
-            f"SBP column: {cfg.sbp_channel or '—'}",
-            f"DBP column: {cfg.dbp_channel or '—'}",
-            f"MAP column: {cfg.map_channel or '—'}",
-        ]
-        if cfg.time_column:
-            lines.append(f"Time column: {cfg.time_column}")
-        self._layout_summary_var.set("\n".join(lines))
+        self._layout_field_vars["time_column"].set(str(layout.time_column))
+        self._layout_field_vars["sbp_column"].set(str(layout.sbp_column))
+        self._layout_field_vars["dbp_column"].set(str(layout.dbp_column))
+        self._layout_field_vars["map_column"].set(str(layout.map_column))
 
     def _on_layout_config_selected(self, *_event):
         selected = self.layout_config_var.get()
@@ -849,7 +870,7 @@ class ARVApp(tk.Tk):
         self._layout_config_combo["values"] = names
         if self.active_layout_name in names:
             self._layout_config_combo.set(self.active_layout_name)
-        self._refresh_layout_summary()
+        self._update_layout_preview()
 
     # --------------------------- Dialog windows --------------------------
     def open_preferences(self):
@@ -966,16 +987,15 @@ class ARVApp(tk.Tk):
             "first_data_row",
             "separator",
             "decimal",
-            "sbp_channel",
-            "dbp_channel",
-            "map_channel",
             "time_column",
+            "sbp_column",
+            "dbp_column",
+            "map_column",
         ]
         for name in field_names:
             self._layout_field_vars[name] = tk.StringVar()
 
         def _on_field_change(*_args):
-            self._refresh_layout_summary()
             self._update_layout_preview()
 
         for name in field_names:
@@ -1019,44 +1039,69 @@ class ARVApp(tk.Tk):
             width=12,
         ).grid(row=3, column=1, sticky="w", pady=(0, 6))
 
-        ttk.Label(data_frame, text="Time column (optional)").grid(row=4, column=0, sticky="w", pady=(0, 6))
-        ttk.Entry(data_frame, textvariable=self._layout_field_vars["time_column"], width=16).grid(
-            row=4, column=1, sticky="we", pady=(0, 6)
-        )
-
-        channel_frame = ttk.LabelFrame(left_panel, text="Channel mapping")
-        channel_frame.grid(row=1, column=0, sticky="nsew", pady=(16, 0))
-        channel_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(channel_frame, text="SBP column").grid(row=0, column=0, sticky="w", pady=(0, 6))
-        ttk.Entry(channel_frame, textvariable=self._layout_field_vars["sbp_channel"], width=20).grid(
-            row=0, column=1, sticky="we", pady=(0, 6)
-        )
-
-        ttk.Label(channel_frame, text="DBP column").grid(row=1, column=0, sticky="w", pady=(0, 6))
-        ttk.Entry(channel_frame, textvariable=self._layout_field_vars["dbp_channel"], width=20).grid(
-            row=1, column=1, sticky="we", pady=(0, 6)
-        )
-
-        ttk.Label(channel_frame, text="MAP column").grid(row=2, column=0, sticky="w", pady=(0, 6))
-        ttk.Entry(channel_frame, textvariable=self._layout_field_vars["map_channel"], width=20).grid(
-            row=2, column=1, sticky="we", pady=(0, 6)
-        )
-
         ttk.Label(left_panel, text="Configure only the fields that affect import for your files.", foreground="gray")\
-            .grid(row=2, column=0, sticky="w", pady=(12, 0))
+            .grid(row=1, column=0, sticky="w", pady=(12, 0))
 
         right_panel = ttk.Frame(container)
         right_panel.grid(row=1, column=1, sticky="nsew")
         right_panel.columnconfigure(0, weight=1)
         right_panel.rowconfigure(1, weight=1)
 
-        self._layout_summary_var = tk.StringVar()
-        summary_frame = ttk.LabelFrame(right_panel, text="Layout summary")
-        summary_frame.grid(row=0, column=0, sticky="ew")
-        ttk.Label(summary_frame, textvariable=self._layout_summary_var, justify=tk.LEFT).pack(
-            fill=tk.X, expand=True, padx=8, pady=8
+        mapping_frame = ttk.LabelFrame(right_panel, text="Column mapping")
+        mapping_frame.grid(row=0, column=0, sticky="ew")
+        mapping_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(mapping_frame, text="Time column").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        time_spin = spinbox_cls(
+            mapping_frame,
+            from_=1,
+            to=9999,
+            width=10,
+            textvariable=self._layout_field_vars["time_column"],
+            increment=1,
         )
+        time_spin.grid(row=0, column=1, sticky="w", pady=(0, 6))
+
+        ttk.Label(mapping_frame, text="SBP column").grid(row=1, column=0, sticky="w", pady=(0, 6))
+        sbp_spin = spinbox_cls(
+            mapping_frame,
+            from_=2,
+            to=9999,
+            width=10,
+            textvariable=self._layout_field_vars["sbp_column"],
+            increment=1,
+        )
+        sbp_spin.grid(row=1, column=1, sticky="w", pady=(0, 6))
+
+        ttk.Label(mapping_frame, text="DBP column").grid(row=2, column=0, sticky="w", pady=(0, 6))
+        dbp_spin = spinbox_cls(
+            mapping_frame,
+            from_=2,
+            to=9999,
+            width=10,
+            textvariable=self._layout_field_vars["dbp_column"],
+            increment=1,
+        )
+        dbp_spin.grid(row=2, column=1, sticky="w", pady=(0, 6))
+
+        ttk.Label(mapping_frame, text="MAP column").grid(row=3, column=0, sticky="w", pady=(0, 6))
+        map_spin = spinbox_cls(
+            mapping_frame,
+            from_=2,
+            to=9999,
+            width=10,
+            textvariable=self._layout_field_vars["map_column"],
+            increment=1,
+        )
+        map_spin.grid(row=3, column=1, sticky="w", pady=(0, 6))
+
+        ttk.Label(
+            mapping_frame,
+            text="Columns are 1-based. Use the preview below to verify how delimiters split your file.",
+            foreground="gray",
+            wraplength=360,
+            justify=tk.LEFT,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         preview_frame = ttk.LabelFrame(right_panel, text="Preview of data file")
         preview_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
@@ -1068,16 +1113,17 @@ class ARVApp(tk.Tk):
         preview_container.rowconfigure(0, weight=1)
         preview_container.columnconfigure(0, weight=1)
 
-        preview_box = tk.Text(preview_container, height=18, wrap="none")
-        preview_box.configure(font=("Courier", 10))
-        preview_box.grid(row=0, column=0, sticky="nsew")
+        preview_tree = ttk.Treeview(preview_container, show="headings")
+        preview_tree.grid(row=0, column=0, sticky="nsew")
 
-        preview_y_scroll = ttk.Scrollbar(preview_container, orient=tk.VERTICAL, command=preview_box.yview)
+        preview_y_scroll = ttk.Scrollbar(preview_container, orient=tk.VERTICAL, command=preview_tree.yview)
         preview_y_scroll.grid(row=0, column=1, sticky="ns")
-        preview_x_scroll = ttk.Scrollbar(preview_container, orient=tk.HORIZONTAL, command=preview_box.xview)
+        preview_x_scroll = ttk.Scrollbar(preview_container, orient=tk.HORIZONTAL, command=preview_tree.xview)
         preview_x_scroll.grid(row=1, column=0, sticky="ew")
-        preview_box.configure(yscrollcommand=preview_y_scroll.set, xscrollcommand=preview_x_scroll.set)
-        self._layout_preview_box = preview_box
+        preview_tree.configure(yscrollcommand=preview_y_scroll.set, xscrollcommand=preview_x_scroll.set)
+        preview_tree.tag_configure("header", background="#eef2ff")
+        preview_tree.tag_configure("data_start", background="#e6ffef")
+        self._layout_preview_tree = preview_tree
 
         signal_frame = ttk.LabelFrame(right_panel, text="Signal preview")
         signal_frame.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
@@ -1106,7 +1152,7 @@ class ARVApp(tk.Tk):
         if window.winfo_exists():
             window.destroy()
         self._layout_window = None
-        self._layout_preview_box = None
+        self._layout_preview_tree = None
         for var, trace in self._layout_field_traces:
             try:
                 var.trace_remove("write", trace)
@@ -1115,24 +1161,26 @@ class ARVApp(tk.Tk):
         self._layout_field_traces = []
         self._layout_field_vars = {}
         self._layout_file_label_var = None
-        self._layout_summary_var = None
         self._layout_config_combo = None
 
     def _update_layout_preview(self, *_event):
-        if not self._layout_preview_box:
+        if not self._layout_preview_tree:
             return
         if not (self._layout_window and self._layout_window.winfo_exists()):
             return
 
-        preview_box = self._layout_preview_box
-        preview_box.configure(state="normal")
-        preview_box.delete("1.0", tk.END)
+        tree = self._layout_preview_tree
+        for col in tree["columns"]:
+            tree.heading(col, text="")
+        tree.delete(*tree.get_children())
 
         if not self.filepaths:
+            tree["columns"] = ("message",)
+            tree.heading("message", text="Preview")
+            tree.column("message", anchor=tk.W, width=400, stretch=True)
+            tree.insert("", tk.END, values=("No files loaded. Add files to preview their layout.",))
             if self._layout_file_label_var is not None:
                 self._layout_file_label_var.set("No file selected.")
-            preview_box.insert("1.0", "No files loaded. Add files to preview their layout.")
-            preview_box.configure(state="disabled")
             return
 
         selection = self.files_list.curselection()
@@ -1144,37 +1192,61 @@ class ARVApp(tk.Tk):
             self._layout_file_label_var.set(f"Filename: {os.path.basename(path)}")
 
         layout_cfg = self._collect_layout_from_fields(quiet=True) or self._get_active_layout()
-        header_lines = getattr(layout_cfg, "header_lines", None)
-        first_data_row = getattr(layout_cfg, "first_data_row", None)
+        header_lines = getattr(layout_cfg, "header_lines", 0) or 0
+        first_data_row = getattr(layout_cfg, "first_data_row", 0) or 0
+        separator = getattr(layout_cfg, "separator", "\t") or "\t"
 
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as fh:
                 snippet = fh.readlines()[:200]
         except Exception as exc:
-            preview_box.insert("1.0", f"Could not load preview for {os.path.basename(path)}:\n{exc}")
-            preview_box.configure(state="disabled")
+            tree["columns"] = ("message",)
+            tree.heading("message", text="Preview")
+            tree.column("message", anchor=tk.W, width=400, stretch=True)
+            tree.insert(
+                "",
+                tk.END,
+                values=(f"Could not load preview for {os.path.basename(path)}: {exc}",),
+            )
             return
 
         if not snippet:
-            preview_box.insert("1.0", f"{os.path.basename(path)} is empty.")
-            preview_box.configure(state="disabled")
+            tree["columns"] = ("message",)
+            tree.heading("message", text="Preview")
+            tree.column("message", anchor=tk.W, width=400, stretch=True)
+            tree.insert("", tk.END, values=(f"{os.path.basename(path)} is empty.",))
             return
 
-        lines = []
+        parsed_rows = []
+        max_cols = 0
         for lineno, raw in enumerate(snippet, start=1):
             text = raw.rstrip("\n")
-            marker = "  "
+            if separator == " ":
+                cells = text.split()
+            else:
+                cells = text.split(separator)
+            parsed_rows.append((lineno, cells))
+            if len(cells) > max_cols:
+                max_cols = len(cells)
+
+        columns = ["row"] + [f"col_{i}" for i in range(1, max_cols + 1)]
+        tree["columns"] = columns
+
+        tree.heading("row", text="Row")
+        tree.column("row", width=60, anchor=tk.E, stretch=False)
+        for idx in range(1, max_cols + 1):
+            col_id = f"col_{idx}"
+            tree.heading(col_id, text=f"Col {idx}")
+            tree.column(col_id, width=120, anchor=tk.W, stretch=True)
+
+        for lineno, cells in parsed_rows:
+            values = [str(lineno)] + [cell for cell in cells] + [""] * (max_cols - len(cells))
+            tags = []
+            if header_lines and lineno <= header_lines:
+                tags.append("header")
             if first_data_row and lineno == first_data_row:
-                marker = "▶ "
-            elif header_lines and lineno <= header_lines:
-                marker = "• "
-            lines.append(f"{lineno:>5} {marker}{text}\n")
-
-        preview_box.insert("1.0", "".join(lines))
-
-        preview_box.configure(state="disabled")
-        if self._layout_summary_var is not None:
-            self._refresh_layout_summary()
+                tags.append("data_start")
+            tree.insert("", tk.END, values=values, tags=tags)
 
     def open_about(self):
         win = tk.Toplevel(self)
