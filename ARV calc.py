@@ -3,14 +3,16 @@
 
 import os
 import csv
+import json
 import math
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from dataclasses import dataclass, asdict
+from tkinter import ttk, filedialog, messagebox, simpledialog
 from statistics import mean as _pymean
 
 # ----------------------------- Core parsing & ARV -----------------------------
 
-def parse_header(lines):
+def parse_header(lines, separator="\t", data_start_override=None):
     """
     Returns:
       interval_s (float): sampling interval in seconds
@@ -38,9 +40,16 @@ def parse_header(lines):
             channel_titles = [t.strip() for t in titles.split("\t") if t.strip()]
 
         if data_start_idx is None:
-            parts = ln.rstrip("\n").split("\t")
+            row = ln.rstrip("\n")
+            if separator == " ":
+                parts = row.split()
+            else:
+                parts = row.split(separator)
             if len(parts) >= 2 and parts[0].strip().isdigit():
                 data_start_idx = i
+
+    if data_start_override is not None:
+        data_start_idx = max(0, min(len(lines) - 1, int(data_start_override)))
 
     if interval_s is None:
         raise ValueError("Could not parse sampling Interval= from file header.")
@@ -51,14 +60,16 @@ def parse_header(lines):
     return interval_s, channel_titles, data_start_idx
 
 
-def safe_float(x: str) -> float:
+def safe_float(x: str, decimal: str = ".") -> float:
     try:
+        if isinstance(x, str) and decimal != ".":
+            x = x.replace(decimal, ".")
         return float(x)
     except Exception:
         return float("nan")
 
 
-def load_series(filepath):
+def load_series(filepath, layout_config=None):
     """
     Reads the file, returns (interval_s, {channel_name: [values...]})
     Only channels listed in ChannelTitle= are returned.
@@ -66,13 +77,30 @@ def load_series(filepath):
     with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.readlines()
 
-    interval_s, channel_titles, data_start = parse_header(lines)
+    separator = "\t"
+    decimal = "."
+    data_start_override = None
+    if layout_config is not None:
+        separator = layout_config.separator or "\t"
+        decimal = layout_config.decimal or "."
+        if layout_config.first_data_row:
+            data_start_override = layout_config.first_data_row - 1
+
+    interval_s, channel_titles, data_start = parse_header(
+        lines,
+        separator=separator,
+        data_start_override=data_start_override,
+    )
     n_channels = len(channel_titles)
     series_map = {name: [] for name in channel_titles}
 
     # IMPORTANT: No artificial limit here — reads the ENTIRE dataset
     for ln in lines[data_start:]:
-        row = ln.rstrip("\n").split("\t")
+        row_txt = ln.rstrip("\n")
+        if separator == " ":
+            row = row_txt.split()
+        else:
+            row = row_txt.split(separator)
         if not row or not row[0].strip().isdigit():
             continue
         if len(row) < 1 + n_channels:
@@ -80,7 +108,7 @@ def load_series(filepath):
 
         vals = row[1:1 + n_channels]
         for name, val in zip(channel_titles, vals):
-            series_map[name].append(safe_float(val))
+            series_map[name].append(safe_float(val, decimal=decimal))
 
     return interval_s, series_map
 
@@ -234,8 +262,8 @@ def compute_metrics(series, use_filter=False, filter_method="rolling", interval_
 
 
 def compute_all_for_file(path, start_s, end_s, use_filter, filter_method,
-                         k_sd, window_s, k_mad):
-    interval_s, series_map = load_series(path)
+                         k_sd, window_s, k_mad, layout_config=None):
+    interval_s, series_map = load_series(path, layout_config=layout_config)
 
     def resolve(name):
         # exact, case-insensitive, or contains
@@ -249,9 +277,16 @@ def compute_all_for_file(path, start_s, end_s, use_filter, filter_method,
                 return k
         raise KeyError(f"Channel '{name}' not found. Available: {list(series_map.keys())}")
 
-    sbp_key = resolve("reSYS")
-    dbp_key = resolve("reDIA")
-    map_key = resolve("reMAP")
+    def fallback(name, default):
+        return name if name else default
+
+    target_sbp = fallback(getattr(layout_config, "sbp_channel", None), "reSYS")
+    target_dbp = fallback(getattr(layout_config, "dbp_channel", None), "reDIA")
+    target_map = fallback(getattr(layout_config, "map_channel", None), "reMAP")
+
+    sbp_key = resolve(target_sbp)
+    dbp_key = resolve(target_dbp)
+    map_key = resolve(target_map)
 
     sbp = select_window(series_map[sbp_key], interval_s, start_s, end_s)
     dbp = select_window(series_map[dbp_key], interval_s, start_s, end_s)
@@ -333,6 +368,54 @@ def fmt_float(x, digits=6):
         return f"{x:.{digits}g}"
     return str(x)
 
+# --------------------------- Layout configuration ---------------------------
+
+
+@dataclass
+class LayoutConfig:
+    name: str
+    header_lines: int = 9
+    first_data_row: int = 10
+    separator: str = "\t"
+    decimal: str = "."
+    sbp_channel: str = "reSYS"
+    dbp_channel: str = "reDIA"
+    map_channel: str = "reMAP"
+    time_column: str = ""
+
+    @classmethod
+    def default(cls):
+        return cls(
+            name="Default",
+            header_lines=9,
+            first_data_row=10,
+            separator="\t",
+            decimal=".",
+            sbp_channel="reSYS",
+            dbp_channel="reDIA",
+            map_channel="reMAP",
+            time_column="",
+        )
+
+    @classmethod
+    def from_dict(cls, data):
+        if data is None:
+            return cls.default()
+        return cls(
+            name=data.get("name", "Unnamed"),
+            header_lines=int(data.get("header_lines", 0) or 0),
+            first_data_row=int(data.get("first_data_row", 1) or 1),
+            separator=data.get("separator", "\t") or "\t",
+            decimal=data.get("decimal", ".") or ".",
+            sbp_channel=data.get("sbp_channel", "reSYS") or "reSYS",
+            dbp_channel=data.get("dbp_channel", "reDIA") or "reDIA",
+            map_channel=data.get("map_channel", "reMAP") or "reMAP",
+            time_column=data.get("time_column", "") or "",
+        )
+
+    def to_dict(self):
+        return asdict(self)
+
 # ---------------------------------- GUI ------------------------------------
 
 class ARVApp(tk.Tk):
@@ -344,6 +427,13 @@ class ARVApp(tk.Tk):
 
         self.filepaths = []
         self.results = []
+
+        self.layout_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "layout_configs.json")
+        self.layout_configs = {}
+        self.layout_config_order = []
+        self.active_layout_name = None
+        self._load_layout_configs()
+        self.layout_config_var = tk.StringVar(value=self.active_layout_name)
 
         # Preference state variables
         self.start_var = tk.StringVar(value="")
@@ -357,6 +447,11 @@ class ARVApp(tk.Tk):
         self._preferences_window = None
         self._layout_window = None
         self._layout_preview_box = None
+        self._layout_file_label_var = None
+        self._layout_summary_var = None
+        self._layout_field_vars = {}
+        self._layout_field_traces = []
+        self._layout_config_combo = None
 
         # Styling (optional nicer look)
         style = ttk.Style(self)
@@ -510,6 +605,252 @@ class ARVApp(tk.Tk):
             self._root_pane.unbind("<Configure>", self._sash_bind_id)
             self._sash_bind_id = None
 
+    # --------------------------- Layout config logic ---------------------
+
+    def _iter_layout_configs(self):
+        for name in self.layout_config_order:
+            cfg = self.layout_configs.get(name)
+            if cfg is not None:
+                yield cfg
+
+    def _load_layout_configs(self):
+        data = None
+        if os.path.exists(self.layout_config_path):
+            try:
+                with open(self.layout_config_path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except Exception:
+                data = None
+
+        self.layout_configs = {}
+        self.layout_config_order = []
+
+        if isinstance(data, dict):
+            for item in data.get("configs", []):
+                cfg = LayoutConfig.from_dict(item)
+                self.layout_configs[cfg.name] = cfg
+                self.layout_config_order.append(cfg.name)
+            active = data.get("active")
+        else:
+            active = None
+
+        if not self.layout_configs:
+            default_cfg = LayoutConfig.default()
+            self.layout_configs[default_cfg.name] = default_cfg
+            self.layout_config_order = [default_cfg.name]
+
+        if active not in self.layout_configs:
+            active = self.layout_config_order[0]
+
+        self.active_layout_name = active
+
+    def _persist_layout_configs(self):
+        data = {
+            "active": self.active_layout_name,
+            "configs": [cfg.to_dict() for cfg in self._iter_layout_configs()],
+        }
+        try:
+            with open(self.layout_config_path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+        except Exception as exc:
+            if hasattr(self, "status"):
+                self.status.set(f"Warning: could not save layout configs: {exc}")
+
+    def _get_active_layout(self):
+        if self.active_layout_name in self.layout_configs:
+            return self.layout_configs[self.active_layout_name]
+        return next(self._iter_layout_configs(), LayoutConfig.default())
+
+    def _set_active_layout(self, name, persist=True):
+        if name not in self.layout_configs:
+            return
+        self.active_layout_name = name
+        try:
+            self.layout_config_var.set(name)
+        except Exception:
+            pass
+        if persist:
+            self._persist_layout_configs()
+        if hasattr(self, "status"):
+            self.status.set(f"Active layout set to '{name}'.")
+
+    def _layout_names(self):
+        return [cfg.name for cfg in self._iter_layout_configs()]
+
+    def _separator_display(self, separator):
+        mapping = {
+            "\t": "Tab",
+            ",": "Comma",
+            ";": "Semicolon",
+            " ": "Space",
+        }
+        return mapping.get(separator, separator or "Tab")
+
+    def _decimal_display(self, decimal):
+        mapping = {
+            ".": "Dot",
+            ",": "Comma",
+        }
+        return mapping.get(decimal, decimal or "Dot")
+
+    def _collect_layout_from_fields(self, target_name=None, quiet=False):
+        if not self._layout_field_vars:
+            return None
+
+        def parse_int(value, fallback):
+            value = (value or "").strip()
+            if not value:
+                return fallback
+            return int(value)
+
+        try:
+            header_lines = parse_int(self._layout_field_vars["header_lines"].get(), 0)
+            first_data_row = parse_int(
+                self._layout_field_vars["first_data_row"].get(),
+                header_lines + 1 if header_lines else 1,
+            )
+        except ValueError:
+            if quiet:
+                return None
+            messagebox.showerror("Layout", "Header lines and first data row must be integers.")
+            return None
+
+        separator_label = self._layout_field_vars["separator"].get()
+        decimal_label = self._layout_field_vars["decimal"].get()
+        separator_map = {"Tab": "\t", "Comma": ",", "Semicolon": ";", "Space": " "}
+        decimal_map = {"Dot": ".", "Comma": ","}
+        separator = separator_map.get(separator_label, "\t")
+        decimal = decimal_map.get(decimal_label, ".")
+
+        name = target_name or self.layout_config_var.get() or self.active_layout_name or "Custom"
+
+        return LayoutConfig(
+            name=name,
+            header_lines=header_lines,
+            first_data_row=first_data_row,
+            separator=separator,
+            decimal=decimal,
+            sbp_channel=self._layout_field_vars["sbp_channel"].get().strip() or "reSYS",
+            dbp_channel=self._layout_field_vars["dbp_channel"].get().strip() or "reDIA",
+            map_channel=self._layout_field_vars["map_channel"].get().strip() or "reMAP",
+            time_column=self._layout_field_vars["time_column"].get().strip(),
+        )
+
+    def _apply_layout_config_to_fields(self, layout):
+        if layout is None:
+            return
+        if not self._layout_field_vars:
+            return
+
+        self._layout_field_vars["header_lines"].set(str(layout.header_lines))
+        self._layout_field_vars["first_data_row"].set(str(layout.first_data_row))
+        self._layout_field_vars["separator"].set(self._separator_display(layout.separator))
+        self._layout_field_vars["decimal"].set(self._decimal_display(layout.decimal))
+        self._layout_field_vars["sbp_channel"].set(layout.sbp_channel)
+        self._layout_field_vars["dbp_channel"].set(layout.dbp_channel)
+        self._layout_field_vars["map_channel"].set(layout.map_channel)
+        self._layout_field_vars["time_column"].set(layout.time_column)
+        self._refresh_layout_summary()
+
+    def _refresh_layout_summary(self):
+        if self._layout_summary_var is None:
+            return
+        cfg = self._collect_layout_from_fields(quiet=True)
+        if cfg is None:
+            self._layout_summary_var.set("Adjust the options on the left to describe your data layout.")
+            return
+        lines = [
+            f"Header lines: {cfg.header_lines}",
+            f"First data row: {cfg.first_data_row}",
+            f"Separator: {self._separator_display(cfg.separator)}",
+            f"Decimal symbol: {self._decimal_display(cfg.decimal)}",
+            f"SBP column: {cfg.sbp_channel or '—'}",
+            f"DBP column: {cfg.dbp_channel or '—'}",
+            f"MAP column: {cfg.map_channel or '—'}",
+        ]
+        if cfg.time_column:
+            lines.append(f"Time column: {cfg.time_column}")
+        self._layout_summary_var.set("\n".join(lines))
+
+    def _on_layout_config_selected(self, *_event):
+        selected = self.layout_config_var.get()
+        if selected not in self.layout_configs:
+            return
+        self._set_active_layout(selected)
+        self._apply_layout_config_to_fields(self.layout_configs[selected])
+        self._update_layout_preview()
+
+    def _save_layout_from_fields(self):
+        target = self.layout_config_var.get() or self.active_layout_name
+        if not target:
+            messagebox.showerror("Layout", "Select or name a layout before saving.")
+            return
+        cfg = self._collect_layout_from_fields(target_name=target)
+        if cfg is None:
+            return
+        self.layout_configs[cfg.name] = cfg
+        if cfg.name not in self.layout_config_order:
+            self.layout_config_order.append(cfg.name)
+        self._set_active_layout(cfg.name, persist=False)
+        self._persist_layout_configs()
+        if hasattr(self, "status"):
+            self.status.set(f"Saved layout '{cfg.name}'.")
+        self._update_layout_combo_values()
+
+    def _save_layout_as(self):
+        cfg = self._collect_layout_from_fields(quiet=False)
+        if cfg is None:
+            return
+        name = simpledialog.askstring("Save layout", "Enter a name for this layout:", parent=self._layout_window)
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if name in self.layout_configs and not messagebox.askyesno(
+            "Overwrite layout",
+            f"A layout named '{name}' already exists. Overwrite it?",
+            parent=self._layout_window,
+        ):
+            return
+        cfg.name = name
+        self.layout_configs[name] = cfg
+        if name not in self.layout_config_order:
+            self.layout_config_order.append(name)
+        self._set_active_layout(name, persist=False)
+        self._persist_layout_configs()
+        if hasattr(self, "status"):
+            self.status.set(f"Saved new layout '{name}'.")
+        self._update_layout_combo_values()
+
+    def _delete_layout(self):
+        target = self.layout_config_var.get()
+        if not target or target not in self.layout_configs:
+            return
+        if len(self.layout_config_order) <= 1:
+            messagebox.showinfo("Layout", "At least one layout must remain.")
+            return
+        if not messagebox.askyesno("Delete layout", f"Delete layout '{target}'?", parent=self._layout_window):
+            return
+        self.layout_configs.pop(target, None)
+        if target in self.layout_config_order:
+            self.layout_config_order.remove(target)
+        fallback = self.layout_config_order[0]
+        self._set_active_layout(fallback, persist=False)
+        self._persist_layout_configs()
+        self._update_layout_combo_values()
+        if hasattr(self, "status"):
+            self.status.set(f"Deleted layout '{target}'.")
+
+    def _update_layout_combo_values(self):
+        if not hasattr(self, "_layout_config_combo") or self._layout_config_combo is None:
+            return
+        names = self._layout_names()
+        self._layout_config_combo["values"] = names
+        if self.active_layout_name in names:
+            self._layout_config_combo.set(self.active_layout_name)
+        self._refresh_layout_summary()
+
     # --------------------------- Dialog windows --------------------------
     def open_preferences(self):
         if self._preferences_window is not None and self._preferences_window.winfo_exists():
@@ -565,50 +906,170 @@ class ARVApp(tk.Tk):
             self._layout_window.lift()
             return
 
+        for var, trace in self._layout_field_traces:
+            try:
+                var.trace_remove("write", trace)
+            except Exception:
+                pass
+        self._layout_field_traces = []
+        self._layout_field_vars = {}
+
         win = tk.Toplevel(self)
         win.title("Format file layout")
-        win.geometry("600x560")
+        win.geometry("960x720")
+        win.minsize(820, 620)
         win.transient(self)
         self._layout_window = win
         win.protocol("WM_DELETE_WINDOW", lambda: self._close_layout(win))
 
         container = ttk.Frame(win, padding=16)
         container.pack(fill=tk.BOTH, expand=True)
+        container.columnconfigure(0, weight=0)
+        container.columnconfigure(1, weight=1)
+        container.rowconfigure(1, weight=1)
 
-        spec_frame = ttk.LabelFrame(container, text="Data specifications")
-        spec_frame.pack(fill=tk.X, pady=(0, 12))
+        header = ttk.Frame(container)
+        header.grid(row=0, column=0, columnspan=2, sticky="ew")
+        header.columnconfigure(1, weight=1)
 
-        labels = [
-            ("Header lines", "9"),
-            ("Data type", "RR"),
-            ("Time units", "s"),
-            ("Data units", "mmHg"),
-            ("Column separator", "Tab"),
-            ("Time index column", "None"),
+        self._layout_file_label_var = tk.StringVar()
+        ttk.Label(header, textvariable=self._layout_file_label_var, font=("TkDefaultFont", 11, "bold"))\
+            .grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 6))
+
+        ttk.Label(header, text="Config:").grid(row=1, column=0, sticky="w")
+        self.layout_config_var.set(self.active_layout_name)
+        config_combo = ttk.Combobox(
+            header,
+            textvariable=self.layout_config_var,
+            values=self._layout_names(),
+            state="readonly",
+            width=24,
+        )
+        config_combo.grid(row=1, column=1, sticky="w")
+        config_combo.bind("<<ComboboxSelected>>", self._on_layout_config_selected)
+        self._layout_config_combo = config_combo
+
+        ttk.Button(header, text="Save", command=self._save_layout_from_fields).grid(row=1, column=2, padx=(8, 0))
+        ttk.Button(header, text="Save as…", command=self._save_layout_as).grid(row=1, column=3, padx=(8, 0))
+        ttk.Button(header, text="Delete", command=self._delete_layout).grid(row=1, column=4, padx=(8, 0))
+
+        ttk.Label(header, text="Saved layouts let you switch quickly between file formats.", foreground="gray")\
+            .grid(row=2, column=0, columnspan=5, sticky="w", pady=(6, 0))
+
+        left_panel = ttk.Frame(container)
+        left_panel.grid(row=1, column=0, sticky="ns", padx=(0, 16))
+        left_panel.columnconfigure(0, weight=1)
+
+        # Prepare field variables
+        field_names = [
+            "header_lines",
+            "first_data_row",
+            "separator",
+            "decimal",
+            "sbp_channel",
+            "dbp_channel",
+            "map_channel",
+            "time_column",
         ]
-        for i, (label, default) in enumerate(labels):
-            ttk.Label(spec_frame, text=label).grid(row=i, column=0, sticky="w", pady=4, padx=4)
-            entry = ttk.Entry(spec_frame, width=24)
-            entry.grid(row=i, column=1, sticky="w", pady=4, padx=4)
-            entry.insert(0, default)
+        for name in field_names:
+            self._layout_field_vars[name] = tk.StringVar()
 
-        update_frame = ttk.LabelFrame(container, text="Update/add additional columns")
-        update_frame.pack(fill=tk.X, pady=(0, 12))
+        def _on_field_change(*_args):
+            self._refresh_layout_summary()
+            self._update_layout_preview()
 
-        fields = ["Date", "Time", "Age/Gender", "Weight", "Height"]
-        for i, name in enumerate(fields):
-            ttk.Label(update_frame, text=f"{name}:").grid(row=i, column=0, sticky="w", pady=4, padx=4)
-            ttk.Entry(update_frame, width=24).grid(row=i, column=1, sticky="w", pady=4, padx=4)
+        for name in field_names:
+            var = self._layout_field_vars[name]
+            trace_id = var.trace_add("write", _on_field_change)
+            self._layout_field_traces.append((var, trace_id))
 
-        preview_frame = ttk.LabelFrame(container, text="Preview of data file")
-        preview_frame.pack(fill=tk.BOTH, expand=True)
+        data_frame = ttk.LabelFrame(left_panel, text="Data format")
+        data_frame.grid(row=0, column=0, sticky="nsew")
+        data_frame.columnconfigure(1, weight=1)
+
+        spinbox_cls = ttk.Spinbox if hasattr(ttk, "Spinbox") else tk.Spinbox
+
+        ttk.Label(data_frame, text="Header lines").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        header_spin = spinbox_cls(
+            data_frame, from_=0, to=999, width=8, textvariable=self._layout_field_vars["header_lines"], increment=1
+        )
+        header_spin.grid(row=0, column=1, sticky="w", pady=(0, 6))
+
+        ttk.Label(data_frame, text="First data row").grid(row=1, column=0, sticky="w", pady=(0, 6))
+        first_row_spin = spinbox_cls(
+            data_frame, from_=1, to=99999, width=8, textvariable=self._layout_field_vars["first_data_row"], increment=1
+        )
+        first_row_spin.grid(row=1, column=1, sticky="w", pady=(0, 6))
+
+        ttk.Label(data_frame, text="Separator").grid(row=2, column=0, sticky="w", pady=(0, 6))
+        ttk.Combobox(
+            data_frame,
+            textvariable=self._layout_field_vars["separator"],
+            values=["Tab", "Comma", "Semicolon", "Space"],
+            state="readonly",
+            width=12,
+        ).grid(row=2, column=1, sticky="w", pady=(0, 6))
+
+        ttk.Label(data_frame, text="Decimal symbol").grid(row=3, column=0, sticky="w", pady=(0, 6))
+        ttk.Combobox(
+            data_frame,
+            textvariable=self._layout_field_vars["decimal"],
+            values=["Dot", "Comma"],
+            state="readonly",
+            width=12,
+        ).grid(row=3, column=1, sticky="w", pady=(0, 6))
+
+        ttk.Label(data_frame, text="Time column (optional)").grid(row=4, column=0, sticky="w", pady=(0, 6))
+        ttk.Entry(data_frame, textvariable=self._layout_field_vars["time_column"], width=16).grid(
+            row=4, column=1, sticky="we", pady=(0, 6)
+        )
+
+        channel_frame = ttk.LabelFrame(left_panel, text="Channel mapping")
+        channel_frame.grid(row=1, column=0, sticky="nsew", pady=(16, 0))
+        channel_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(channel_frame, text="SBP column").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        ttk.Entry(channel_frame, textvariable=self._layout_field_vars["sbp_channel"], width=20).grid(
+            row=0, column=1, sticky="we", pady=(0, 6)
+        )
+
+        ttk.Label(channel_frame, text="DBP column").grid(row=1, column=0, sticky="w", pady=(0, 6))
+        ttk.Entry(channel_frame, textvariable=self._layout_field_vars["dbp_channel"], width=20).grid(
+            row=1, column=1, sticky="we", pady=(0, 6)
+        )
+
+        ttk.Label(channel_frame, text="MAP column").grid(row=2, column=0, sticky="w", pady=(0, 6))
+        ttk.Entry(channel_frame, textvariable=self._layout_field_vars["map_channel"], width=20).grid(
+            row=2, column=1, sticky="we", pady=(0, 6)
+        )
+
+        ttk.Label(left_panel, text="Configure only the fields that affect import for your files.", foreground="gray")\
+            .grid(row=2, column=0, sticky="w", pady=(12, 0))
+
+        right_panel = ttk.Frame(container)
+        right_panel.grid(row=1, column=1, sticky="nsew")
+        right_panel.columnconfigure(0, weight=1)
+        right_panel.rowconfigure(1, weight=1)
+
+        self._layout_summary_var = tk.StringVar()
+        summary_frame = ttk.LabelFrame(right_panel, text="Layout summary")
+        summary_frame.grid(row=0, column=0, sticky="ew")
+        ttk.Label(summary_frame, textvariable=self._layout_summary_var, justify=tk.LEFT).pack(
+            fill=tk.X, expand=True, padx=8, pady=8
+        )
+
+        preview_frame = ttk.LabelFrame(right_panel, text="Preview of data file")
+        preview_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        preview_frame.rowconfigure(0, weight=1)
+        preview_frame.columnconfigure(0, weight=1)
 
         preview_container = ttk.Frame(preview_frame)
-        preview_container.pack(fill=tk.BOTH, expand=True)
+        preview_container.grid(row=0, column=0, sticky="nsew")
         preview_container.rowconfigure(0, weight=1)
         preview_container.columnconfigure(0, weight=1)
 
-        preview_box = tk.Text(preview_container, height=10, wrap="none")
+        preview_box = tk.Text(preview_container, height=18, wrap="none")
+        preview_box.configure(font=("Courier", 10))
         preview_box.grid(row=0, column=0, sticky="nsew")
 
         preview_y_scroll = ttk.Scrollbar(preview_container, orient=tk.VERTICAL, command=preview_box.yview)
@@ -618,13 +1079,22 @@ class ARVApp(tk.Tk):
         preview_box.configure(yscrollcommand=preview_y_scroll.set, xscrollcommand=preview_x_scroll.set)
         self._layout_preview_box = preview_box
 
-        signal_frame = ttk.LabelFrame(container, text="Signal preview")
-        signal_frame.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
-        ttk.Label(signal_frame, text="Data can not be imported with selected settings", foreground="gray")\
-            .pack(fill=tk.BOTH, expand=True, pady=12)
+        signal_frame = ttk.LabelFrame(right_panel, text="Signal preview")
+        signal_frame.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        ttk.Label(
+            signal_frame,
+            text="Signal preview coming soon. Current settings affect numerical calculations only.",
+            foreground="gray",
+            wraplength=360,
+            justify=tk.LEFT,
+        ).pack(fill=tk.BOTH, expand=True, padx=8, pady=12)
 
-        ttk.Button(container, text="Close", command=lambda: self._close_layout(win)).pack(anchor="e", pady=(12, 0))
+        buttons = ttk.Frame(container)
+        buttons.grid(row=2, column=0, columnspan=2, sticky="e", pady=(16, 0))
+        ttk.Button(buttons, text="Close", command=lambda: self._close_layout(win)).pack(side=tk.RIGHT)
 
+        self._apply_layout_config_to_fields(self._get_active_layout())
+        self._update_layout_combo_values()
         self._update_layout_preview()
 
     def _close_preferences(self, window):
@@ -637,6 +1107,16 @@ class ARVApp(tk.Tk):
             window.destroy()
         self._layout_window = None
         self._layout_preview_box = None
+        for var, trace in self._layout_field_traces:
+            try:
+                var.trace_remove("write", trace)
+            except Exception:
+                pass
+        self._layout_field_traces = []
+        self._layout_field_vars = {}
+        self._layout_file_label_var = None
+        self._layout_summary_var = None
+        self._layout_config_combo = None
 
     def _update_layout_preview(self, *_event):
         if not self._layout_preview_box:
@@ -649,22 +1129,52 @@ class ARVApp(tk.Tk):
         preview_box.delete("1.0", tk.END)
 
         if not self.filepaths:
+            if self._layout_file_label_var is not None:
+                self._layout_file_label_var.set("No file selected.")
             preview_box.insert("1.0", "No files loaded. Add files to preview their layout.")
-        else:
-            selection = self.files_list.curselection()
-            index = selection[0] if selection else 0
-            path = self.filepaths[index]
-            try:
-                with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-                    snippet = fh.readlines()[:100]
-                if not snippet:
-                    preview_box.insert("1.0", f"{os.path.basename(path)} is empty.")
-                else:
-                    preview_box.insert("1.0", "".join(snippet))
-            except Exception as exc:
-                preview_box.insert("1.0", f"Could not load preview for {os.path.basename(path)}:\n{exc}")
+            preview_box.configure(state="disabled")
+            return
+
+        selection = self.files_list.curselection()
+        index = selection[0] if selection else 0
+        index = max(0, min(len(self.filepaths) - 1, index))
+        path = self.filepaths[index]
+
+        if self._layout_file_label_var is not None:
+            self._layout_file_label_var.set(f"Filename: {os.path.basename(path)}")
+
+        layout_cfg = self._collect_layout_from_fields(quiet=True) or self._get_active_layout()
+        header_lines = getattr(layout_cfg, "header_lines", None)
+        first_data_row = getattr(layout_cfg, "first_data_row", None)
+
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                snippet = fh.readlines()[:200]
+        except Exception as exc:
+            preview_box.insert("1.0", f"Could not load preview for {os.path.basename(path)}:\n{exc}")
+            preview_box.configure(state="disabled")
+            return
+
+        if not snippet:
+            preview_box.insert("1.0", f"{os.path.basename(path)} is empty.")
+            preview_box.configure(state="disabled")
+            return
+
+        lines = []
+        for lineno, raw in enumerate(snippet, start=1):
+            text = raw.rstrip("\n")
+            marker = "  "
+            if first_data_row and lineno == first_data_row:
+                marker = "▶ "
+            elif header_lines and lineno <= header_lines:
+                marker = "• "
+            lines.append(f"{lineno:>5} {marker}{text}\n")
+
+        preview_box.insert("1.0", "".join(lines))
 
         preview_box.configure(state="disabled")
+        if self._layout_summary_var is not None:
+            self._refresh_layout_summary()
 
     def open_about(self):
         win = tk.Toplevel(self)
@@ -721,7 +1231,8 @@ class ARVApp(tk.Tk):
                     filter_method=method,
                     k_sd=k_sd,
                     window_s=window_s,
-                    k_mad=k_mad
+                    k_mad=k_mad,
+                    layout_config=self._get_active_layout(),
                 )
                 self.results.append(res)
                 self.tree.insert("", tk.END, values=(
