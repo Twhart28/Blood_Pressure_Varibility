@@ -6,6 +6,7 @@ import csv
 import json
 import math
 import tkinter as tk
+import tkinter.font as tkfont
 from dataclasses import dataclass, asdict
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from statistics import mean as _pymean
@@ -615,6 +616,45 @@ class ARVApp(tk.Tk):
             self._root_pane.unbind("<Configure>", self._sash_bind_id)
             self._sash_bind_id = None
 
+    def _autofit_tree_columns(self, tree, min_width=60, padding=24, max_width=600):
+        """Resize treeview columns to fit their visible content.
+
+        Args:
+            tree: The ``ttk.Treeview`` widget to resize.
+            min_width: Smallest width (pixels) allowed for any column.
+            padding: Extra pixels to add beyond the measured content width.
+            max_width: Optional hard cap for column width (``None`` for no cap).
+        """
+        if not tree:
+            return
+        columns = tree["columns"]
+        if isinstance(columns, str):
+            columns = (columns,)
+        if not columns:
+            return
+
+        try:
+            body_font = tkfont.nametofont(tree.cget("font"))
+        except tk.TclError:
+            body_font = tkfont.nametofont("TkDefaultFont")
+
+        try:
+            heading_font = tkfont.nametofont("TkHeadingFont")
+        except tk.TclError:
+            heading_font = body_font
+
+        for col in columns:
+            heading_text = tree.heading(col).get("text", "")
+            content_width = heading_font.measure(heading_text)
+            for item in tree.get_children():
+                cell_text = tree.set(item, col)
+                content_width = max(content_width, body_font.measure(str(cell_text)))
+
+            target_width = max(min_width, content_width + padding)
+            if max_width is not None:
+                target_width = min(target_width, max_width)
+            tree.column(col, width=int(target_width))
+
     # --------------------------- Layout config logic ---------------------
 
     def _iter_layout_configs(self):
@@ -707,23 +747,21 @@ class ARVApp(tk.Tk):
         if not self._layout_field_vars:
             return None
 
-        def parse_int(value, fallback):
-            value = (value or "").strip()
-            if not value:
-                return fallback
-            return int(value)
-
         try:
-            header_lines = parse_int(self._layout_field_vars["header_lines"].get(), 0)
-            first_data_row = parse_int(
-                self._layout_field_vars["first_data_row"].get(),
-                header_lines + 1 if header_lines else 1,
-            )
+            first_data_row = int((self._layout_field_vars["first_data_row"].get() or "").strip())
         except ValueError:
             if quiet:
                 return None
-            messagebox.showerror("Layout", "Header lines and first data row must be integers.")
+            messagebox.showerror("Layout", "First data row must be an integer.")
             return None
+
+        if first_data_row < 1:
+            if quiet:
+                return None
+            messagebox.showerror("Layout", "First data row must be 1 or greater.")
+            return None
+
+        header_lines = max(0, first_data_row - 1)
 
         separator_label = self._layout_field_vars["separator"].get()
         decimal_label = self._layout_field_vars["decimal"].get()
@@ -784,7 +822,6 @@ class ARVApp(tk.Tk):
         if not self._layout_field_vars:
             return
 
-        self._layout_field_vars["header_lines"].set(str(layout.header_lines))
         self._layout_field_vars["first_data_row"].set(str(layout.first_data_row))
         self._layout_field_vars["separator"].set(self._separator_display(layout.separator))
         self._layout_field_vars["decimal"].set(self._decimal_display(layout.decimal))
@@ -945,12 +982,13 @@ class ARVApp(tk.Tk):
 
         container = ttk.Frame(win, padding=16)
         container.pack(fill=tk.BOTH, expand=True)
-        container.columnconfigure(0, weight=0)
-        container.columnconfigure(1, weight=1)
-        container.rowconfigure(1, weight=1)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(1, weight=0)
+        container.rowconfigure(2, weight=1)
+        container.rowconfigure(3, weight=0)
 
         header = ttk.Frame(container)
-        header.grid(row=0, column=0, columnspan=2, sticky="ew")
+        header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(1, weight=1)
 
         self._layout_file_label_var = tk.StringVar()
@@ -977,13 +1015,18 @@ class ARVApp(tk.Tk):
         ttk.Label(header, text="Saved layouts let you switch quickly between file formats.", foreground="gray")\
             .grid(row=2, column=0, columnspan=5, sticky="w", pady=(6, 0))
 
-        left_panel = ttk.Frame(container)
-        left_panel.grid(row=1, column=0, sticky="ns", padx=(0, 16))
+        top_section = ttk.Frame(container)
+        top_section.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        top_section.columnconfigure(0, weight=0)
+        top_section.columnconfigure(1, weight=1)
+        top_section.rowconfigure(0, weight=1)
+
+        left_panel = ttk.Frame(top_section)
+        left_panel.grid(row=0, column=0, sticky="nsw", padx=(0, 16))
         left_panel.columnconfigure(0, weight=1)
 
         # Prepare field variables
         field_names = [
-            "header_lines",
             "first_data_row",
             "separator",
             "decimal",
@@ -1009,43 +1052,36 @@ class ARVApp(tk.Tk):
 
         spinbox_cls = ttk.Spinbox if hasattr(ttk, "Spinbox") else tk.Spinbox
 
-        ttk.Label(data_frame, text="Header lines").grid(row=0, column=0, sticky="w", pady=(0, 6))
-        header_spin = spinbox_cls(
-            data_frame, from_=0, to=999, width=8, textvariable=self._layout_field_vars["header_lines"], increment=1
-        )
-        header_spin.grid(row=0, column=1, sticky="w", pady=(0, 6))
-
-        ttk.Label(data_frame, text="First data row").grid(row=1, column=0, sticky="w", pady=(0, 6))
+        ttk.Label(data_frame, text="First data row").grid(row=0, column=0, sticky="w", pady=(0, 6))
         first_row_spin = spinbox_cls(
             data_frame, from_=1, to=99999, width=8, textvariable=self._layout_field_vars["first_data_row"], increment=1
         )
-        first_row_spin.grid(row=1, column=1, sticky="w", pady=(0, 6))
+        first_row_spin.grid(row=0, column=1, sticky="w", pady=(0, 6))
 
-        ttk.Label(data_frame, text="Separator").grid(row=2, column=0, sticky="w", pady=(0, 6))
+        ttk.Label(data_frame, text="Separator").grid(row=1, column=0, sticky="w", pady=(0, 6))
         ttk.Combobox(
             data_frame,
             textvariable=self._layout_field_vars["separator"],
             values=["Tab", "Comma", "Semicolon", "Space"],
             state="readonly",
             width=12,
-        ).grid(row=2, column=1, sticky="w", pady=(0, 6))
+        ).grid(row=1, column=1, sticky="w", pady=(0, 6))
 
-        ttk.Label(data_frame, text="Decimal symbol").grid(row=3, column=0, sticky="w", pady=(0, 6))
+        ttk.Label(data_frame, text="Decimal symbol").grid(row=2, column=0, sticky="w", pady=(0, 6))
         ttk.Combobox(
             data_frame,
             textvariable=self._layout_field_vars["decimal"],
             values=["Dot", "Comma"],
             state="readonly",
             width=12,
-        ).grid(row=3, column=1, sticky="w", pady=(0, 6))
+        ).grid(row=2, column=1, sticky="w", pady=(0, 6))
 
         ttk.Label(left_panel, text="Configure only the fields that affect import for your files.", foreground="gray")\
             .grid(row=1, column=0, sticky="w", pady=(12, 0))
 
-        right_panel = ttk.Frame(container)
-        right_panel.grid(row=1, column=1, sticky="nsew")
+        right_panel = ttk.Frame(top_section)
+        right_panel.grid(row=0, column=1, sticky="nsew")
         right_panel.columnconfigure(0, weight=1)
-        right_panel.rowconfigure(1, weight=1)
 
         mapping_frame = ttk.LabelFrame(right_panel, text="Column mapping")
         mapping_frame.grid(row=0, column=0, sticky="ew")
@@ -1099,12 +1135,12 @@ class ARVApp(tk.Tk):
             mapping_frame,
             text="Columns are 1-based. Use the preview below to verify how delimiters split your file.",
             foreground="gray",
-            wraplength=360,
+            wraplength=520,
             justify=tk.LEFT,
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-        preview_frame = ttk.LabelFrame(right_panel, text="Preview of data file")
-        preview_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        preview_frame = ttk.LabelFrame(container, text="Preview of data file")
+        preview_frame.grid(row=2, column=0, sticky="nsew", pady=(16, 0))
         preview_frame.rowconfigure(0, weight=1)
         preview_frame.columnconfigure(0, weight=1)
 
@@ -1125,18 +1161,8 @@ class ARVApp(tk.Tk):
         preview_tree.tag_configure("data_start", background="#e6ffef")
         self._layout_preview_tree = preview_tree
 
-        signal_frame = ttk.LabelFrame(right_panel, text="Signal preview")
-        signal_frame.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
-        ttk.Label(
-            signal_frame,
-            text="Signal preview coming soon. Current settings affect numerical calculations only.",
-            foreground="gray",
-            wraplength=360,
-            justify=tk.LEFT,
-        ).pack(fill=tk.BOTH, expand=True, padx=8, pady=12)
-
         buttons = ttk.Frame(container)
-        buttons.grid(row=2, column=0, columnspan=2, sticky="e", pady=(16, 0))
+        buttons.grid(row=3, column=0, sticky="e", pady=(16, 0))
         ttk.Button(buttons, text="Close", command=lambda: self._close_layout(win)).pack(side=tk.RIGHT)
 
         self._apply_layout_config_to_fields(self._get_active_layout())
@@ -1170,17 +1196,21 @@ class ARVApp(tk.Tk):
             return
 
         tree = self._layout_preview_tree
-        for col in tree["columns"]:
+        existing_columns = tree["columns"]
+        if isinstance(existing_columns, str):
+            existing_columns = (existing_columns,)
+        for col in existing_columns:
             tree.heading(col, text="")
         tree.delete(*tree.get_children())
 
         if not self.filepaths:
             tree["columns"] = ("message",)
             tree.heading("message", text="Preview")
-            tree.column("message", anchor=tk.W, width=400, stretch=True)
+            tree.column("message", anchor=tk.W, stretch=True)
             tree.insert("", tk.END, values=("No files loaded. Add files to preview their layout.",))
             if self._layout_file_label_var is not None:
                 self._layout_file_label_var.set("No file selected.")
+            self._autofit_tree_columns(tree, min_width=200, padding=24, max_width=None)
             return
 
         selection = self.files_list.curselection()
@@ -1202,19 +1232,21 @@ class ARVApp(tk.Tk):
         except Exception as exc:
             tree["columns"] = ("message",)
             tree.heading("message", text="Preview")
-            tree.column("message", anchor=tk.W, width=400, stretch=True)
+            tree.column("message", anchor=tk.W, stretch=True)
             tree.insert(
                 "",
                 tk.END,
                 values=(f"Could not load preview for {os.path.basename(path)}: {exc}",),
             )
+            self._autofit_tree_columns(tree, min_width=200, padding=24, max_width=None)
             return
 
         if not snippet:
             tree["columns"] = ("message",)
             tree.heading("message", text="Preview")
-            tree.column("message", anchor=tk.W, width=400, stretch=True)
+            tree.column("message", anchor=tk.W, stretch=True)
             tree.insert("", tk.END, values=(f"{os.path.basename(path)} is empty.",))
+            self._autofit_tree_columns(tree, min_width=200, padding=24, max_width=None)
             return
 
         parsed_rows = []
@@ -1233,11 +1265,11 @@ class ARVApp(tk.Tk):
         tree["columns"] = columns
 
         tree.heading("row", text="Row")
-        tree.column("row", width=60, anchor=tk.E, stretch=False)
+        tree.column("row", anchor=tk.E, stretch=False)
         for idx in range(1, max_cols + 1):
             col_id = f"col_{idx}"
             tree.heading(col_id, text=f"Col {idx}")
-            tree.column(col_id, width=120, anchor=tk.W, stretch=True)
+            tree.column(col_id, anchor=tk.W, stretch=True)
 
         for lineno, cells in parsed_rows:
             values = [str(lineno)] + [cell for cell in cells] + [""] * (max_cols - len(cells))
@@ -1247,6 +1279,8 @@ class ARVApp(tk.Tk):
             if first_data_row and lineno == first_data_row:
                 tags.append("data_start")
             tree.insert("", tk.END, values=values, tags=tags)
+
+        self._autofit_tree_columns(tree, min_width=60, padding=24, max_width=None)
 
     def open_about(self):
         win = tk.Toplevel(self)
@@ -1337,6 +1371,8 @@ class ARVApp(tk.Tk):
                     "file": os.path.basename(p),
                     "error": str(e),
                 })
+
+        self._autofit_tree_columns(self.tree, min_width=90, padding=28, max_width=None)
 
         if errors:
             self.status.set(f"Done with {len(self.results)} result(s). {errors} file(s) had errors (see table).")
