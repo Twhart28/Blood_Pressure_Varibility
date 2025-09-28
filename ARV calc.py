@@ -10,9 +10,22 @@ import tkinter.font as tkfont
 from dataclasses import dataclass, asdict
 from statistics import mean as _pymean
 from tkinter import ttk, filedialog, messagebox, simpledialog
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 
 # ----------------------------- Core parsing & ARV -----------------------------
+
+def _split_preserving_trailing(text: str, separator: str) -> List[str]:
+    """Split ``text`` while retaining trailing empty fields."""
+    if separator == " ":
+        return text.split()
+    if not separator:
+        return [text]
+    parts = text.split(separator)
+    expected = text.count(separator) + 1
+    if len(parts) < expected:
+        parts.extend([""] * (expected - len(parts)))
+    return parts
+
 
 def parse_header(lines, separator="\t", data_start_override=None):
     """
@@ -47,7 +60,7 @@ def parse_header(lines, separator="\t", data_start_override=None):
             if separator == " ":
                 parts = row.split()
             else:
-                parts = row.split(separator)
+                parts = _split_preserving_trailing(row, separator)
             if len(parts) >= 2 and parts[0].strip().isdigit():
                 data_start_idx = i
 
@@ -133,11 +146,13 @@ def load_series(filepath, layout_config=None):
         if separator == " ":
             row = row_txt.split()
         else:
-            row = row_txt.split(separator)
+            row = _split_preserving_trailing(row_txt, separator)
         if not row or not row[0].strip().isdigit():
             continue
         if len(row) < 1 + n_channels:
-            continue
+            row.extend([""] * (1 + n_channels - len(row)))
+        elif len(row) > 1 + n_channels:
+            row = row[: 1 + n_channels]
 
         vals = row[1:1 + n_channels]
         for name, val in zip(channel_titles, vals):
@@ -1980,7 +1995,7 @@ class ARVApp(tk.Tk):
                 if separator == " ":
                     cells = text.split()
                 else:
-                    cells = text.split(separator)
+                    cells = _split_preserving_trailing(text, separator)
                 parsed_rows.append((lineno, cells))
                 if len(cells) > max_cols:
                     max_cols = len(cells)
