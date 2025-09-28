@@ -180,6 +180,42 @@ def arv(values):
 
 # -------------------------- Outlier filtering (artifacts) ---------------------
 
+FILTER_METHOD_ORDER = ["moving_average", "absolute_change", "std_from_mean"]
+FILTER_METHODS = {
+    "moving_average": {"label": "Moving average"},
+    "absolute_change": {"label": "Absolute beat-beat change"},
+    "std_from_mean": {"label": "STD from mean"},
+}
+_FILTER_LABEL_TO_CODE = {info["label"]: code for code, info in FILTER_METHODS.items()}
+_LEGACY_FILTER_ALIASES = {
+    "rolling": "moving_average",
+    "global": "std_from_mean",
+}
+
+
+def normalize_filter_method(value: Optional[str]) -> str:
+    if not value:
+        return "moving_average"
+    if value in FILTER_METHODS:
+        return value
+    if value in _FILTER_LABEL_TO_CODE:
+        return _FILTER_LABEL_TO_CODE[value]
+    lowered = value.lower()
+    if lowered in _LEGACY_FILTER_ALIASES:
+        return _LEGACY_FILTER_ALIASES[lowered]
+    for label, code in _FILTER_LABEL_TO_CODE.items():
+        if lowered == label.lower():
+            return code
+    normalized = lowered.replace(" ", "_")
+    if normalized in FILTER_METHODS:
+        return normalized
+    return "moving_average"
+
+
+def filter_label_from_value(value: Optional[str]) -> str:
+    code = normalize_filter_method(value)
+    return FILTER_METHODS[code]["label"]
+
 def _nanmean(xs):
     vals = [x for x in xs if not math.isnan(x)]
     return float("nan") if not vals else sum(vals)/len(vals)
@@ -212,13 +248,21 @@ def _mad(xs):
 def filter_outliers_global(values, k_sd=3.0):
     """
     Simple global filter: drop points > k_sd * SD from the global mean.
+    Returns (kept_values, excluded_values).
     """
     m = _nanmean(values)
     s = _nansd(values, ddof=1)
+    clean = [v for v in values if not math.isnan(v)]
     if math.isnan(m) or math.isnan(s) or s == 0:
-        return [v for v in values if not math.isnan(v)]
-    lo, hi = m - k_sd*s, m + k_sd*s
-    return [v for v in values if (not math.isnan(v)) and (lo <= v <= hi)]
+        return clean, []
+    lo, hi = m - k_sd * s, m + k_sd * s
+    kept, excluded = [], []
+    for v in clean:
+        if lo <= v <= hi:
+            kept.append(v)
+        else:
+            excluded.append(v)
+    return kept, excluded
 
 def filter_outliers_rolling_robust(values, interval_s, window_s=15.0, k_mad=4.0):
     """
@@ -230,12 +274,12 @@ def filter_outliers_rolling_robust(values, interval_s, window_s=15.0, k_mad=4.0)
     vals = [float(v) for v in values]
     n = len(vals)
     if n == 0 or interval_s <= 0:
-        return [v for v in vals if not math.isnan(v)]
+        return [v for v in vals if not math.isnan(v)], []
 
     w = max(3, int(round(window_s / interval_s)))  # window length in samples
     half = w // 2
 
-    kept = []
+    kept, excluded = [], []
     for i in range(n):
         lo = max(0, i - half)
         hi = min(n, i + half + 1)
@@ -260,14 +304,44 @@ def filter_outliers_rolling_robust(values, interval_s, window_s=15.0, k_mad=4.0)
             # if flat window, keep point if exactly med
             if abs(x - med) <= 1e-12:
                 kept.append(x)
+            else:
+                excluded.append(x)
         else:
             if abs(x - med) <= k_mad * sigma:
                 kept.append(x)
-    return kept
+            else:
+                excluded.append(x)
+    return kept, excluded
 
 
-def compute_metrics(series, use_filter=False, filter_method="rolling", interval_s=1.0,
-                    k_sd=3.0, window_s=15.0, k_mad=4.0):
+def filter_outliers_absolute_change(values, max_delta):
+    """Exclude beats where the absolute change from the previous kept beat exceeds ``max_delta``."""
+    clean = [v for v in values if not math.isnan(v)]
+    if not clean:
+        return [], []
+    try:
+        threshold = float(max_delta)
+    except (TypeError, ValueError):
+        threshold = 0.0
+    if threshold <= 0:
+        return clean, []
+    kept, excluded = [], []
+    prev = None
+    for v in clean:
+        if prev is None:
+            kept.append(v)
+            prev = v
+            continue
+        if abs(v - prev) <= threshold:
+            kept.append(v)
+            prev = v
+        else:
+            excluded.append(v)
+    return kept, excluded
+
+
+def compute_metrics(series, use_filter=False, filter_method="moving_average", interval_s=1.0,
+                    k_sd=3.0, window_s=15.0, k_mad=4.0, delta_cutoff=0.0):
     """
     Returns dict with:
       n_raw, n_kept, mean, sd, cv, arv
@@ -276,14 +350,21 @@ def compute_metrics(series, use_filter=False, filter_method="rolling", interval_
     n_raw = len(raw)
 
     if not use_filter:
-        kept = raw
+        kept = list(raw)
+        excluded = []
     else:
-        if filter_method == "global":
-            kept = filter_outliers_global(raw, k_sd=float(k_sd))
+        method_code = normalize_filter_method(filter_method)
+        if method_code == "std_from_mean":
+            kept, excluded = filter_outliers_global(raw, k_sd=float(k_sd))
+        elif method_code == "absolute_change":
+            kept, excluded = filter_outliers_absolute_change(raw, max_delta=float(delta_cutoff))
         else:
-            kept = filter_outliers_rolling_robust(raw, interval_s=interval_s,
-                                                  window_s=float(window_s),
-                                                  k_mad=float(k_mad))
+            kept, excluded = filter_outliers_rolling_robust(
+                raw,
+                interval_s=interval_s,
+                window_s=float(window_s),
+                k_mad=float(k_mad),
+            )
     n_kept = len(kept)
     m = _pymean(kept) if n_kept else float("nan")
 
@@ -297,12 +378,13 @@ def compute_metrics(series, use_filter=False, filter_method="rolling", interval_
         "mean": m,
         "sd": sd,
         "cv": cv,
-        "arv": arv_val
+        "arv": arv_val,
+        "excluded_values": excluded,
     }
 
 
 def compute_all_for_file(path, window_spec, use_filter, filter_method,
-                         k_sd, window_s, k_mad, layout_config=None):
+                         k_sd, window_s, k_mad, delta_cutoff, layout_config=None):
     interval_s, series_map, channel_titles = load_series(path, layout_config=layout_config)
 
     layout_cfg = layout_config or LayoutConfig.default()
@@ -348,13 +430,13 @@ def compute_all_for_file(path, window_spec, use_filter, filter_method,
     mapp = series_map[map_key][start_idx:end_idx]
 
     ms_sbp = compute_metrics(
-        sbp, use_filter, filter_method, interval_s, k_sd, window_s, k_mad
+        sbp, use_filter, filter_method, interval_s, k_sd, window_s, k_mad, delta_cutoff
     )
     ms_dbp = compute_metrics(
-        dbp, use_filter, filter_method, interval_s, k_sd, window_s, k_mad
+        dbp, use_filter, filter_method, interval_s, k_sd, window_s, k_mad, delta_cutoff
     )
     ms_map = compute_metrics(
-        mapp, use_filter, filter_method, interval_s, k_sd, window_s, k_mad
+        mapp, use_filter, filter_method, interval_s, k_sd, window_s, k_mad, delta_cutoff
     )
 
     return {
@@ -386,6 +468,11 @@ def compute_all_for_file(path, window_spec, use_filter, filter_method,
         "SD_MAP": ms_map["sd"],
         "CV_MAP_pct": ms_map["cv"],
         "ARV_MAP": ms_map["arv"],
+        "excluded_values": {
+            "SBP": list(ms_sbp.get("excluded_values", [])),
+            "DBP": list(ms_dbp.get("excluded_values", [])),
+            "MAP": list(ms_map.get("excluded_values", [])),
+        },
     }
 
 # ----------------------------- Helpers for GUI -----------------------------
@@ -645,10 +732,11 @@ class ARVApp(tk.Tk):
         self.start_offset_var = tk.StringVar(value="0")
         self.end_offset_var = tk.StringVar(value="0")
         self.filter_on = tk.BooleanVar(value=False)
-        self.filter_method = tk.StringVar(value="rolling")
+        self.filter_method = tk.StringVar(value=FILTER_METHODS["moving_average"]["label"])
         self.k_sd_var = tk.StringVar(value="3.0")
         self.window_s_var = tk.StringVar(value="15")
         self.k_mad_var = tk.StringVar(value="4.0")
+        self.delta_cutoff_var = tk.StringVar(value="20")
         self.output_std = tk.BooleanVar(value=True)
         self.output_cov = tk.BooleanVar(value=True)
         self.output_arv = tk.BooleanVar(value=True)
@@ -669,6 +757,10 @@ class ARVApp(tk.Tk):
         self._layout_field_vars = {}
         self._layout_field_traces = []
         self._layout_config_combo = None
+
+        self._exclusions_window = None
+        self._exclusion_tree = None
+        self._exclusion_records = []
 
         # Styling (optional nicer look)
         self.style = ttk.Style(self)
@@ -713,6 +805,7 @@ class ARVApp(tk.Tk):
 
         ttk.Button(controls, text="Compute", command=self.compute).pack(side=tk.RIGHT)
         ttk.Button(controls, text="Save CSV…", command=self.save_csv).pack(side=tk.RIGHT, padx=(0, 8))
+        ttk.Button(controls, text="View exclusions", command=self.view_exclusions).pack(side=tk.RIGHT, padx=(0, 8))
 
         # Results table
         self._tree_columns = (
@@ -800,6 +893,7 @@ class ARVApp(tk.Tk):
         self.update_file_list()
         for i in self.tree.get_children():
             self.tree.delete(i)
+        self._refresh_exclusions_window()
         self.status.set("Cleared files and results.")
 
     def update_file_list(self):
@@ -1292,8 +1386,8 @@ class ARVApp(tk.Tk):
 
         self._update_window_mode_frames()
 
-        # Raw measures filtering
-        filter_frame = ttk.LabelFrame(content, text="Raw measures filtering")
+        # Artifact filtering
+        filter_frame = ttk.LabelFrame(content, text="Artifact filtering")
         filter_frame.pack(fill=tk.X, expand=True, pady=(0, 12))
         filter_frame.columnconfigure(1, weight=1)
 
@@ -1305,37 +1399,45 @@ class ARVApp(tk.Tk):
         ).grid(row=0, column=0, columnspan=2, sticky="w")
 
         ttk.Label(filter_frame, text="Filter method").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        method_labels = [FILTER_METHODS[code]["label"] for code in FILTER_METHOD_ORDER]
         method_combo = ttk.Combobox(
             filter_frame,
             textvariable=self.filter_method,
-            values=["rolling", "global"],
+            values=method_labels,
             state="readonly",
-            width=12,
+            width=26,
         )
         method_combo.grid(row=1, column=1, padx=(12, 0), pady=(8, 0), sticky="w")
         method_combo.bind("<<ComboboxSelected>>", self._update_filter_setting_frames)
         self._filter_method_combo = method_combo
 
-        rolling_frame = ttk.Frame(filter_frame)
-        rolling_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        ttk.Label(rolling_frame, text="Window seconds").grid(row=0, column=0, sticky="w")
-        window_entry = ttk.Entry(rolling_frame, textvariable=self.window_s_var, width=8)
+        moving_frame = ttk.Frame(filter_frame)
+        moving_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(moving_frame, text="Window seconds").grid(row=0, column=0, sticky="w")
+        window_entry = ttk.Entry(moving_frame, textvariable=self.window_s_var, width=8)
         window_entry.grid(row=0, column=1, sticky="w", padx=(12, 0))
-        ttk.Label(rolling_frame, text="k_MAD").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        k_mad_entry = ttk.Entry(rolling_frame, textvariable=self.k_mad_var, width=8)
+        ttk.Label(moving_frame, text="k_MAD").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        k_mad_entry = ttk.Entry(moving_frame, textvariable=self.k_mad_var, width=8)
         k_mad_entry.grid(row=1, column=1, sticky="w", padx=(12, 0), pady=(6, 0))
 
-        global_frame = ttk.Frame(filter_frame)
-        global_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        ttk.Label(global_frame, text="k_SD").grid(row=0, column=0, sticky="w")
-        k_sd_entry = ttk.Entry(global_frame, textvariable=self.k_sd_var, width=8)
+        delta_frame = ttk.Frame(filter_frame)
+        delta_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(delta_frame, text="Max delta").grid(row=0, column=0, sticky="w")
+        delta_entry = ttk.Entry(delta_frame, textvariable=self.delta_cutoff_var, width=8)
+        delta_entry.grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+        std_frame = ttk.Frame(filter_frame)
+        std_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(std_frame, text="k_SD").grid(row=0, column=0, sticky="w")
+        k_sd_entry = ttk.Entry(std_frame, textvariable=self.k_sd_var, width=8)
         k_sd_entry.grid(row=0, column=1, sticky="w", padx=(12, 0))
 
         self._filter_method_frames = {
-            "rolling": rolling_frame,
-            "global": global_frame,
+            "moving_average": moving_frame,
+            "absolute_change": delta_frame,
+            "std_from_mean": std_frame,
         }
-        self._filter_method_inputs = [window_entry, k_mad_entry, k_sd_entry]
+        self._filter_method_inputs = [window_entry, k_mad_entry, delta_entry, k_sd_entry]
         for frame in self._filter_method_frames.values():
             frame.grid_remove()
 
@@ -1354,19 +1456,19 @@ class ARVApp(tk.Tk):
         ).grid(row=0, column=0, columnspan=3, sticky="w")
         ttk.Checkbutton(
             metrics_frame,
-            text="STD",
+            text="Standard deviation",
             variable=self.output_std,
             command=self._on_metric_preference_changed,
         ).grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Checkbutton(
             metrics_frame,
-            text="CoV",
+            text="Coefficient of Variation",
             variable=self.output_cov,
             command=self._on_metric_preference_changed,
         ).grid(row=1, column=1, sticky="w", pady=(8, 0), padx=(16, 0))
         ttk.Checkbutton(
             metrics_frame,
-            text="ARV",
+            text="Average real variability",
             variable=self.output_arv,
             command=self._on_metric_preference_changed,
         ).grid(row=1, column=2, sticky="w", pady=(8, 0), padx=(16, 0))
@@ -1472,7 +1574,7 @@ class ARVApp(tk.Tk):
     def _update_filter_setting_frames(self, *_args):
         if not self._filter_method_frames:
             return
-        method = (self.filter_method.get() or "rolling").lower()
+        method = normalize_filter_method(self.filter_method.get())
         for frame in self._filter_method_frames.values():
             frame.grid_remove()
         selected = self._filter_method_frames.get(method)
@@ -1505,6 +1607,138 @@ class ARVApp(tk.Tk):
                 values.append(fmt_float(result.get(col), 6))
         return values
 
+    def _gather_exclusion_records(self):
+        records = []
+        for res in self.results:
+            if not isinstance(res, dict):
+                continue
+            if res.get("error"):
+                continue
+            excluded_map = res.get("excluded_values") or {}
+            if not isinstance(excluded_map, dict):
+                continue
+            file_name = res.get("file", "")
+            ordered_measures = ("SBP", "DBP", "MAP")
+            for measure in ordered_measures:
+                values = excluded_map.get(measure)
+                if values:
+                    records.append({
+                        "file": file_name,
+                        "measure": measure,
+                        "values": list(values),
+                    })
+            for measure, values in excluded_map.items():
+                if measure in ordered_measures:
+                    continue
+                if values:
+                    records.append({
+                        "file": file_name,
+                        "measure": measure,
+                        "values": list(values),
+                    })
+        return records
+
+    def _refresh_exclusions_window(self):
+        if self._exclusions_window is None or not self._exclusions_window.winfo_exists():
+            self._exclusion_tree = None
+            self._exclusion_records = []
+            return
+        tree = self._exclusion_tree
+        if tree is None:
+            return
+        tree.delete(*tree.get_children())
+        records = self._gather_exclusion_records()
+        self._exclusion_records = records
+        if not records:
+            tree.insert("", tk.END, values=("No excluded values recorded.", "", ""))
+        else:
+            for rec in records:
+                formatted = ", ".join(fmt_float(val, 6) for val in rec["values"])
+                tree.insert("", tk.END, values=(rec["file"], rec["measure"], formatted))
+        self._autofit_tree_columns(tree, min_width=120, padding=32, max_width=None)
+
+    def _close_exclusions_window(self):
+        win = self._exclusions_window
+        if win is not None and win.winfo_exists():
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+        self._exclusions_window = None
+        self._exclusion_tree = None
+        self._exclusion_records = []
+
+    def _export_exclusions_csv(self):
+        records = self._gather_exclusion_records()
+        value_rows = []
+        for rec in records:
+            for value in rec["values"]:
+                value_rows.append((rec["file"], rec["measure"], fmt_float(value, 10)))
+        if not value_rows:
+            messagebox.showinfo("No exclusions", "No excluded values to export.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save exclusions CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(["file", "measurement", "excluded_value"])
+                for file_name, measure, value in value_rows:
+                    writer.writerow([file_name, measure, value])
+            self.status.set(f"Saved exclusion CSV: {path}")
+        except Exception as exc:
+            messagebox.showerror("Export error", str(exc))
+
+    def view_exclusions(self):
+        if self._exclusions_window is not None and self._exclusions_window.winfo_exists():
+            self._exclusions_window.lift()
+            self._refresh_exclusions_window()
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Excluded blood pressure values")
+        win.transient(self)
+        win.resizable(True, True)
+        self._exclusions_window = win
+
+        content = ttk.Frame(win, padding=12)
+        content.pack(fill=tk.BOTH, expand=True)
+        content.columnconfigure(0, weight=1)
+        content.rowconfigure(0, weight=1)
+
+        columns = ("file", "measure", "values")
+        tree = ttk.Treeview(content, columns=columns, show="headings", height=14)
+        tree.heading("file", text="Participant")
+        tree.heading("measure", text="Measurement")
+        tree.heading("values", text="Excluded values")
+        tree.column("file", anchor=tk.W, width=200, stretch=False)
+        tree.column("measure", anchor=tk.W, width=140, stretch=False)
+        tree.column("values", anchor=tk.W, stretch=True)
+        tree.grid(row=0, column=0, sticky="nsew")
+
+        y_scroll = ttk.Scrollbar(content, orient=tk.VERTICAL, command=tree.yview)
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        tree.configure(yscrollcommand=y_scroll.set)
+
+        x_scroll = ttk.Scrollbar(content, orient=tk.HORIZONTAL, command=tree.xview)
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        tree.configure(xscrollcommand=x_scroll.set)
+
+        btns = ttk.Frame(content)
+        btns.grid(row=2, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(btns, text="Close", command=self._close_exclusions_window).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Export CSV…", command=self._export_exclusions_csv).pack(side=tk.RIGHT, padx=(0, 8))
+
+        self._exclusion_tree = tree
+        win.protocol("WM_DELETE_WINDOW", self._close_exclusions_window)
+
+        self._refresh_exclusions_window()
+
     def _export_preferences(self) -> Dict[str, Any]:
         return {
             "start_mode": self.start_mode_var.get(),
@@ -1522,6 +1756,7 @@ class ARVApp(tk.Tk):
             "k_sd": self.k_sd_var.get(),
             "window_s": self.window_s_var.get(),
             "k_mad": self.k_mad_var.get(),
+            "delta_cutoff": self.delta_cutoff_var.get(),
             "show_std": bool(self.output_std.get()),
             "show_cov": bool(self.output_cov.get()),
             "show_arv": bool(self.output_arv.get()),
@@ -1541,10 +1776,19 @@ class ARVApp(tk.Tk):
         self.end_comment_var.set(snapshot.get("end_comment", ""))
         self.end_offset_var.set(snapshot.get("end_offset", "0"))
         self.filter_on.set(bool(snapshot.get("filter_on", False)))
-        self.filter_method.set(snapshot.get("filter_method", "rolling"))
+        saved_method = snapshot.get("filter_method", FILTER_METHODS["moving_average"]["label"])
+        self.filter_method.set(filter_label_from_value(saved_method))
         self.k_sd_var.set(snapshot.get("k_sd", "3.0"))
         self.window_s_var.set(snapshot.get("window_s", "15"))
         self.k_mad_var.set(snapshot.get("k_mad", "4.0"))
+        delta_value = snapshot.get("delta_cutoff", "20")
+        if delta_value is None:
+            delta_text = "20"
+        elif delta_value == "":
+            delta_text = ""
+        else:
+            delta_text = str(delta_value)
+        self.delta_cutoff_var.set(delta_text)
         self.output_std.set(bool(snapshot.get("show_std", True)))
         self.output_cov.set(bool(snapshot.get("show_cov", True)))
         self.output_arv.set(bool(snapshot.get("show_arv", True)))
@@ -2063,7 +2307,7 @@ class ARVApp(tk.Tk):
 
         # parse filter params
         use_filter = bool(self.filter_on.get())
-        method = self.filter_method.get()
+        method = normalize_filter_method(self.filter_method.get())
         try:
             k_sd = float(self.k_sd_var.get())
         except Exception:
@@ -2076,6 +2320,10 @@ class ARVApp(tk.Tk):
             k_mad = float(self.k_mad_var.get())
         except Exception:
             k_mad = 4.0
+        try:
+            delta_cutoff = float(self.delta_cutoff_var.get())
+        except Exception:
+            delta_cutoff = 0.0
 
         # compute
         self.results = []
@@ -2095,6 +2343,7 @@ class ARVApp(tk.Tk):
                     k_sd=k_sd,
                     window_s=window_s,
                     k_mad=k_mad,
+                    delta_cutoff=delta_cutoff,
                     layout_config=self._get_active_layout(),
                 )
                 res["error"] = ""
@@ -2115,6 +2364,7 @@ class ARVApp(tk.Tk):
             self.status.set(f"Done with {len(self.results)} result(s). {errors} file(s) had errors (see table).")
         else:
             self.status.set(f"Done. Computed metrics for {len(self.results)} file(s).")
+        self._refresh_exclusions_window()
 
     def save_csv(self):
         if not self.results:
