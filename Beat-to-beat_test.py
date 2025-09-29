@@ -146,23 +146,27 @@ def _parse_list_field(raw_value: str) -> List[str]:
     return merged or tokens
 
 
-def _scan_bp_file(file_path: Path, max_numeric_rows: int = 20) -> BPFilePreview:
-    """Perform a quick pass to gather metadata and column previews."""
+def _parse_bp_header(file_path: Path) -> Tuple[Dict[str, str], List[int], List[str]]:
+    """Return metadata, line numbers to skip, and inferred column names.
+
+    The parser treats blank lines, comments, and ``key=value`` metadata entries
+    as non-numeric content.  All remaining rows are expected to contain the
+    same number of whitespace-delimited values; inconsistent rows raise a
+    ``ValueError`` instead of being silently truncated.
+    """
 
     metadata: Dict[str, str] = {}
-    preview_rows: List[List[float]] = []
     skiprows: List[int] = []
-    numeric_rows = 0
     column_count: Optional[int] = None
 
     with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
         for idx, raw_line in enumerate(handle):
-            line = raw_line.strip()
-            if not line:
+            stripped = raw_line.strip()
+            if not stripped:
                 skiprows.append(idx)
                 continue
 
-            candidate = line
+            candidate = stripped
             if "#" in candidate:
                 candidate = candidate.split("#", 1)[0].strip()
                 if not candidate:
@@ -175,25 +179,18 @@ def _scan_bp_file(file_path: Path, max_numeric_rows: int = 20) -> BPFilePreview:
                 skiprows.append(idx)
                 continue
 
-            parts = [p for p in re.split(r"\s+", candidate) if p]
-            if not parts:
+            values = np.fromstring(candidate, sep=" ")
+            if values.size == 0:
                 skiprows.append(idx)
                 continue
 
-            try:
-                row = [float(p) if p.lower() != "nan" else math.nan for p in parts]
-            except ValueError as exc:
-                raise ValueError(
-                    f"Could not parse data row at line {idx + 1}: {raw_line.strip()!r}"
-                ) from exc
-
             if column_count is None:
-                column_count = len(row)
-
-            preview_rows.append(row)
-            numeric_rows += 1
-            if numeric_rows >= max_numeric_rows:
-                break
+                column_count = int(values.size)
+            elif int(values.size) != column_count:
+                raise ValueError(
+                    "Encountered data row with an unexpected column count at "
+                    f"line {idx + 1}: expected {column_count}, found {int(values.size)}."
+                )
 
     if column_count is None:
         raise ValueError("No numeric data found in file.")
@@ -204,8 +201,32 @@ def _scan_bp_file(file_path: Path, max_numeric_rows: int = 20) -> BPFilePreview:
     else:
         column_names = [f"col_{idx}" for idx in range(column_count)]
 
-    preview_frame = pd.DataFrame(preview_rows, columns=column_names)
-    return BPFilePreview(metadata=metadata, column_names=column_names, preview=preview_frame, skiprows=skiprows)
+    return metadata, skiprows, column_names
+
+
+def _scan_bp_file(file_path: Path, max_numeric_rows: int = 20) -> BPFilePreview:
+    """Perform a quick pass to gather metadata and column previews."""
+
+    metadata, skiprows, column_names = _parse_bp_header(file_path)
+    preview_frame = pd.read_csv(
+        file_path,
+        delim_whitespace=True,
+        comment="#",
+        header=None,
+        names=column_names,
+        skiprows=skiprows,
+        nrows=max_numeric_rows,
+        engine="python",
+        na_values=["nan", "NaN", "NA"],
+        dtype=float,
+    )
+
+    return BPFilePreview(
+        metadata=metadata,
+        column_names=column_names,
+        preview=preview_frame,
+        skiprows=skiprows,
+    )
 
 
 def _default_column_selection(column_names: Sequence[str], requested: Optional[str], *, fallback: Optional[str] = None) -> str:
@@ -529,7 +550,10 @@ def detect_systolic_peaks(
     rapid systolic upstroke and then it validates peaks based on their
     prominence relative to neighbouring troughs.  To emulate that behaviour we
     detrend the signal, analyse the velocity profile, and adaptively gate the
-    candidate peaks before evaluating their prominences.
+    candidate peaks before evaluating their prominences.  Peak candidates are
+    generated in a vectorised fashion (using :func:`scipy.signal.find_peaks`
+    when available) to reduce Python-level looping while preserving the legacy
+    gating heuristics.
     """
 
     if signal.size == 0:
@@ -647,73 +671,79 @@ def detect_systolic_peaks(
     adaptive_floor = max(amplitude_span * prominence_noise_factor, noise_proxy * 5.0)
     min_prominence = max(prominence_floor, adaptive_floor)
 
-    peaks: List[int] = []
-    prominences: List[float] = []
-    notches: List[int] = []
-
     downstroke_grace = max(1, int(round(0.02 * fs)))
     sustained_negative = max(1, int(round(0.02 * fs)))
     notch_guard = max(1, int(round(0.05 * fs)))
-    suppress_until = -1
 
-    for onset in candidate_onsets:
-        if onset <= suppress_until:
-            continue
+    if sp_signal is not None:
+        candidate_peaks, _ = sp_signal.find_peaks(
+            signal,
+            distance=min_distance,
+            prominence=min_prominence,
+        )
+        candidate_peaks = np.asarray(candidate_peaks, dtype=int)
+    else:
+        candidate_peaks, _ = find_prominent_peaks(
+            signal,
+            fs=fs,
+            min_rr=min_rr,
+            max_rr=max_rr,
+            min_prominence=min_prominence,
+        )
 
-        search_start = int(onset)
-        search_end = min(signal.size, search_start + search_horizon)
-        if search_end <= search_start:
-            continue
+    if candidate_peaks.size == 0:
+        return (
+            np.array([], dtype=int),
+            np.array([], dtype=float),
+            np.array([], dtype=int),
+            calibration_segments,
+        )
 
-        segment = signal[search_start:search_end]
-        velocity_window = velocity[search_start:search_end]
+    onset_indices = np.searchsorted(candidate_onsets, candidate_peaks, side="right") - 1
+    valid_mask = onset_indices >= 0
+    if valid_mask.any():
+        onset_samples = candidate_onsets[onset_indices[valid_mask]]
+        within_window = candidate_peaks[valid_mask] - onset_samples <= search_horizon
+        valid_mask_indices = np.flatnonzero(valid_mask)
+        keep = valid_mask_indices[within_window]
+    else:
+        keep = np.array([], dtype=int)
 
-        peak_rel = int(np.argmax(segment))
+    if keep.size == 0:
+        return (
+            np.array([], dtype=int),
+            np.array([], dtype=float),
+            np.array([], dtype=int),
+            calibration_segments,
+        )
 
-        seen_positive = False
-        run_length = 0
-        sustained_limit: Optional[int] = None
-        for idx, vel_val in enumerate(velocity_window):
-            if vel_val > 0:
-                seen_positive = True
-                run_length = 0
-            elif vel_val <= 0 and seen_positive:
-                run_length += 1
-                if run_length >= sustained_negative:
-                    sustained_limit = idx + downstroke_grace
-                    break
-            else:
-                run_length = 0
+    candidate_peaks = candidate_peaks[keep]
+    onset_samples = candidate_onsets[onset_indices[keep]]
 
-        if sustained_limit is not None:
-            limit = min(segment.size, max(sustained_limit, peak_rel + 1))
-            if limit > 0:
-                capped_segment = segment[:limit]
-                if capped_segment.size:
-                    peak_rel = int(np.argmax(capped_segment))
-        else:
-            descending = np.flatnonzero(velocity_window <= 0)
-            if descending.size:
-                limit = descending[0] + downstroke_grace
-                limit = min(limit, segment.size)
-                if limit > 0:
-                    capped_segment = segment[:limit]
-                    if capped_segment.size:
-                        peak_rel = int(np.argmax(capped_segment))
+    order = np.lexsort((-signal[candidate_peaks], onset_samples))
+    sorted_onsets = onset_samples[order]
+    _, unique_indices = np.unique(sorted_onsets, return_index=True)
+    chosen = order[unique_indices]
+    candidate_peaks = candidate_peaks[chosen]
+    onset_samples = onset_samples[chosen]
 
-        peak_idx = search_start + peak_rel
+    order = np.argsort(candidate_peaks, kind="mergesort")
+    candidate_peaks = candidate_peaks[order]
 
+    def _estimate_prominence(peak_idx: int) -> Optional[float]:
         left = signal[max(0, peak_idx - max_distance) : peak_idx + 1]
         right = signal[peak_idx : min(signal.size, peak_idx + max_distance)]
+
+        left = left[np.isfinite(left)]
+        right = right[np.isfinite(right)]
         if left.size == 0 or right.size == 0:
-            continue
+            return None
 
         left_min = float(np.min(left))
         right_min = float(np.min(right))
-        prominence = float(signal[peak_idx] - max(left_min, right_min))
-        if prominence < min_prominence:
-            continue
+        return float(signal[peak_idx] - max(left_min, right_min))
 
+    def _estimate_notch(peak_idx: int) -> int:
         notch_idx = -1
         notch_start = peak_idx + 1
         notch_end = min(signal.size, peak_idx + int(round(0.45 * fs)))
@@ -729,20 +759,62 @@ def detect_systolic_peaks(
                 local_end = min(signal.size, zero_idx + window_radius)
                 if local_end > local_start:
                     local_segment = signal[local_start:local_end]
-                    notch_rel = int(np.argmin(local_segment))
-                    notch_idx = local_start + notch_rel
+                    if np.any(np.isfinite(local_segment)):
+                        notch_rel = int(np.nanargmin(local_segment))
+                        notch_idx = local_start + notch_rel
+        return notch_idx
+
+    def _has_sustained_downstroke(peak_idx: int) -> bool:
+        window_end = min(signal.size, peak_idx + sustained_negative + downstroke_grace + 1)
+        if window_end <= peak_idx:
+            return False
+        velocity_window = velocity[peak_idx:window_end]
+        finite_velocity = velocity_window[np.isfinite(velocity_window)]
+        if finite_velocity.size == 0:
+            return False
+        negative_mask = velocity_window <= 0
+        if negative_mask.size < sustained_negative:
+            return False
+        kernel = np.ones(sustained_negative, dtype=int)
+        sustained = np.convolve(negative_mask.astype(int), kernel, mode="valid")
+        return bool(np.any(sustained >= sustained_negative))
+
+    peaks: List[int] = []
+    prominences: List[float] = []
+    notches: List[int] = []
+    suppress_until = -1
+
+    for peak_idx in candidate_peaks:
+        prominence = _estimate_prominence(peak_idx)
+        if prominence is None or prominence < min_prominence:
+            continue
+        if not _has_sustained_downstroke(peak_idx):
+            continue
+
         if peaks and peak_idx - peaks[-1] < min_distance:
             if signal[peak_idx] > signal[peaks[-1]]:
                 peaks[-1] = peak_idx
                 prominences[-1] = prominence
-                notches[-1] = notch_idx
-                suppress_until = (notch_idx if notch_idx >= 0 else peak_idx) + notch_guard
+                notches[-1] = _estimate_notch(peak_idx)
+                suppress_until = (
+                    notches[-1] if notches[-1] >= 0 else peak_idx
+                ) + notch_guard
             continue
 
+        if peak_idx <= suppress_until:
+            if peaks and signal[peak_idx] > signal[peaks[-1]]:
+                peaks[-1] = peak_idx
+                prominences[-1] = prominence
+                notches[-1] = _estimate_notch(peak_idx)
+                suppress_until = (
+                    notches[-1] if notches[-1] >= 0 else peaks[-1]
+                ) + notch_guard
+            continue
+
+        notch_idx = _estimate_notch(peak_idx)
         peaks.append(peak_idx)
         prominences.append(prominence)
         notches.append(notch_idx)
-
         suppress_until = (notch_idx if notch_idx >= 0 else peak_idx) + notch_guard
 
     if peaks:
