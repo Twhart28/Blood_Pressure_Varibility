@@ -505,13 +505,15 @@ def derive_beats(
             pressure[finite_mask],
         )
 
+    min_rr, max_rr = config.rr_bounds
+
     filtered = zero_phase_filter(pressure_filled, fs=fs)
     smoothed = smooth_signal(filtered, window_seconds=0.03, fs=fs)
     systolic_indices, prominences = detect_systolic_peaks(
         smoothed,
         fs=fs,
-        min_rr=config.rr_bounds[0],
-        max_rr=config.rr_bounds[1],
+        min_rr=min_rr,
+        max_rr=max_rr,
         prominence_floor=config.min_prominence,
         prominence_noise_factor=config.prominence_noise_factor,
     )
