@@ -182,9 +182,120 @@ def parse_interval(metadata: Dict[str, str], frame: pd.DataFrame) -> float:
 def smooth_signal(signal: np.ndarray, window_seconds: float, fs: float) -> np.ndarray:
     """Apply a simple moving average filter to suppress high-frequency noise."""
 
-    window_samples = max(1, int(window_seconds * fs))
-    kernel = np.ones(window_samples) / window_samples
+    window_samples = max(1, int(round(window_seconds * fs)))
+    if window_samples <= 1:
+        return signal.astype(float, copy=False)
+
+    kernel = np.ones(window_samples, dtype=float) / float(window_samples)
     return np.convolve(signal, kernel, mode="same")
+
+
+def detrend_signal(signal: np.ndarray, fs: float, window_seconds: float = 0.6) -> np.ndarray:
+    """Remove slow-varying trends using a long moving-average window."""
+
+    if window_seconds <= 0:
+        return signal
+
+    baseline = smooth_signal(signal, window_seconds=window_seconds, fs=fs)
+    return signal - baseline
+
+
+def detect_systolic_peaks(
+    signal: np.ndarray,
+    fs: float,
+    *,
+    min_rr: float,
+    max_rr: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Detect systolic peaks using adaptive upstroke and prominence checks.
+
+    The Lab chart module applies a two-step process: first it emphasises the
+    rapid systolic upstroke and then it validates peaks based on their
+    prominence relative to neighbouring troughs.  To emulate that behaviour we
+    detrend the signal, analyse the velocity profile, and adaptively gate the
+    candidate peaks before evaluating their prominences.
+    """
+
+    if signal.size == 0:
+        return np.array([], dtype=int), np.array([], dtype=float)
+
+    detrended = detrend_signal(signal, fs, window_seconds=0.6)
+    velocity = np.gradient(detrended)
+    velocity = smooth_signal(velocity, window_seconds=0.03, fs=fs)
+    positive_velocity = np.clip(velocity, a_min=0.0, a_max=None)
+
+    if not np.any(positive_velocity > 0):
+        return np.array([], dtype=int), np.array([], dtype=float)
+
+    baseline = float(np.median(positive_velocity[positive_velocity > 0]))
+    mad = float(np.median(np.abs(positive_velocity[positive_velocity > 0] - baseline)))
+    if mad == 0.0:
+        mad = float(np.std(positive_velocity))
+    if mad == 0.0:
+        mad = 1.0
+
+    upstroke_threshold = baseline + 2.5 * mad
+    if upstroke_threshold <= 0:
+        upstroke_threshold = baseline * 1.5 if baseline > 0 else 0.5
+
+    crossings = np.flatnonzero(
+        (positive_velocity[:-1] < upstroke_threshold)
+        & (positive_velocity[1:] >= upstroke_threshold)
+    )
+    if crossings.size:
+        candidate_onsets = crossings + 1
+    else:
+        candidate_onsets = np.arange(signal.size)
+
+    min_distance = max(1, int(round(min_rr * fs)))
+    max_distance = max(min_distance + 1, int(round(max_rr * fs)))
+    search_horizon = max(min_distance, int(round(0.45 * fs)))
+
+    amplitude_span = float(np.percentile(signal, 95) - np.percentile(signal, 5))
+    min_prominence = max(8.0, 0.18 * amplitude_span)
+
+    peaks: List[int] = []
+    prominences: List[float] = []
+    last_peak = -max_distance
+
+    for onset in candidate_onsets:
+        search_start = int(onset)
+        search_end = min(signal.size, search_start + search_horizon)
+        if search_end <= search_start:
+            continue
+
+        segment = signal[search_start:search_end]
+        peak_rel = int(np.argmax(segment))
+        peak_idx = search_start + peak_rel
+
+        if peak_idx - last_peak < min_distance:
+            if peaks and signal[peak_idx] > signal[peaks[-1]]:
+                peaks[-1] = peak_idx
+            continue
+
+        left = signal[max(0, peak_idx - max_distance) : peak_idx + 1]
+        right = signal[peak_idx : min(signal.size, peak_idx + max_distance)]
+        if left.size == 0 or right.size == 0:
+            continue
+
+        left_min = float(np.min(left))
+        right_min = float(np.min(right))
+        prominence = float(signal[peak_idx] - max(left_min, right_min))
+        if prominence < min_prominence:
+            continue
+
+        peaks.append(peak_idx)
+        prominences.append(prominence)
+        last_peak = peak_idx
+
+    if len(peaks) < 3:
+        fallback_peaks, fallback_prom = find_prominent_peaks(
+            signal, fs=fs, min_rr=min_rr, max_rr=max_rr, min_prominence=min_prominence
+        )
+        if fallback_peaks.size:
+            return fallback_peaks, fallback_prom
+
+    return np.asarray(peaks, dtype=int), np.asarray(prominences, dtype=float)
 
 
 def find_prominent_peaks(
@@ -275,23 +386,33 @@ def derive_beats(
             pressure[finite_mask],
         )
 
-    smoothed = smooth_signal(pressure_filled, window_seconds=0.04, fs=fs)
-    systolic_indices, prominences = find_prominent_peaks(
+    smoothed = smooth_signal(pressure_filled, window_seconds=0.03, fs=fs)
+    systolic_indices, prominences = detect_systolic_peaks(
         smoothed, fs=fs, min_rr=min_rr, max_rr=max_rr
     )
 
     beats: List[Beat] = []
     for idx, sys_idx in enumerate(systolic_indices):
-        start = systolic_indices[idx - 1] if idx > 0 else 0
-        end = systolic_indices[idx + 1] if idx + 1 < len(systolic_indices) else len(smoothed) - 1
+        prev_sys = systolic_indices[idx - 1] if idx > 0 else None
+        next_sys = systolic_indices[idx + 1] if idx + 1 < len(systolic_indices) else None
 
-        search_start = max(start, sys_idx - int(max_rr * fs))
-        search_end = min(end, sys_idx + int(max_rr * fs))
-        segment = smoothed[search_start:sys_idx + 1]
+        if prev_sys is not None:
+            search_start = prev_sys + max(1, int(round(0.05 * fs)))
+        else:
+            search_start = max(0, sys_idx - int(round(max_rr * fs)))
+
+        search_end = sys_idx
+        if next_sys is not None:
+            search_end = min(search_end, next_sys - max(1, int(round(0.15 * fs))))
+
+        search_start = max(0, min(search_start, sys_idx))
+        search_end = max(search_start + 1, min(sys_idx + 1, search_end + 1))
+
+        segment = smoothed[search_start:search_end]
         if segment.size == 0:
             continue
-        dia_rel = np.argmin(segment)
-        dia_idx = search_start + int(dia_rel)
+        dia_rel = int(np.argmin(segment))
+        dia_idx = search_start + dia_rel
 
         systolic_time = float(time[sys_idx])
         systolic_pressure = float(pressure[sys_idx])
