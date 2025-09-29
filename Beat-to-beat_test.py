@@ -21,7 +21,8 @@ from __future__ import annotations
 import math
 import re
 import sys
-from dataclasses import dataclass
+import argparse
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -59,6 +60,11 @@ try:
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
     raise SystemExit("pandas is required to run this script. Please install it and retry.") from exc
 
+try:  # pragma: no cover - optional dependency for zero-phase filtering/PSD
+    from scipy import signal as sp_signal
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    sp_signal = None
+
 
 @dataclass
 class Beat:
@@ -73,6 +79,23 @@ class Beat:
     rr_interval: Optional[float]
     systolic_prominence: float
     is_artifact: bool
+    artifact_reasons: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ArtifactConfig:
+    """Tunable thresholds used to classify artefactual beats."""
+
+    systolic_mad_multiplier: float = 4.5
+    diastolic_mad_multiplier: float = 4.5
+    rr_mad_multiplier: float = 3.5
+    systolic_abs_floor: float = 15.0
+    diastolic_abs_floor: float = 12.0
+    pulse_pressure_min: float = 10.0
+    rr_bounds: Tuple[float, float] = (0.3, 2.0)
+    min_prominence: float = 8.0
+    prominence_noise_factor: float = 0.18
+    max_missing_gap: float = 10.0
 
 
 def _parse_list_field(raw_value: str) -> List[str]:
@@ -160,11 +183,14 @@ def load_bp_file(file_path: Path) -> Tuple[pd.DataFrame, Dict[str, str]]:
 def parse_interval(metadata: Dict[str, str], frame: pd.DataFrame) -> float:
     """Extract the sampling interval from metadata or infer it from the data."""
 
+    metadata_interval: Optional[float] = None
+    inferred_interval: Optional[float] = None
+
     interval_raw = metadata.get("Interval")
     if interval_raw:
         match = re.search(r"([0-9]+\.?[0-9]*)", interval_raw)
         if match:
-            return float(match.group(1))
+            metadata_interval = float(match.group(1))
 
     # Infer from the time column if available.
     if "Time" in frame.columns:
@@ -173,7 +199,22 @@ def parse_interval(metadata: Dict[str, str], frame: pd.DataFrame) -> float:
             diffs = np.diff(time_values)
             diffs = diffs[~np.isnan(diffs)]
             if len(diffs) > 0:
-                return float(np.median(diffs))
+                inferred_interval = float(np.median(diffs))
+
+    if metadata_interval and inferred_interval:
+        if metadata_interval > 0 and abs(inferred_interval - metadata_interval) / metadata_interval > 0.1:
+            print(
+                "Warning: metadata interval"
+                f" ({metadata_interval:.4f}s) differs from inferred interval"
+                f" ({inferred_interval:.4f}s)."
+            )
+        return metadata_interval
+
+    if metadata_interval:
+        return metadata_interval
+
+    if inferred_interval:
+        return inferred_interval
 
     # Fallback to 1 Hz.
     return 1.0
@@ -190,6 +231,40 @@ def smooth_signal(signal: np.ndarray, window_seconds: float, fs: float) -> np.nd
     return np.convolve(signal, kernel, mode="same")
 
 
+def zero_phase_filter(
+    signal: np.ndarray,
+    fs: float,
+    *,
+    lowcut: float = 0.5,
+    highcut: float = 20.0,
+    order: int = 4,
+) -> np.ndarray:
+    """Apply a zero-phase bandpass filter when SciPy is available.
+
+    Falls back to returning the input data when filtering fails or SciPy is
+    unavailable. The cutoff range is clipped to the [0, Nyquist) interval to
+    avoid numerical errors on very low/high sampling rates.
+    """
+
+    if sp_signal is None or fs <= 0:
+        return signal
+
+    nyquist = 0.5 * fs
+    if nyquist <= 0:
+        return signal
+
+    low = max(0.01, lowcut) / nyquist
+    high = min(highcut, nyquist * 0.99) / nyquist
+    if not (0 < low < high < 1):
+        return signal
+
+    try:
+        b, a = sp_signal.butter(order, [low, high], btype="bandpass")
+        return sp_signal.filtfilt(b, a, signal.astype(float, copy=False))
+    except Exception:
+        return signal
+
+
 def detrend_signal(signal: np.ndarray, fs: float, window_seconds: float = 0.6) -> np.ndarray:
     """Remove slow-varying trends using a long moving-average window."""
 
@@ -200,12 +275,44 @@ def detrend_signal(signal: np.ndarray, fs: float, window_seconds: float = 0.6) -
     return signal - baseline
 
 
+def _find_long_gaps(time: np.ndarray, mask: np.ndarray, gap_seconds: float) -> List[Tuple[float, float]]:
+    """Return start/stop times for gaps that exceed ``gap_seconds``."""
+
+    if gap_seconds <= 0 or time.size == 0:
+        return []
+
+    invalid_spans: List[Tuple[float, float]] = []
+    gap_start: Optional[int] = None
+
+    for idx, missing in enumerate(mask):
+        if missing and gap_start is None:
+            gap_start = idx
+        elif not missing and gap_start is not None:
+            gap_end = idx - 1
+            if gap_end >= gap_start:
+                start_time = float(time[gap_start])
+                end_time = float(time[min(gap_end, len(time) - 1)])
+                if end_time - start_time >= gap_seconds:
+                    invalid_spans.append((start_time, end_time))
+            gap_start = None
+
+    if gap_start is not None:
+        start_time = float(time[gap_start])
+        end_time = float(time[-1])
+        if end_time - start_time >= gap_seconds:
+            invalid_spans.append((start_time, end_time))
+
+    return invalid_spans
+
+
 def detect_systolic_peaks(
     signal: np.ndarray,
     fs: float,
     *,
     min_rr: float,
     max_rr: float,
+    prominence_floor: float,
+    prominence_noise_factor: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Detect systolic peaks using adaptive upstroke and prominence checks.
 
@@ -249,10 +356,16 @@ def detect_systolic_peaks(
 
     min_distance = max(1, int(round(min_rr * fs)))
     max_distance = max(min_distance + 1, int(round(max_rr * fs)))
-    search_horizon = max(min_distance, int(round(0.45 * fs)))
+    max_search_window = min(0.45, 0.6 * max(min_rr, 0.2))
+    search_horizon = max(min_distance, int(round(max_search_window * fs)))
 
     amplitude_span = float(np.percentile(signal, 95) - np.percentile(signal, 5))
-    min_prominence = max(8.0, 0.18 * amplitude_span)
+    if signal.size > 1:
+        noise_proxy = float(np.median(np.abs(np.diff(signal))))
+    else:
+        noise_proxy = 0.0
+    adaptive_floor = max(amplitude_span * prominence_noise_factor, noise_proxy * 5.0)
+    min_prominence = max(prominence_floor, adaptive_floor)
 
     peaks: List[int] = []
     prominences: List[float] = []
@@ -290,7 +403,11 @@ def detect_systolic_peaks(
 
     if len(peaks) < 3:
         fallback_peaks, fallback_prom = find_prominent_peaks(
-            signal, fs=fs, min_rr=min_rr, max_rr=max_rr, min_prominence=min_prominence
+            signal,
+            fs=fs,
+            min_rr=min_rr,
+            max_rr=max_rr,
+            min_prominence=min_prominence,
         )
         if fallback_peaks.size:
             return fallback_peaks, fallback_prom
@@ -366,8 +483,8 @@ def derive_beats(
     time: np.ndarray,
     pressure: np.ndarray,
     fs: float,
-    min_rr: float = 0.3,
-    max_rr: float = 2.0,
+    *,
+    config: ArtifactConfig,
 ) -> List[Beat]:
     """Derive systolic/diastolic/MAP landmarks from a continuous waveform."""
 
@@ -379,6 +496,8 @@ def derive_beats(
         raise ValueError("Pressure signal contains no valid samples.")
 
     pressure_filled = pressure.copy()
+    missing_mask = ~finite_mask
+    invalid_spans = _find_long_gaps(time, missing_mask, config.max_missing_gap)
     if not np.all(finite_mask):
         pressure_filled[~finite_mask] = np.interp(
             np.flatnonzero(~finite_mask),
@@ -386,12 +505,20 @@ def derive_beats(
             pressure[finite_mask],
         )
 
-    smoothed = smooth_signal(pressure_filled, window_seconds=0.03, fs=fs)
+    filtered = zero_phase_filter(pressure_filled, fs=fs)
+    smoothed = smooth_signal(filtered, window_seconds=0.03, fs=fs)
     systolic_indices, prominences = detect_systolic_peaks(
-        smoothed, fs=fs, min_rr=min_rr, max_rr=max_rr
+        smoothed,
+        fs=fs,
+        min_rr=config.rr_bounds[0],
+        max_rr=config.rr_bounds[1],
+        prominence_floor=config.min_prominence,
+        prominence_noise_factor=config.prominence_noise_factor,
     )
 
     beats: List[Beat] = []
+    prev_dia_sample: Optional[int] = None
+
     for idx, sys_idx in enumerate(systolic_indices):
         prev_sys = systolic_indices[idx - 1] if idx > 0 else None
         next_sys = systolic_indices[idx + 1] if idx + 1 < len(systolic_indices) else None
@@ -415,14 +542,37 @@ def derive_beats(
         dia_idx = search_start + dia_rel
 
         systolic_time = float(time[sys_idx])
-        systolic_pressure = float(pressure[sys_idx])
+        raw_sys = pressure[sys_idx]
+        raw_dia = pressure[dia_idx]
+        systolic_pressure = float(raw_sys) if math.isfinite(raw_sys) else float(pressure_filled[sys_idx])
         diastolic_time = float(time[dia_idx])
-        diastolic_pressure = float(pressure[dia_idx])
-        map_pressure = diastolic_pressure + (systolic_pressure - diastolic_pressure) / 3.0
+        diastolic_pressure = float(raw_dia) if math.isfinite(raw_dia) else float(pressure_filled[dia_idx])
         map_time = float((systolic_time + diastolic_time) / 2.0)
+        area_map = math.nan
+        if prev_dia_sample is not None and prev_dia_sample < dia_idx:
+            start_idx = prev_dia_sample
+            end_idx = dia_idx + 1
+            if end_idx - start_idx > 2:
+                segment_time = time[start_idx:end_idx]
+                segment_pressure = pressure_filled[start_idx:end_idx]
+                area = float(np.trapz(segment_pressure, segment_time))
+                duration = float(segment_time[-1] - segment_time[0])
+                if duration > 0:
+                    area_map = area / duration
+
+        if math.isnan(area_map):
+            map_pressure = diastolic_pressure + (systolic_pressure - diastolic_pressure) / 3.0
+        else:
+            map_pressure = area_map
         rr_interval = None
         if idx > 0:
             rr_interval = float(systolic_time - time[systolic_indices[idx - 1]])
+
+        reasons: List[str] = []
+        for start_time, end_time in invalid_spans:
+            if start_time <= systolic_time <= end_time:
+                reasons.append("long gap interpolation")
+                break
 
         beats.append(
             Beat(
@@ -435,10 +585,13 @@ def derive_beats(
                 rr_interval=rr_interval,
                 systolic_prominence=float(prominences[idx]),
                 is_artifact=False,
+                artifact_reasons=reasons,
             )
         )
 
-    apply_artifact_rules(beats)
+        prev_dia_sample = dia_idx
+
+    apply_artifact_rules(beats, config=config)
     return beats
 
 
@@ -485,7 +638,7 @@ def _robust_central_tendency(values: np.ndarray) -> Tuple[float, float]:
     return median, mad
 
 
-def apply_artifact_rules(beats: List[Beat]) -> None:
+def apply_artifact_rules(beats: List[Beat], *, config: ArtifactConfig) -> None:
     """Flag beats that violate simple physiological heuristics."""
 
     if not beats:
@@ -505,6 +658,8 @@ def apply_artifact_rules(beats: List[Beat]) -> None:
     dia_roll_med, dia_roll_mad = _rolling_median_and_mad(diastolic_values, window=9)
     rr_roll_med, rr_roll_mad = _rolling_median_and_mad(rr_values, window=9)
 
+    min_rr, max_rr = config.rr_bounds
+
     for idx, beat in enumerate(beats):
         severe_reasons: List[str] = []
         soft_reasons: List[str] = []
@@ -515,46 +670,53 @@ def apply_artifact_rules(beats: List[Beat]) -> None:
             severe_reasons.append("implausible systolic")
         if beat.diastolic_pressure < 20 or beat.diastolic_pressure > 160:
             severe_reasons.append("implausible diastolic")
-        if beat.systolic_pressure - beat.diastolic_pressure < 10:
+        if beat.systolic_pressure - beat.diastolic_pressure < config.pulse_pressure_min:
             severe_reasons.append("low pulse pressure")
 
         sys_ref = sys_roll_med[idx] if math.isfinite(sys_roll_med[idx]) else sys_med
         sys_scale = sys_roll_mad[idx] if math.isfinite(sys_roll_mad[idx]) else sys_mad
-        if not math.isfinite(sys_scale):
-            sys_scale = 0.0
-        sys_scale = max(sys_scale, 5.0)
-        if math.isfinite(sys_ref) and math.isfinite(beat.systolic_pressure):
-            if abs(beat.systolic_pressure - sys_ref) > max(45.0, 4.0 * sys_scale):
+        if math.isfinite(sys_ref) and math.isfinite(beat.systolic_pressure) and math.isfinite(sys_scale):
+            limit = max(config.systolic_abs_floor, config.systolic_mad_multiplier * max(sys_scale, 1.0))
+            if abs(beat.systolic_pressure - sys_ref) > limit:
                 soft_reasons.append("systolic deviation")
 
         dia_ref = dia_roll_med[idx] if math.isfinite(dia_roll_med[idx]) else dia_med
         dia_scale = dia_roll_mad[idx] if math.isfinite(dia_roll_mad[idx]) else dia_mad
-        if not math.isfinite(dia_scale):
-            dia_scale = 0.0
-        dia_scale = max(dia_scale, 4.0)
-        if math.isfinite(dia_ref) and math.isfinite(beat.diastolic_pressure):
-            if abs(beat.diastolic_pressure - dia_ref) > max(35.0, 4.0 * dia_scale):
+        if math.isfinite(dia_ref) and math.isfinite(beat.diastolic_pressure) and math.isfinite(dia_scale):
+            limit = max(config.diastolic_abs_floor, config.diastolic_mad_multiplier * max(dia_scale, 1.0))
+            if abs(beat.diastolic_pressure - dia_ref) > limit:
                 soft_reasons.append("diastolic deviation")
 
         if beat.rr_interval is not None and math.isfinite(beat.rr_interval):
-            if beat.rr_interval < 0.3 or beat.rr_interval > 2.5:
+            if beat.rr_interval < min_rr * 0.7 or beat.rr_interval > max_rr * 1.3:
                 severe_reasons.append("rr outside bounds")
             rr_ref = rr_roll_med[idx] if math.isfinite(rr_roll_med[idx]) else rr_med
             rr_scale = rr_roll_mad[idx] if math.isfinite(rr_roll_mad[idx]) else rr_mad
-            if not math.isfinite(rr_scale):
-                rr_scale = 0.0
-            rr_scale = max(rr_scale, 0.1)
-            if math.isfinite(rr_ref):
-                if abs(beat.rr_interval - rr_ref) > max(0.5, 4.0 * rr_scale):
+            if math.isfinite(rr_ref) and math.isfinite(rr_scale):
+                limit = max(0.1, config.rr_mad_multiplier * max(rr_scale, 0.05))
+                if abs(beat.rr_interval - rr_ref) > limit:
                     soft_reasons.append("rr deviation")
 
-        if beat.systolic_prominence < 5:
+        if beat.systolic_prominence < config.min_prominence:
             soft_reasons.append("low prominence")
 
+        combined_reasons = list(beat.artifact_reasons)
+        if any(reason == "long gap interpolation" for reason in beat.artifact_reasons):
+            severe_reasons.append("long gap interpolation")
+        combined_reasons.extend(severe_reasons)
+        combined_reasons.extend(soft_reasons)
         beat.is_artifact = bool(severe_reasons or len(soft_reasons) >= 2)
+        beat.artifact_reasons = combined_reasons if beat.is_artifact else []
 
 
-def plot_waveform(time: np.ndarray, pressure: np.ndarray, beats: Sequence[Beat]) -> None:
+def plot_waveform(
+    time: np.ndarray,
+    pressure: np.ndarray,
+    beats: Sequence[Beat],
+    *,
+    show: bool = True,
+    save_path: Optional[Path] = None,
+) -> None:
     """Plot the waveform with annotated beat landmarks."""
 
     if plt is None:  # pragma: no cover - handled in main
@@ -607,7 +769,14 @@ def plot_waveform(time: np.ndarray, pressure: np.ndarray, beats: Sequence[Beat])
     plt.title("Continuous blood pressure with beat landmarks")
     plt.legend()
     plt.tight_layout()
-    plt.show()
+
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150)
+
+    if show:
+        plt.show()
+    else:
+        plt.close()
 
 
 def summarise_beats(beats: Sequence[Beat]) -> pd.DataFrame:
@@ -626,9 +795,118 @@ def summarise_beats(beats: Sequence[Beat]) -> pd.DataFrame:
                 "rr_interval": beat.rr_interval,
                 "prominence": beat.systolic_prominence,
                 "artifact": beat.is_artifact,
+                "artifact_reasons": ", ".join(beat.artifact_reasons) if beat.artifact_reasons else "",
             }
         )
     return pd.DataFrame.from_records(records)
+
+
+def _resample_even_grid(times: np.ndarray, values: np.ndarray, fs: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Interpolate ``values`` onto an even time grid at ``fs`` Hz."""
+
+    if times.size == 0 or values.size == 0 or fs <= 0:
+        return np.array([]), np.array([])
+
+    start = float(times[0])
+    end = float(times[-1])
+    if end <= start:
+        return np.array([]), np.array([])
+
+    grid = np.arange(start, end, 1.0 / fs, dtype=float)
+    finite_mask = np.isfinite(values)
+    if not np.any(finite_mask):
+        return grid, np.full_like(grid, np.nan)
+
+    interp_values = np.interp(grid, times[finite_mask], values[finite_mask])
+    return grid, interp_values
+
+
+def compute_bpv_psd(
+    beat_times: np.ndarray,
+    beat_values: np.ndarray,
+    *,
+    resample_fs: float,
+    nperseg: int = 256,
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Compute Welch PSD for beat-to-beat series when SciPy is present."""
+
+    if sp_signal is None:
+        return None
+
+    grid_time, resampled = _resample_even_grid(beat_times, beat_values, resample_fs)
+    if grid_time.size < nperseg:
+        return None
+
+    try:
+        freqs, power = sp_signal.welch(resampled, fs=resample_fs, nperseg=min(nperseg, len(resampled)))
+    except Exception:
+        return None
+
+    return freqs, power
+
+
+def _bandpower(freqs: np.ndarray, power: np.ndarray, band: Tuple[float, float]) -> float:
+    """Integrate Welch spectrum within ``band`` (in Hz)."""
+
+    low, high = band
+    mask = (freqs >= low) & (freqs <= high)
+    if not np.any(mask):
+        return math.nan
+    return float(np.trapz(power[mask], freqs[mask]))
+
+
+def compute_rr_metrics(rr_intervals: np.ndarray, *, pnn_threshold: float) -> Dict[str, float]:
+    """Compute summary statistics for RR-intervals."""
+
+    rr = rr_intervals[np.isfinite(rr_intervals)]
+    if rr.size == 0:
+        return {
+            "mean": math.nan,
+            "sd": math.nan,
+            "cv": math.nan,
+            "rmssd": math.nan,
+            "arv": math.nan,
+            "pnn": math.nan,
+        }
+
+    diffs = np.diff(rr)
+    rmssd = float(np.sqrt(np.mean(diffs**2))) if diffs.size else math.nan
+    arv = float(np.mean(np.abs(diffs))) if diffs.size else math.nan
+    if diffs.size:
+        pnn = float(np.mean(np.abs(diffs) > pnn_threshold))
+    else:
+        pnn = math.nan
+
+    mean_rr = float(np.mean(rr))
+    sd_rr = float(np.std(rr, ddof=1)) if rr.size > 1 else 0.0
+    cv_rr = float(sd_rr / mean_rr) if mean_rr else math.nan
+
+    return {
+        "mean": mean_rr,
+        "sd": sd_rr,
+        "cv": cv_rr,
+        "rmssd": rmssd,
+        "arv": arv,
+        "pnn": pnn,
+    }
+
+
+def print_column_overview(frame: pd.DataFrame) -> None:
+    """Display column names, dtypes, and first numeric samples to aid selection."""
+
+    print("\nAvailable columns:")
+    for name in frame.columns:
+        series = frame[name]
+        dtype = str(series.dtype)
+        if pd.api.types.is_numeric_dtype(series):
+            sample = series.dropna().astype(float).head(3).to_list()
+            preview = ", ".join(f"{value:.3f}" for value in sample)
+        else:
+            sample = series.dropna().astype(str).head(3).to_list()
+            preview = ", ".join(sample)
+        if not preview:
+            preview = "(no finite samples)"
+        print(f"  - {name} [{dtype}]: {preview}")
 
 
 def select_file_via_dialog() -> Optional[Path]:
@@ -649,12 +927,81 @@ def select_file_via_dialog() -> Optional[Path]:
     return Path(filename)
 
 
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Explore beat-to-beat arterial pressure waveforms.")
+    parser.add_argument("file", nargs="?", help="Path to the exported waveform text file.")
+    parser.add_argument("--column", default="reBAP", help="Name of the arterial pressure column to analyse.")
+    parser.add_argument("--time-column", default="Time", help="Name of the time column (defaults to 'Time').")
+    parser.add_argument("--min-rr", type=float, default=0.3, help="Minimum RR interval in seconds.")
+    parser.add_argument("--max-rr", type=float, default=2.0, help="Maximum RR interval in seconds.")
+    parser.add_argument("--min-prominence", type=float, default=8.0, help="Minimum systolic prominence (mmHg).")
+    parser.add_argument(
+        "--prominence-factor",
+        type=float,
+        default=0.18,
+        help="Multiplier for adaptive prominence threshold based on noise.",
+    )
+    parser.add_argument(
+        "--systolic-mad-multiplier",
+        type=float,
+        default=4.5,
+        help="MAD multiplier for systolic outlier detection.",
+    )
+    parser.add_argument(
+        "--diastolic-mad-multiplier",
+        type=float,
+        default=4.5,
+        help="MAD multiplier for diastolic outlier detection.",
+    )
+    parser.add_argument(
+        "--rr-mad-multiplier",
+        type=float,
+        default=3.5,
+        help="MAD multiplier for RR-interval outlier detection.",
+    )
+    parser.add_argument("--pulse-pressure-min", type=float, default=10.0, help="Minimum pulse pressure (mmHg).")
+    parser.add_argument(
+        "--systolic-abs-floor",
+        type=float,
+        default=15.0,
+        help="Absolute systolic deviation floor in mmHg.",
+    )
+    parser.add_argument(
+        "--diastolic-abs-floor",
+        type=float,
+        default=12.0,
+        help="Absolute diastolic deviation floor in mmHg.",
+    )
+    parser.add_argument(
+        "--max-gap",
+        type=float,
+        default=10.0,
+        help="Maximum tolerated gap (s) before interpolated beats are flagged.",
+    )
+    parser.add_argument(
+        "--pnn-threshold",
+        type=float,
+        default=50.0,
+        help="pNN threshold in milliseconds for RR statistics.",
+    )
+    parser.add_argument("--psd", action="store_true", help="Compute Welch PSD for clean beat series.")
+    parser.add_argument("--psd-fs", type=float, default=4.0, help="Resampling frequency for PSD (Hz).")
+    parser.add_argument("--psd-nperseg", type=int, default=256, help="nperseg parameter for Welch PSD.")
+    parser.add_argument("--out", type=Path, help="Optional path to export the beat summary CSV.")
+    parser.add_argument("--savefig", type=Path, help="Save the plot to this path instead of/as well as showing it.")
+    parser.add_argument("--no-plot", action="store_true", help="Skip interactive plot display.")
+    return parser
+
+
 def main(argv: Sequence[str]) -> int:
-    if plt is None:
-        print("matplotlib is required to visualise the waveform. Please install it and retry.")
-        return 1
-    if len(argv) > 1:
-        file_path = Path(argv[1])
+    parser = build_arg_parser()
+    args = parser.parse_args(argv[1:])
+
+    if args.min_rr >= args.max_rr:
+        parser.error("--min-rr must be less than --max-rr")
+
+    if args.file:
+        file_path = Path(args.file)
     else:
         file_path = select_file_via_dialog()
         if file_path is None:
@@ -671,27 +1018,59 @@ def main(argv: Sequence[str]) -> int:
         print(f"Failed to load file: {exc}")
         return 1
 
-    if "reBAP" not in frame.columns:
-        print("The selected file does not contain a 'reBAP' column.")
+    print(f"Loaded file: {file_path}")
+    print_column_overview(frame)
+
+    if args.column not in frame.columns:
+        print(f"Column '{args.column}' not found. Available columns: {', '.join(frame.columns)}")
         return 1
+
+    if args.time_column in frame.columns:
+        time_series = pd.to_numeric(frame[args.time_column], errors="coerce")
+        time = time_series.to_numpy()
+    else:
+        time = None
+
+    pressure_series = pd.to_numeric(frame[args.column], errors="coerce")
+    pressure = pressure_series.to_numpy()
 
     interval = parse_interval(metadata, frame)
     fs = 1.0 / interval if interval > 0 else 1.0
 
-    time = frame["Time"].to_numpy() if "Time" in frame.columns else np.arange(len(frame)) * interval
-    pressure = frame["reBAP"].to_numpy()
+    if time is None or not np.any(np.isfinite(time)):
+        time = np.arange(len(frame), dtype=float) * interval
+
+    config = ArtifactConfig(
+        systolic_mad_multiplier=args.systolic_mad_multiplier,
+        diastolic_mad_multiplier=args.diastolic_mad_multiplier,
+        rr_mad_multiplier=args.rr_mad_multiplier,
+        systolic_abs_floor=args.systolic_abs_floor,
+        diastolic_abs_floor=args.diastolic_abs_floor,
+        pulse_pressure_min=args.pulse_pressure_min,
+        rr_bounds=(args.min_rr, args.max_rr),
+        min_prominence=args.min_prominence,
+        prominence_noise_factor=args.prominence_factor,
+        max_missing_gap=args.max_gap,
+    )
 
     try:
-        beats = derive_beats(time, pressure, fs=fs)
+        beats = derive_beats(time, pressure, fs=fs, config=config)
     except Exception as exc:  # pragma: no cover - interactive feedback
         print(f"Beat detection failed: {exc}")
         return 1
 
     summary = summarise_beats(beats)
 
-    clean_beats = summary[~summary["artifact"]]
+    if args.out:
+        try:
+            summary.to_csv(args.out, index=False)
+            print(f"Beat summary exported to {args.out}")
+        except Exception as exc:  # pragma: no cover - filesystem feedback
+            print(f"Failed to save summary CSV: {exc}")
+
+    clean_beats = summary[~summary["artifact"]].copy()
     if not clean_beats.empty:
-        print("Detected beats (clean):")
+        print("\nDetected beats (first clean entries):")
         print(
             clean_beats[
                 [
@@ -710,17 +1089,68 @@ def main(argv: Sequence[str]) -> int:
             f"{clean_beats['diastolic_pressure'].mean():.1f} mmHg, MAP: "
             f"{clean_beats['map_pressure'].mean():.1f} mmHg"
         )
+
+        rr_metrics = compute_rr_metrics(
+            clean_beats["rr_interval"].to_numpy(dtype=float),
+            pnn_threshold=args.pnn_threshold / 1000.0,
+        )
+        print(
+            "RR metrics — mean: "
+            f"{rr_metrics['mean']:.3f}s, SD: {rr_metrics['sd']:.3f}s, CV: {rr_metrics['cv']:.3f}, "
+            f"RMSSD: {rr_metrics['rmssd']:.3f}s, ARV: {rr_metrics['arv']:.3f}s, "
+            f"pNN>{args.pnn_threshold:.0f}ms: {rr_metrics['pnn'] * 100 if not math.isnan(rr_metrics['pnn']) else float('nan'):.1f}%"
+        )
     else:
         print("No clean beats detected; all beats were flagged as artefacts.")
 
     if summary["artifact"].any():
         print()
         print(
-            f"{summary['artifact'].sum()} beats were flagged as potential artefacts "
-            "based on amplitude, RR-interval, or waveform prominence heuristics."
+            f"{summary['artifact'].sum()} beats were flagged as potential artefacts."
         )
 
-    plot_waveform(time, pressure, beats)
+    if args.psd:
+        if sp_signal is None:
+            print("SciPy is not installed; skipping PSD computation.")
+        elif clean_beats.empty:
+            print("PSD skipped because no clean beats are available.")
+        else:
+            beat_times = clean_beats["systolic_time"].to_numpy(dtype=float)
+            if np.any(np.diff(beat_times) > config.max_missing_gap):
+                print(
+                    "PSD skipped because long gaps (>"
+                    f"{config.max_missing_gap}s) remain after artefact removal."
+                )
+            else:
+                for label, column in [
+                    ("SBP", "systolic_pressure"),
+                    ("DBP", "diastolic_pressure"),
+                    ("MAP", "map_pressure"),
+                ]:
+                    result = compute_bpv_psd(
+                        beat_times,
+                        clean_beats[column].to_numpy(dtype=float),
+                        resample_fs=args.psd_fs,
+                        nperseg=args.psd_nperseg,
+                    )
+                    if result is None:
+                        print(f"PSD for {label} unavailable (insufficient data or SciPy error).")
+                        continue
+                    freqs, power = result
+                    lf = _bandpower(freqs, power, (0.04, 0.15))
+                    hf = _bandpower(freqs, power, (0.15, 0.4))
+                    hf = hf if hf > 0 else math.nan
+                    lf_hf = lf / hf if not math.isnan(hf) and hf != 0 else math.nan
+                    print(
+                        f"{label} PSD — LF: {lf:.3f} mmHg^2, HF: {hf:.3f} mmHg^2, LF/HF: {lf_hf:.3f}"
+                    )
+
+    show_plot = not args.no_plot
+    if plt is None and (show_plot or args.savefig):
+        print("matplotlib is required to visualise or save the waveform plot.")
+    elif show_plot or args.savefig:
+        plot_waveform(time, pressure, beats, show=show_plot, save_path=args.savefig)
+
     return 0
 
 
