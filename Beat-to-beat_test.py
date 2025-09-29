@@ -442,43 +442,116 @@ def derive_beats(
     return beats
 
 
+def _rolling_median_and_mad(values: np.ndarray, window: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Return rolling median and MAD for ``values`` using an odd-sized window."""
+
+    if window % 2 == 0:
+        raise ValueError("window must be odd to compute centred statistics")
+
+    medians = np.full_like(values, np.nan, dtype=float)
+    mads = np.full_like(values, np.nan, dtype=float)
+    half_window = window // 2
+
+    for idx in range(len(values)):
+        start = max(0, idx - half_window)
+        end = min(len(values), idx + half_window + 1)
+        segment = values[start:end]
+        segment = segment[np.isfinite(segment)]
+        if segment.size < 3:
+            continue
+        median = float(np.median(segment))
+        deviations = np.abs(segment - median)
+        mad = float(1.4826 * np.median(deviations)) if deviations.size else 0.0
+        if mad < 1e-3:
+            # Fallback to standard deviation when the MAD is tiny (near-constant segment).
+            mad = float(np.std(segment, ddof=0))
+        medians[idx] = median
+        mads[idx] = mad
+
+    return medians, mads
+
+
+def _robust_central_tendency(values: np.ndarray) -> Tuple[float, float]:
+    """Compute median and MAD with sensible fallbacks for empty arrays."""
+
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return math.nan, math.nan
+    median = float(np.median(finite))
+    deviations = np.abs(finite - median)
+    mad = float(1.4826 * np.median(deviations)) if deviations.size else 0.0
+    if mad < 1e-3:
+        mad = float(np.std(finite, ddof=0))
+    return median, mad
+
+
 def apply_artifact_rules(beats: List[Beat]) -> None:
     """Flag beats that violate simple physiological heuristics."""
 
     if not beats:
         return
 
-    systolic_values = np.array([b.systolic_pressure for b in beats])
-    diastolic_values = np.array([b.diastolic_pressure for b in beats])
-    rr_values = np.array([b.rr_interval for b in beats if b.rr_interval is not None])
+    systolic_values = np.array([b.systolic_pressure for b in beats], dtype=float)
+    diastolic_values = np.array([b.diastolic_pressure for b in beats], dtype=float)
+    rr_values = np.array([
+        b.rr_interval if b.rr_interval is not None else math.nan for b in beats
+    ])
 
-    sys_median = float(np.nanmedian(systolic_values))
-    dia_median = float(np.nanmedian(diastolic_values))
-    rr_median = float(np.nanmedian(rr_values)) if rr_values.size else None
+    sys_med, sys_mad = _robust_central_tendency(systolic_values)
+    dia_med, dia_mad = _robust_central_tendency(diastolic_values)
+    rr_med, rr_mad = _robust_central_tendency(rr_values)
 
-    for beat in beats:
-        reasons: List[str] = []
+    sys_roll_med, sys_roll_mad = _rolling_median_and_mad(systolic_values, window=9)
+    dia_roll_med, dia_roll_mad = _rolling_median_and_mad(diastolic_values, window=9)
+    rr_roll_med, rr_roll_mad = _rolling_median_and_mad(rr_values, window=9)
+
+    for idx, beat in enumerate(beats):
+        severe_reasons: List[str] = []
+        soft_reasons: List[str] = []
+
         if not math.isfinite(beat.systolic_pressure) or not math.isfinite(beat.diastolic_pressure):
-            reasons.append("non-finite pressure")
+            severe_reasons.append("non-finite pressure")
         if beat.systolic_pressure < 40 or beat.systolic_pressure > 260:
-            reasons.append("implausible systolic")
+            severe_reasons.append("implausible systolic")
         if beat.diastolic_pressure < 20 or beat.diastolic_pressure > 160:
-            reasons.append("implausible diastolic")
+            severe_reasons.append("implausible diastolic")
         if beat.systolic_pressure - beat.diastolic_pressure < 10:
-            reasons.append("low pulse pressure")
-        if abs(beat.systolic_pressure - sys_median) > 40:
-            reasons.append("systolic jump")
-        if abs(beat.diastolic_pressure - dia_median) > 30:
-            reasons.append("diastolic jump")
-        if beat.rr_interval is not None and rr_median is not None:
-            if beat.rr_interval < 0.3 or beat.rr_interval > 2.5:
-                reasons.append("rr outside bounds")
-            if abs(beat.rr_interval - rr_median) > 0.4:
-                reasons.append("rr jump")
-        if beat.systolic_prominence < 5:
-            reasons.append("low prominence")
+            severe_reasons.append("low pulse pressure")
 
-        beat.is_artifact = bool(reasons)
+        sys_ref = sys_roll_med[idx] if math.isfinite(sys_roll_med[idx]) else sys_med
+        sys_scale = sys_roll_mad[idx] if math.isfinite(sys_roll_mad[idx]) else sys_mad
+        if not math.isfinite(sys_scale):
+            sys_scale = 0.0
+        sys_scale = max(sys_scale, 5.0)
+        if math.isfinite(sys_ref) and math.isfinite(beat.systolic_pressure):
+            if abs(beat.systolic_pressure - sys_ref) > max(45.0, 4.0 * sys_scale):
+                soft_reasons.append("systolic deviation")
+
+        dia_ref = dia_roll_med[idx] if math.isfinite(dia_roll_med[idx]) else dia_med
+        dia_scale = dia_roll_mad[idx] if math.isfinite(dia_roll_mad[idx]) else dia_mad
+        if not math.isfinite(dia_scale):
+            dia_scale = 0.0
+        dia_scale = max(dia_scale, 4.0)
+        if math.isfinite(dia_ref) and math.isfinite(beat.diastolic_pressure):
+            if abs(beat.diastolic_pressure - dia_ref) > max(35.0, 4.0 * dia_scale):
+                soft_reasons.append("diastolic deviation")
+
+        if beat.rr_interval is not None and math.isfinite(beat.rr_interval):
+            if beat.rr_interval < 0.3 or beat.rr_interval > 2.5:
+                severe_reasons.append("rr outside bounds")
+            rr_ref = rr_roll_med[idx] if math.isfinite(rr_roll_med[idx]) else rr_med
+            rr_scale = rr_roll_mad[idx] if math.isfinite(rr_roll_mad[idx]) else rr_mad
+            if not math.isfinite(rr_scale):
+                rr_scale = 0.0
+            rr_scale = max(rr_scale, 0.1)
+            if math.isfinite(rr_ref):
+                if abs(beat.rr_interval - rr_ref) > max(0.5, 4.0 * rr_scale):
+                    soft_reasons.append("rr deviation")
+
+        if beat.systolic_prominence < 5:
+            soft_reasons.append("low prominence")
+
+        beat.is_artifact = bool(severe_reasons or len(soft_reasons) >= 2)
 
 
 def plot_waveform(time: np.ndarray, pressure: np.ndarray, beats: Sequence[Beat]) -> None:
