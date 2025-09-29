@@ -99,6 +99,16 @@ class ArtifactConfig:
     max_missing_gap: float = 10.0
 
 
+@dataclass
+class BPFilePreview:
+    """Lightweight summary of an export gathered without full ingestion."""
+
+    metadata: Dict[str, str]
+    column_names: List[str]
+    preview: pd.DataFrame
+    skiprows: List[int]
+
+
 def _parse_list_field(raw_value: str) -> List[str]:
     """Split a metadata field that contains multiple values.
 
@@ -136,49 +146,247 @@ def _parse_list_field(raw_value: str) -> List[str]:
     return merged or tokens
 
 
-def load_bp_file(file_path: Path) -> Tuple[pd.DataFrame, Dict[str, str]]:
-    """Load a text export containing beat-to-beat blood pressure data."""
+def _scan_bp_file(file_path: Path, max_numeric_rows: int = 20) -> BPFilePreview:
+    """Perform a quick pass to gather metadata and column previews."""
 
     metadata: Dict[str, str] = {}
-    data_rows: List[List[float]] = []
+    preview_rows: List[List[float]] = []
+    skiprows: List[int] = []
+    numeric_rows = 0
+    column_count: Optional[int] = None
 
     with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
-        for raw_line in handle:
+        for idx, raw_line in enumerate(handle):
             line = raw_line.strip()
             if not line:
+                skiprows.append(idx)
                 continue
 
-            # Metadata entries contain an equals sign.
-            if "=" in line and not re.match(r"^[+-]?[0-9]", line):
-                key, value = line.split("=", 1)
-                metadata[key.strip()] = value.strip()
-                continue
-
-            # Remaining lines are expected to be numeric data.
-            if "#" in line:
-                line = line.split("#", 1)[0].strip()
-                if not line:
+            candidate = line
+            if "#" in candidate:
+                candidate = candidate.split("#", 1)[0].strip()
+                if not candidate:
+                    skiprows.append(idx)
                     continue
 
-            parts = [p for p in re.split(r"\s+", line) if p]
+            if "=" in candidate and not re.match(r"^[+-]?[0-9]", candidate):
+                key, value = candidate.split("=", 1)
+                metadata[key.strip()] = value.strip()
+                skiprows.append(idx)
+                continue
+
+            parts = [p for p in re.split(r"\s+", candidate) if p]
+            if not parts:
+                skiprows.append(idx)
+                continue
+
             try:
                 row = [float(p) if p.lower() != "nan" else math.nan for p in parts]
             except ValueError as exc:
-                raise ValueError(f"Could not parse data row: {raw_line.strip()!r}") from exc
-            data_rows.append(row)
+                raise ValueError(
+                    f"Could not parse data row at line {idx + 1}: {raw_line.strip()!r}"
+                ) from exc
 
-    if not data_rows:
+            if column_count is None:
+                column_count = len(row)
+
+            preview_rows.append(row)
+            numeric_rows += 1
+            if numeric_rows >= max_numeric_rows:
+                break
+
+    if column_count is None:
         raise ValueError("No numeric data found in file.")
 
     channels = _parse_list_field(metadata.get("ChannelTitle", ""))
-    if channels and len(data_rows[0]) == len(channels) + 1:
+    if channels and column_count == len(channels) + 1:
         column_names = ["Time"] + channels
     else:
-        # Fallback: generate generic column names.
-        column_names = [f"col_{idx}" for idx in range(len(data_rows[0]))]
+        column_names = [f"col_{idx}" for idx in range(column_count)]
 
-    frame = pd.DataFrame(data_rows, columns=column_names)
-    return frame, metadata
+    preview_frame = pd.DataFrame(preview_rows, columns=column_names)
+    return BPFilePreview(metadata=metadata, column_names=column_names, preview=preview_frame, skiprows=skiprows)
+
+
+def _default_column_selection(column_names: Sequence[str], requested: Optional[str], *, fallback: Optional[str] = None) -> str:
+    """Return a sensible default column name."""
+
+    if requested and requested in column_names:
+        return requested
+
+    if fallback and fallback in column_names:
+        return fallback
+
+    if column_names:
+        return column_names[0]
+
+    raise ValueError("No columns available for selection.")
+
+
+def _select_columns_via_cli(
+    column_names: Sequence[str],
+    *,
+    default_time: str,
+    default_pressure: str,
+) -> Tuple[str, str]:
+    """Prompt for time/pressure selection using stdin."""
+
+    if not sys.stdin.isatty():
+        return default_time, default_pressure
+
+    print("\nSelect time and pressure columns (press Enter to accept defaults).")
+    for idx, name in enumerate(column_names):
+        marker = ""
+        if name == default_time:
+            marker = " (default time)"
+        elif name == default_pressure:
+            marker = " (default pressure)"
+        print(f"  [{idx}] {name}{marker}")
+
+    def _prompt(label: str, default: str) -> str:
+        while True:
+            response = input(f"{label} [{default}]: ").strip()
+            if not response:
+                return default
+            if response in column_names:
+                return response
+            if response.isdigit():
+                idx = int(response)
+                if 0 <= idx < len(column_names):
+                    return column_names[idx]
+            print("Invalid selection. Choose a column name or index.")
+
+    time_column = _prompt("Time column", default_time)
+    while True:
+        pressure_column = _prompt("Pressure column", default_pressure)
+        if pressure_column == time_column:
+            print("Pressure column must differ from the time column.")
+        else:
+            break
+
+    return time_column, pressure_column
+
+
+def _select_columns_via_tk(
+    column_names: Sequence[str],
+    *,
+    default_time: str,
+    default_pressure: str,
+) -> Tuple[str, str]:
+    """Display a Tkinter dialog for column selection."""
+
+    if tk is None:
+        return default_time, default_pressure
+
+    root = tk.Tk()
+    root.title("Select waveform columns")
+    root.geometry("360x180")
+
+    time_var = tk.StringVar(value=default_time)
+    pressure_var = tk.StringVar(value=default_pressure)
+    error_var = tk.StringVar(value="")
+
+    tk.Label(root, text="Time column:").pack(pady=(12, 0))
+    tk.OptionMenu(root, time_var, *column_names).pack()
+
+    tk.Label(root, text="Pressure column:").pack(pady=(8, 0))
+    tk.OptionMenu(root, pressure_var, *column_names).pack()
+
+    error_label = tk.Label(root, textvariable=error_var, fg="red")
+    error_label.pack(pady=(6, 0))
+
+    selection: Dict[str, str] = {}
+
+    def confirm() -> None:
+        time_choice = time_var.get()
+        pressure_choice = pressure_var.get()
+        if time_choice == pressure_choice:
+            error_var.set("Time and pressure must differ.")
+            return
+        selection["time"] = time_choice
+        selection["pressure"] = pressure_choice
+        root.quit()
+
+    tk.Button(root, text="Confirm", command=confirm).pack(pady=12)
+
+    root.mainloop()
+    root.destroy()
+
+    if "time" in selection and "pressure" in selection:
+        return selection["time"], selection["pressure"]
+
+    return default_time, default_pressure
+
+
+def select_time_pressure_columns(
+    preview: BPFilePreview,
+    *,
+    requested_time: Optional[str] = None,
+    requested_pressure: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Resolve the time and pressure columns, prompting the user when possible."""
+
+    column_names = preview.column_names
+    time_default = _default_column_selection(column_names, requested_time, fallback="Time")
+
+    remaining = [name for name in column_names if name != time_default]
+    pressure_default = _default_column_selection(
+        remaining if remaining else column_names,
+        requested_pressure if requested_pressure != time_default else None,
+        fallback="reBAP",
+    )
+
+    if tk is not None:
+        try:
+            return _select_columns_via_tk(
+                column_names,
+                default_time=time_default,
+                default_pressure=pressure_default,
+            )
+        except Exception:
+            pass
+
+    return _select_columns_via_cli(column_names, default_time=time_default, default_pressure=pressure_default)
+
+
+def load_bp_file(
+    file_path: Path,
+    *,
+    preview: Optional[BPFilePreview] = None,
+    time_column: Optional[str] = None,
+    pressure_column: Optional[str] = None,
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Load the selected columns from a waveform export."""
+
+    if preview is None:
+        preview = _scan_bp_file(file_path)
+
+    if time_column is None or time_column not in preview.column_names or pressure_column is None or pressure_column not in preview.column_names:
+        time_column, pressure_column = select_time_pressure_columns(
+            preview,
+            requested_time=time_column,
+            requested_pressure=pressure_column,
+        )
+
+    desired = [time_column, pressure_column]
+    # ``dict.fromkeys`` preserves order while removing duplicates.
+    usecols = list(dict.fromkeys(desired))
+    dtype_map = {name: float for name in usecols}
+
+    frame = pd.read_csv(
+        file_path,
+        delim_whitespace=True,
+        comment="#",
+        header=None,
+        names=preview.column_names,
+        usecols=usecols,
+        skiprows=preview.skiprows,
+        engine="python",
+        na_values=["nan", "NaN", "NA"],
+        dtype=dtype_map,
+    )
+
+    return frame, preview.metadata
 
 
 def parse_interval(metadata: Dict[str, str], frame: pd.DataFrame) -> float:
@@ -1230,25 +1438,41 @@ def main(argv: Sequence[str]) -> int:
         return 1
 
     try:
-        frame, metadata = load_bp_file(file_path)
+        preview = _scan_bp_file(file_path)
+    except Exception as exc:  # pragma: no cover - interactive feedback
+        print(f"Failed to parse file header: {exc}")
+        return 1
+
+    print(f"Loaded file preview: {file_path}")
+    print("\nColumn preview (first 20 numeric rows):")
+    print_column_overview(preview.preview)
+
+    selected_time_column, selected_pressure_column = select_time_pressure_columns(
+        preview,
+        requested_time=args.time_column,
+        requested_pressure=args.column,
+    )
+
+    try:
+        frame, metadata = load_bp_file(
+            file_path,
+            preview=preview,
+            time_column=selected_time_column,
+            pressure_column=selected_pressure_column,
+        )
     except Exception as exc:  # pragma: no cover - interactive feedback
         print(f"Failed to load file: {exc}")
         return 1
 
-    print(f"Loaded file: {file_path}")
-    print_column_overview(frame)
+    print(f"Loaded columns: time='{selected_time_column}', pressure='{selected_pressure_column}'")
 
-    if args.column not in frame.columns:
-        print(f"Column '{args.column}' not found. Available columns: {', '.join(frame.columns)}")
-        return 1
-
-    if args.time_column in frame.columns:
-        time_series = pd.to_numeric(frame[args.time_column], errors="coerce")
+    if selected_time_column in frame.columns:
+        time_series = pd.to_numeric(frame[selected_time_column], errors="coerce")
         time = time_series.to_numpy()
     else:
         time = None
 
-    pressure_series = pd.to_numeric(frame[args.column], errors="coerce")
+    pressure_series = pd.to_numeric(frame[selected_pressure_column], errors="coerce")
     pressure = pressure_series.to_numpy()
 
     interval = parse_interval(metadata, frame)
