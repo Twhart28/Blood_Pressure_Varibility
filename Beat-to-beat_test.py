@@ -784,6 +784,19 @@ def plot_waveform(
 def summarise_beats(beats: Sequence[Beat]) -> pd.DataFrame:
     """Build a DataFrame summarising the detected beats."""
 
+    base_columns = {
+        "systolic_time": pd.Series(dtype=float),
+        "systolic_pressure": pd.Series(dtype=float),
+        "diastolic_time": pd.Series(dtype=float),
+        "diastolic_pressure": pd.Series(dtype=float),
+        "map_time": pd.Series(dtype=float),
+        "map_pressure": pd.Series(dtype=float),
+        "rr_interval": pd.Series(dtype=float),
+        "prominence": pd.Series(dtype=float),
+        "artifact": pd.Series(dtype=bool),
+        "artifact_reasons": pd.Series(dtype=object),
+    }
+
     records = []
     for beat in beats:
         records.append(
@@ -800,8 +813,10 @@ def summarise_beats(beats: Sequence[Beat]) -> pd.DataFrame:
                 "artifact_reasons": ", ".join(beat.artifact_reasons) if beat.artifact_reasons else "",
             }
         )
-    return pd.DataFrame.from_records(records)
+    if not records:
+        return pd.DataFrame(base_columns)
 
+    return pd.DataFrame.from_records(records)
 
 def _resample_even_grid(times: np.ndarray, values: np.ndarray, fs: float) -> Tuple[np.ndarray, np.ndarray]:
     """Interpolate ``values`` onto an even time grid at ``fs`` Hz."""
