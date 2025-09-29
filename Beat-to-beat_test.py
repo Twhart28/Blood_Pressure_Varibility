@@ -74,6 +74,7 @@ class Beat:
     systolic_pressure: float
     diastolic_time: float
     diastolic_pressure: float
+    notch_time: Optional[float]
     map_time: float
     map_pressure: float
     rr_interval: Optional[float]
@@ -313,7 +314,7 @@ def detect_systolic_peaks(
     max_rr: float,
     prominence_floor: float,
     prominence_noise_factor: float,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Tuple[int, int]]]:
     """Detect systolic peaks using adaptive upstroke and prominence checks.
 
     The Lab chart module applies a two-step process: first it emphasises the
@@ -324,7 +325,12 @@ def detect_systolic_peaks(
     """
 
     if signal.size == 0:
-        return np.array([], dtype=int), np.array([], dtype=float)
+        return (
+            np.array([], dtype=int),
+            np.array([], dtype=float),
+            np.array([], dtype=int),
+            [],
+        )
 
     detrended = detrend_signal(signal, fs, window_seconds=0.6)
     velocity = np.gradient(detrended)
@@ -332,23 +338,89 @@ def detect_systolic_peaks(
     positive_velocity = np.clip(velocity, a_min=0.0, a_max=None)
 
     if not np.any(positive_velocity > 0):
-        return np.array([], dtype=int), np.array([], dtype=float)
+        return (
+            np.array([], dtype=int),
+            np.array([], dtype=float),
+            np.array([], dtype=int),
+            [],
+        )
 
-    baseline = float(np.median(positive_velocity[positive_velocity > 0]))
-    mad = float(np.median(np.abs(positive_velocity[positive_velocity > 0] - baseline)))
+    positive_samples = positive_velocity[positive_velocity > 0]
+    baseline = float(np.median(positive_samples))
+    mad = float(np.median(np.abs(positive_samples - baseline)))
     if mad == 0.0:
-        mad = float(np.std(positive_velocity))
+        mad = float(np.std(positive_samples))
     if mad == 0.0:
         mad = 1.0
 
-    upstroke_threshold = baseline + 2.5 * mad
-    if upstroke_threshold <= 0:
-        upstroke_threshold = baseline * 1.5 if baseline > 0 else 0.5
+    global_threshold = baseline + 2.5 * mad
+    if global_threshold <= 0:
+        global_threshold = baseline * 1.5 if baseline > 0 else 0.5
 
-    crossings = np.flatnonzero(
-        (positive_velocity[:-1] < upstroke_threshold)
-        & (positive_velocity[1:] >= upstroke_threshold)
+    velocity_scale = float(np.nanmedian(np.abs(velocity))) if velocity.size else 0.0
+    plateau_eps = max(0.02, 0.3 * velocity_scale)
+    plateau_samples = max(1, int(round(0.5 * fs)))
+    calibration_segments: List[Tuple[int, int]] = []
+    if plateau_samples > 1:
+        mask = np.abs(velocity) <= plateau_eps
+        idx = 0
+        while idx < mask.size:
+            if mask[idx]:
+                start = idx
+                while idx < mask.size and mask[idx]:
+                    idx += 1
+                if idx - start >= plateau_samples:
+                    calibration_segments.append((start, idx))
+            else:
+                idx += 1
+
+    rolling_window_seconds = 4.0
+    default_window = max(3, int(round(rolling_window_seconds * fs)))
+    if default_window % 2 == 0:
+        default_window += 1
+
+    local_medians = np.full(signal.size, np.nan, dtype=float)
+    local_mads = np.full(signal.size, np.nan, dtype=float)
+
+    segment_boundaries: List[Tuple[int, int]] = []
+    cursor = 0
+    for start, end in calibration_segments:
+        if start > cursor:
+            segment_boundaries.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < signal.size:
+        segment_boundaries.append((cursor, signal.size))
+
+    for seg_start, seg_end in segment_boundaries:
+        seg_len = seg_end - seg_start
+        if seg_len < 3:
+            continue
+        window = min(default_window, seg_len if seg_len % 2 == 1 else seg_len - 1)
+        if window < 3:
+            continue
+        seg_med, seg_mad = _rolling_median_and_mad(positive_velocity[seg_start:seg_end], window)
+        local_medians[seg_start:seg_end] = seg_med
+        local_mads[seg_start:seg_end] = seg_mad
+
+    thresholds = np.full(signal.size, global_threshold, dtype=float)
+    valid_local = np.isfinite(local_medians)
+    adjusted_mads = np.where(
+        valid_local & np.isfinite(local_mads) & (local_mads > 1e-6),
+        local_mads,
+        mad,
     )
+    local_thresholds = local_medians + 2.5 * adjusted_mads
+    local_thresholds = np.where(
+        local_thresholds <= 0,
+        np.where(local_medians > 0, local_medians * 1.5, global_threshold),
+        local_thresholds,
+    )
+    np.copyto(thresholds, local_thresholds, where=valid_local)
+
+    thresholds = np.clip(thresholds, 0.05, None)
+
+    above_threshold = positive_velocity >= thresholds
+    crossings = np.flatnonzero(~above_threshold[:-1] & above_threshold[1:])
     if crossings.size:
         candidate_onsets = crossings + 1
     else:
@@ -369,41 +441,59 @@ def detect_systolic_peaks(
 
     peaks: List[int] = []
     prominences: List[float] = []
-    last_peak = -max_distance
+    notches: List[int] = []
 
     downstroke_grace = max(1, int(round(0.02 * fs)))
+    sustained_negative = max(1, int(round(0.02 * fs)))
+    notch_guard = max(1, int(round(0.05 * fs)))
+    suppress_until = -1
 
     for onset in candidate_onsets:
+        if onset <= suppress_until:
+            continue
+
         search_start = int(onset)
         search_end = min(signal.size, search_start + search_horizon)
         if search_end <= search_start:
             continue
 
         segment = signal[search_start:search_end]
-
         velocity_window = velocity[search_start:search_end]
-        # Restrict the peak search to the portion of the beat where the
-        # upstroke is still active. Once the smoothed velocity turns negative
-        # we have passed the systolic apex and risk latching onto the dicrotic
-        # notch, so we cap the search window a few samples after that point.
-        descending = np.flatnonzero(velocity_window <= 0)
-        if descending.size:
-            limit = descending[0] + downstroke_grace
-            limit = min(limit, segment.size)
-            if limit > 3 and np.any(velocity_window[: descending[0] + 1] > 0):
-                capped_segment = segment[:limit]
-                peak_rel = int(np.argmax(capped_segment))
+
+        peak_rel = int(np.argmax(segment))
+
+        seen_positive = False
+        run_length = 0
+        sustained_limit: Optional[int] = None
+        for idx, vel_val in enumerate(velocity_window):
+            if vel_val > 0:
+                seen_positive = True
+                run_length = 0
+            elif vel_val <= 0 and seen_positive:
+                run_length += 1
+                if run_length >= sustained_negative:
+                    sustained_limit = idx + downstroke_grace
+                    break
             else:
-                peak_rel = int(np.argmax(segment))
+                run_length = 0
+
+        if sustained_limit is not None:
+            limit = min(segment.size, max(sustained_limit, peak_rel + 1))
+            if limit > 0:
+                capped_segment = segment[:limit]
+                if capped_segment.size:
+                    peak_rel = int(np.argmax(capped_segment))
         else:
-            peak_rel = int(np.argmax(segment))
+            descending = np.flatnonzero(velocity_window <= 0)
+            if descending.size:
+                limit = descending[0] + downstroke_grace
+                limit = min(limit, segment.size)
+                if limit > 0:
+                    capped_segment = segment[:limit]
+                    if capped_segment.size:
+                        peak_rel = int(np.argmax(capped_segment))
 
         peak_idx = search_start + peak_rel
-
-        if peak_idx - last_peak < min_distance:
-            if peaks and signal[peak_idx] > signal[peaks[-1]]:
-                peaks[-1] = peak_idx
-            continue
 
         left = signal[max(0, peak_idx - max_distance) : peak_idx + 1]
         right = signal[peak_idx : min(signal.size, peak_idx + max_distance)]
@@ -416,9 +506,62 @@ def detect_systolic_peaks(
         if prominence < min_prominence:
             continue
 
+        notch_idx = -1
+        notch_start = peak_idx + 1
+        notch_end = min(signal.size, peak_idx + int(round(0.45 * fs)))
+        if notch_end > notch_start + 1:
+            velocity_slice = velocity[notch_start:notch_end]
+            zero_crossings = np.flatnonzero(
+                (velocity_slice[:-1] < 0) & (velocity_slice[1:] >= 0)
+            )
+            if zero_crossings.size:
+                zero_idx = notch_start + zero_crossings[0] + 1
+                window_radius = max(1, int(round(0.02 * fs)))
+                local_start = max(notch_start, zero_idx - window_radius)
+                local_end = min(signal.size, zero_idx + window_radius)
+                if local_end > local_start:
+                    local_segment = signal[local_start:local_end]
+                    notch_rel = int(np.argmin(local_segment))
+                    notch_idx = local_start + notch_rel
+        if peaks and peak_idx - peaks[-1] < min_distance:
+            if signal[peak_idx] > signal[peaks[-1]]:
+                peaks[-1] = peak_idx
+                prominences[-1] = prominence
+                notches[-1] = notch_idx
+                suppress_until = (notch_idx if notch_idx >= 0 else peak_idx) + notch_guard
+            continue
+
         peaks.append(peak_idx)
         prominences.append(prominence)
-        last_peak = peak_idx
+        notches.append(notch_idx)
+
+        suppress_until = (notch_idx if notch_idx >= 0 else peak_idx) + notch_guard
+
+    if peaks:
+        peak_diffs = np.diff(peaks) / fs if len(peaks) > 1 else np.array([], dtype=float)
+        global_interval = float(np.median(peak_diffs)) if peak_diffs.size else math.nan
+        cleaned_peaks: List[int] = [peaks[0]]
+        cleaned_prom: List[float] = [prominences[0]]
+        cleaned_notches: List[int] = [notches[0]]
+        interval_history: List[float] = []
+        for idx in range(1, len(peaks)):
+            interval = float((peaks[idx] - cleaned_peaks[-1]) / fs)
+            if interval_history:
+                local_median = float(np.median(interval_history[-3:]))
+            else:
+                local_median = global_interval if not math.isnan(global_interval) else interval
+            short_interval = local_median > 0 and interval < 0.4 * local_median
+            weak_prominence = prominences[idx] <= 0.6 * cleaned_prom[-1]
+            if short_interval or weak_prominence:
+                continue
+            cleaned_peaks.append(peaks[idx])
+            cleaned_prom.append(prominences[idx])
+            cleaned_notches.append(notches[idx])
+            interval_history.append(interval)
+
+        peaks = cleaned_peaks
+        prominences = cleaned_prom
+        notches = cleaned_notches
 
     if len(peaks) < 3:
         fallback_peaks, fallback_prom = find_prominent_peaks(
@@ -429,9 +572,15 @@ def detect_systolic_peaks(
             min_prominence=min_prominence,
         )
         if fallback_peaks.size:
-            return fallback_peaks, fallback_prom
+            fallback_notches = np.full_like(fallback_peaks, -1, dtype=int)
+            return fallback_peaks, fallback_prom, fallback_notches, calibration_segments
 
-    return np.asarray(peaks, dtype=int), np.asarray(prominences, dtype=float)
+    return (
+        np.asarray(peaks, dtype=int),
+        np.asarray(prominences, dtype=float),
+        np.asarray(notches, dtype=int),
+        calibration_segments,
+    )
 
 
 def find_prominent_peaks(
@@ -528,7 +677,12 @@ def derive_beats(
 
     filtered = zero_phase_filter(pressure_filled, fs=fs)
     smoothed = smooth_signal(filtered, window_seconds=0.03, fs=fs)
-    systolic_indices, prominences = detect_systolic_peaks(
+    (
+        systolic_indices,
+        prominences,
+        notch_indices,
+        calibration_segments,
+    ) = detect_systolic_peaks(
         smoothed,
         fs=fs,
         min_rr=min_rr,
@@ -540,14 +694,31 @@ def derive_beats(
     beats: List[Beat] = []
     prev_dia_sample: Optional[int] = None
 
+    reset_boundaries = [end for _, end in calibration_segments]
+    post_gap_targets: set[int] = set()
+    for _, end in calibration_segments:
+        for candidate in systolic_indices:
+            if candidate >= end:
+                post_gap_targets.add(candidate)
+                break
+
     for idx, sys_idx in enumerate(systolic_indices):
         prev_sys = systolic_indices[idx - 1] if idx > 0 else None
         next_sys = systolic_indices[idx + 1] if idx + 1 < len(systolic_indices) else None
+
+        notch_idx = notch_indices[idx] if idx < len(notch_indices) else -1
 
         if prev_sys is not None:
             search_start = prev_sys + max(1, int(round(0.05 * fs)))
         else:
             search_start = max(0, sys_idx - int(round(max_rr * fs)))
+
+        last_reset = max(
+            (boundary for boundary in reset_boundaries if boundary <= sys_idx),
+            default=-1,
+        )
+        if last_reset >= 0:
+            search_start = max(search_start, int(last_reset))
 
         search_end = sys_idx
         if next_sys is not None:
@@ -568,11 +739,15 @@ def derive_beats(
         systolic_pressure = float(raw_sys) if math.isfinite(raw_sys) else float(pressure_filled[sys_idx])
         diastolic_time = float(time[dia_idx])
         diastolic_pressure = float(raw_dia) if math.isfinite(raw_dia) else float(pressure_filled[dia_idx])
+        notch_time = float(time[notch_idx]) if 0 <= notch_idx < len(time) else math.nan
         map_time = float((systolic_time + diastolic_time) / 2.0)
         area_map = math.nan
-        if prev_dia_sample is not None and prev_dia_sample < dia_idx:
+        integration_end = dia_idx
+        if 0 <= notch_idx <= dia_idx:
+            integration_end = notch_idx
+        if prev_dia_sample is not None and prev_dia_sample < integration_end:
             start_idx = prev_dia_sample
-            end_idx = dia_idx + 1
+            end_idx = integration_end + 1
             if end_idx - start_idx > 2:
                 segment_time = time[start_idx:end_idx]
                 segment_pressure = pressure_filled[start_idx:end_idx]
@@ -580,6 +755,7 @@ def derive_beats(
                 duration = float(segment_time[-1] - segment_time[0])
                 if duration > 0:
                     area_map = area / duration
+                    map_time = float((segment_time[0] + segment_time[-1]) / 2.0)
 
         if math.isnan(area_map):
             map_pressure = diastolic_pressure + (systolic_pressure - diastolic_pressure) / 3.0
@@ -594,6 +770,8 @@ def derive_beats(
             if start_time <= systolic_time <= end_time:
                 reasons.append("long gap interpolation")
                 break
+        if sys_idx in post_gap_targets:
+            reasons.append("post calibration gap")
 
         beats.append(
             Beat(
@@ -601,6 +779,7 @@ def derive_beats(
                 systolic_pressure=systolic_pressure,
                 diastolic_time=diastolic_time,
                 diastolic_pressure=diastolic_pressure,
+                notch_time=notch_time,
                 map_time=map_time,
                 map_pressure=map_pressure,
                 rr_interval=rr_interval,
@@ -808,6 +987,7 @@ def summarise_beats(beats: Sequence[Beat]) -> pd.DataFrame:
         "systolic_pressure": pd.Series(dtype=float),
         "diastolic_time": pd.Series(dtype=float),
         "diastolic_pressure": pd.Series(dtype=float),
+        "notch_time": pd.Series(dtype=float),
         "map_time": pd.Series(dtype=float),
         "map_pressure": pd.Series(dtype=float),
         "rr_interval": pd.Series(dtype=float),
@@ -824,6 +1004,7 @@ def summarise_beats(beats: Sequence[Beat]) -> pd.DataFrame:
                 "systolic_pressure": beat.systolic_pressure,
                 "diastolic_time": beat.diastolic_time,
                 "diastolic_pressure": beat.diastolic_pressure,
+                "notch_time": beat.notch_time,
                 "map_time": beat.map_time,
                 "map_pressure": beat.map_pressure,
                 "rr_interval": beat.rr_interval,
