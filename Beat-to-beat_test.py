@@ -26,6 +26,25 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 try:
+    import tkinter as tk
+    from tkinter import filedialog
+except Exception:  # pragma: no cover - tkinter may be unavailable in some envs.
+    tk = None
+    filedialog = None
+
+try:
+    import matplotlib
+    if tk is not None:
+        preferred_backend = "TkAgg"
+    else:
+        preferred_backend = "Agg"
+    current_backend = matplotlib.get_backend().lower()
+    if current_backend != preferred_backend.lower():
+        try:
+            matplotlib.use(preferred_backend, force=True)
+        except Exception:
+            if current_backend.startswith("qt"):
+                matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 except ModuleNotFoundError:  # pragma: no cover - optional dependency
     plt = None
@@ -39,13 +58,6 @@ try:
     import pandas as pd
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
     raise SystemExit("pandas is required to run this script. Please install it and retry.") from exc
-
-try:
-    import tkinter as tk
-    from tkinter import filedialog
-except Exception:  # pragma: no cover - tkinter may be unavailable in some envs.
-    tk = None
-    filedialog = None
 
 
 @dataclass
@@ -119,11 +131,16 @@ def load_bp_file(file_path: Path) -> Tuple[pd.DataFrame, Dict[str, str]]:
                 continue
 
             # Remaining lines are expected to be numeric data.
+            if "#" in line:
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+
             parts = [p for p in re.split(r"\s+", line) if p]
             try:
                 row = [float(p) if p.lower() != "nan" else math.nan for p in parts]
             except ValueError as exc:
-                raise ValueError(f"Could not parse data row: {line!r}") from exc
+                raise ValueError(f"Could not parse data row: {raw_line.strip()!r}") from exc
             data_rows.append(row)
 
     if not data_rows:
