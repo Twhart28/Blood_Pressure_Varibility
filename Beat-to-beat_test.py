@@ -371,6 +371,8 @@ def detect_systolic_peaks(
     prominences: List[float] = []
     last_peak = -max_distance
 
+    downstroke_grace = max(1, int(round(0.02 * fs)))
+
     for onset in candidate_onsets:
         search_start = int(onset)
         search_end = min(signal.size, search_start + search_horizon)
@@ -378,7 +380,24 @@ def detect_systolic_peaks(
             continue
 
         segment = signal[search_start:search_end]
-        peak_rel = int(np.argmax(segment))
+
+        velocity_window = velocity[search_start:search_end]
+        # Restrict the peak search to the portion of the beat where the
+        # upstroke is still active. Once the smoothed velocity turns negative
+        # we have passed the systolic apex and risk latching onto the dicrotic
+        # notch, so we cap the search window a few samples after that point.
+        descending = np.flatnonzero(velocity_window <= 0)
+        if descending.size:
+            limit = descending[0] + downstroke_grace
+            limit = min(limit, segment.size)
+            if limit > 3 and np.any(velocity_window[: descending[0] + 1] > 0):
+                capped_segment = segment[:limit]
+                peak_rel = int(np.argmax(capped_segment))
+            else:
+                peak_rel = int(np.argmax(segment))
+        else:
+            peak_rel = int(np.argmax(segment))
+
         peak_idx = search_start + peak_rel
 
         if peak_idx - last_peak < min_distance:
