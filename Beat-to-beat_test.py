@@ -107,6 +107,7 @@ class BPFilePreview:
     column_names: List[str]
     preview: pd.DataFrame
     skiprows: List[int]
+    detected_separator: Optional[str]
 
 
 def _parse_list_field(raw_value: str) -> List[str]:
@@ -146,7 +147,9 @@ def _parse_list_field(raw_value: str) -> List[str]:
     return merged or tokens
 
 
-def _parse_bp_header(file_path: Path) -> Tuple[Dict[str, str], List[int], List[str]]:
+def _parse_bp_header(
+    file_path: Path, *, max_data_lines: int = 5
+) -> Tuple[Dict[str, str], List[int], List[str], Optional[str]]:
     """Return metadata, line numbers to skip, and inferred column names.
 
     The parser treats blank lines, comments, and ``key=value`` metadata entries
@@ -158,31 +161,72 @@ def _parse_bp_header(file_path: Path) -> Tuple[Dict[str, str], List[int], List[s
     metadata: Dict[str, str] = {}
     skiprows: List[int] = []
     column_count: Optional[int] = None
+    first_numeric_row_idx: Optional[int] = None
+    first_numeric_raw: Optional[str] = None
+    numeric_lines_checked = 0
+
+    if max_data_lines <= 0:
+        max_data_lines = 1
+
+    def _numeric_values(candidate: str) -> np.ndarray:
+        tokens = [tok for tok in re.split(r"[\s,;|]+", candidate) if tok]
+        if not tokens:
+            return np.array([], dtype=float)
+        try:
+            return np.asarray([float(tok) for tok in tokens], dtype=float)
+        except ValueError:
+            return np.array([], dtype=float)
 
     with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
         for idx, raw_line in enumerate(handle):
             stripped = raw_line.strip()
-            if not stripped:
-                skiprows.append(idx)
+
+            if first_numeric_row_idx is None:
+                if not stripped:
+                    skiprows.append(idx)
+                    continue
+
+                candidate = stripped
+                if "#" in candidate:
+                    candidate = candidate.split("#", 1)[0].strip()
+                    if not candidate:
+                        skiprows.append(idx)
+                        continue
+
+                if "=" in candidate and not re.match(r"^[+-]?[0-9]", candidate):
+                    key, value = candidate.split("=", 1)
+                    metadata[key.strip()] = value.strip()
+                    skiprows.append(idx)
+                    continue
+
+                values = _numeric_values(candidate)
+                if values.size == 0:
+                    skiprows.append(idx)
+                    continue
+
+                column_count = int(values.size)
+                first_numeric_row_idx = idx
+                first_numeric_raw = raw_line.rstrip("\n")
+                numeric_lines_checked = 1
+
+                if numeric_lines_checked >= max_data_lines:
+                    break
                 continue
+
+            # Once numeric data begins, avoid adding more skip rows and only
+            # validate a limited sample for column consistency.
+            if not stripped:
+                break
 
             candidate = stripped
             if "#" in candidate:
                 candidate = candidate.split("#", 1)[0].strip()
                 if not candidate:
-                    skiprows.append(idx)
-                    continue
+                    break
 
-            if "=" in candidate and not re.match(r"^[+-]?[0-9]", candidate):
-                key, value = candidate.split("=", 1)
-                metadata[key.strip()] = value.strip()
-                skiprows.append(idx)
-                continue
-
-            values = np.fromstring(candidate, sep=" ")
+            values = _numeric_values(candidate)
             if values.size == 0:
-                skiprows.append(idx)
-                continue
+                break
 
             if column_count is None:
                 column_count = int(values.size)
@@ -192,7 +236,11 @@ def _parse_bp_header(file_path: Path) -> Tuple[Dict[str, str], List[int], List[s
                     f"line {idx + 1}: expected {column_count}, found {int(values.size)}."
                 )
 
-    if column_count is None:
+            numeric_lines_checked += 1
+            if numeric_lines_checked >= max_data_lines:
+                break
+
+    if column_count is None or first_numeric_row_idx is None:
         raise ValueError("No numeric data found in file.")
 
     channels = _parse_list_field(metadata.get("ChannelTitle", ""))
@@ -201,31 +249,65 @@ def _parse_bp_header(file_path: Path) -> Tuple[Dict[str, str], List[int], List[s
     else:
         column_names = [f"col_{idx}" for idx in range(column_count)]
 
-    return metadata, skiprows, column_names
+    detected_separator: Optional[str] = None
+    if first_numeric_raw is not None:
+        for delimiter in ("\t", ",", ";", "|"):
+            if delimiter in first_numeric_raw:
+                detected_separator = delimiter
+                break
+
+    return metadata, skiprows, column_names, detected_separator
 
 
-def _scan_bp_file(file_path: Path, max_numeric_rows: int = 20) -> BPFilePreview:
+def _scan_bp_file(
+    file_path: Path,
+    max_numeric_rows: int = 20,
+    *,
+    header_sample_lines: int = 5,
+) -> BPFilePreview:
     """Perform a quick pass to gather metadata and column previews."""
 
-    metadata, skiprows, column_names = _parse_bp_header(file_path)
-    preview_frame = pd.read_csv(
-        file_path,
-        delim_whitespace=True,
+    metadata, skiprows, column_names, detected_separator = _parse_bp_header(
+        file_path, max_data_lines=header_sample_lines
+    )
+
+    read_kwargs = dict(
+        filepath_or_buffer=file_path,
         comment="#",
         header=None,
         names=column_names,
         skiprows=skiprows,
         nrows=max_numeric_rows,
-        engine="python",
         na_values=["nan", "NaN", "NA"],
         dtype=float,
     )
+
+    if detected_separator:
+        try:
+            preview_frame = pd.read_csv(
+                sep=detected_separator,
+                engine="c",
+                **read_kwargs,
+            )
+        except Exception:
+            preview_frame = pd.read_csv(
+                delim_whitespace=True,
+                engine="python",
+                **read_kwargs,
+            )
+    else:
+        preview_frame = pd.read_csv(
+            delim_whitespace=True,
+            engine="python",
+            **read_kwargs,
+        )
 
     return BPFilePreview(
         metadata=metadata,
         column_names=column_names,
         preview=preview_frame,
         skiprows=skiprows,
+        detected_separator=detected_separator,
     )
 
 
@@ -394,18 +476,36 @@ def load_bp_file(
     usecols = list(dict.fromkeys(desired))
     dtype_map = {name: float for name in usecols}
 
-    frame = pd.read_csv(
-        file_path,
-        delim_whitespace=True,
+    read_kwargs = dict(
+        filepath_or_buffer=file_path,
         comment="#",
         header=None,
         names=preview.column_names,
         usecols=usecols,
         skiprows=preview.skiprows,
-        engine="python",
         na_values=["nan", "NaN", "NA"],
         dtype=dtype_map,
     )
+
+    if preview.detected_separator:
+        try:
+            frame = pd.read_csv(
+                sep=preview.detected_separator,
+                engine="c",
+                **read_kwargs,
+            )
+        except Exception:
+            frame = pd.read_csv(
+                delim_whitespace=True,
+                engine="python",
+                **read_kwargs,
+            )
+    else:
+        frame = pd.read_csv(
+            delim_whitespace=True,
+            engine="python",
+            **read_kwargs,
+        )
 
     return frame, preview.metadata
 
