@@ -97,6 +97,7 @@ class Beat:
     systolic_prominence: float
     is_artifact: bool
     artifact_reasons: List[str] = field(default_factory=list)
+    is_post_calibration_recovery: bool = False
 
 
 @dataclass
@@ -1536,11 +1537,11 @@ def derive_beats(
     prev_dia_sample: Optional[int] = None
 
     reset_boundaries = [end for _, end in calibration_segments]
-    post_gap_targets: set[int] = set()
+    post_calibration_targets: set[int] = set()
     for _, end in calibration_segments:
         for candidate in systolic_indices:
             if candidate >= end:
-                post_gap_targets.add(candidate)
+                post_calibration_targets.add(candidate)
                 break
 
     for idx, sys_idx in enumerate(systolic_indices):
@@ -1611,7 +1612,8 @@ def derive_beats(
             if start_time <= systolic_time <= end_time:
                 reasons.append("long gap interpolation")
                 break
-        if sys_idx in post_gap_targets:
+        is_post_calibration = sys_idx in post_calibration_targets
+        if is_post_calibration:
             reasons.append("post calibration gap")
 
         beats.append(
@@ -1627,6 +1629,7 @@ def derive_beats(
                 systolic_prominence=float(prominences[idx]),
                 is_artifact=False,
                 artifact_reasons=reasons,
+                is_post_calibration_recovery=is_post_calibration,
             )
         )
 
@@ -1792,6 +1795,17 @@ def apply_artifact_rules(beats: List[Beat], *, config: ArtifactConfig) -> None:
         combined_reasons.extend(severe_reasons)
         combined_reasons.extend(soft_reasons)
         beat.is_artifact = bool(severe_reasons or len(soft_reasons) >= 2)
+        if (
+            beat.is_post_calibration_recovery
+            and beat.is_artifact
+            and not severe_reasons
+        ):
+            beat.is_artifact = False
+            combined_reasons = [
+                reason
+                for reason in combined_reasons
+                if reason not in soft_reasons
+            ]
         beat.artifact_reasons = combined_reasons if beat.is_artifact else []
 
 
