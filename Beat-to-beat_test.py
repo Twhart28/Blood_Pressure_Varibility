@@ -23,6 +23,7 @@ number of raw samples rendered in the interactive plot
 
 from __future__ import annotations
 
+import csv
 import math
 import re
 import sys
@@ -125,6 +126,7 @@ class BPFilePreview:
     preview: pd.DataFrame
     skiprows: List[int]
     detected_separator: Optional[str]
+    raw_lines: List[str]
 
 
 @dataclass
@@ -135,6 +137,10 @@ class ImportDialogResult:
     separator: Optional[str]
     time_column: str
     pressure_column: str
+    header_row: int
+    first_data_row: int
+    time_column_index: int
+    pressure_column_index: int
 
 
 def _parse_list_field(raw_value: str) -> List[str]:
@@ -358,12 +364,22 @@ def _scan_bp_file(
             **read_kwargs,
         )
 
+    preview_line_cap = max(max_numeric_rows, 200)
+    raw_lines: List[str] = []
+    with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for _ in range(preview_line_cap):
+            line = handle.readline()
+            if not line:
+                break
+            raw_lines.append(line.rstrip("\r\n"))
+
     return BPFilePreview(
         metadata=metadata,
         column_names=column_names,
         preview=preview_frame,
         skiprows=skiprows,
         detected_separator=detected_separator,
+        raw_lines=raw_lines,
     )
 
 
@@ -384,13 +400,15 @@ def _default_column_selection(column_names: Sequence[str], requested: Optional[s
 
 def _render_preview_to_text_widget(
     widget: tk.Text,
-    preview_df: pd.DataFrame,
+    preview_rows: Sequence[Sequence[str]],
     *,
-    time_column: str,
-    pressure_column: str,
+    header_row_index: int,
+    first_data_row_index: int,
+    time_column_index: Optional[int],
+    pressure_column_index: Optional[int],
     max_rows: int = 50,
 ) -> None:
-    """Render a small preview table into a Tkinter text widget with highlights."""
+    """Render a preview table into a Tkinter text widget with highlights."""
 
     if tk is None:
         return
@@ -398,73 +416,64 @@ def _render_preview_to_text_widget(
     widget.configure(state="normal")
     widget.delete("1.0", "end")
 
-    if preview_df.empty:
+    if not preview_rows:
         widget.insert("1.0", "No preview data available.")
         widget.configure(state="disabled")
         return
 
-    head = preview_df.head(max_rows)
-    column_names = list(head.columns)
-    formatted_columns: List[List[str]] = []
+    total_rows = len(preview_rows)
+    display_rows = list(preview_rows[:max_rows])
+    column_count = max((len(row) for row in display_rows), default=0)
+    row_number_width = max(3, len(str(min(total_rows, max_rows)))) + 1
+
     widths: List[int] = []
-
-    for name in column_names:
-        series = head[name]
-        values: List[str] = []
-        max_width = len(str(name))
-        for value in series:
-            if pd.isna(value):
-                text = ""
-            elif isinstance(value, (float, np.floating)):
-                text = f"{value:.6g}"
-            else:
-                text = str(value)
-            max_width = max(max_width, len(text))
-            values.append(text)
-        formatted_columns.append(values)
-        widths.append(max_width)
-
-    def _append_line(cells: Sequence[str]) -> Tuple[str, List[Tuple[int, int, str]]]:
-        parts: List[str] = []
-        positions: List[Tuple[int, int, str]] = []
-        cursor = 0
-        for idx, cell in enumerate(cells):
-            padded = cell.ljust(widths[idx])
-            parts.append(padded)
-            positions.append((cursor, cursor + len(padded), column_names[idx]))
-            cursor += len(padded)
-            if idx < len(cells) - 1:
-                parts.append("  ")
-                cursor += 2
-        return "".join(parts), positions
+    for col_idx in range(column_count):
+        col_values = [
+            str(row[col_idx]) if col_idx < len(row) and row[col_idx] is not None else ""
+            for row in display_rows
+        ]
+        widths.append(max((len(value) for value in col_values), default=0))
 
     line_no = 1
-    header_line, header_positions = _append_line([str(name) for name in column_names])
-    widget.insert("end", header_line + "\n")
-    for start, end, col_name in header_positions:
-        if col_name == time_column:
-            widget.tag_add("highlight_time", f"{line_no}.{start}", f"{line_no}.{end}")
-        elif col_name == pressure_column:
-            widget.tag_add("highlight_pressure", f"{line_no}.{start}", f"{line_no}.{end}")
-    widget.tag_add("header", "1.0", "1.end")
-    line_no += 1
+    for row_number, row_values in enumerate(display_rows, start=1):
+        line_parts: List[str] = [f"{row_number:>{row_number_width}} "]
+        cursor = len(line_parts[0])
+        positions: List[Tuple[int, int, int]] = []
 
-    for row_idx in range(len(head)):
-        row_cells = [formatted_columns[col_idx][row_idx] for col_idx in range(len(column_names))]
-        line_text, positions = _append_line(row_cells)
+        for col_idx in range(column_count):
+            value = ""
+            if col_idx < len(row_values) and row_values[col_idx] is not None:
+                value = str(row_values[col_idx])
+            padded = value.ljust(widths[col_idx] + 2)
+            start = cursor
+            end = cursor + len(padded)
+            positions.append((start, end, col_idx))
+            line_parts.append(padded)
+            cursor = end
+
+        line_text = "".join(line_parts)
         widget.insert("end", line_text + "\n")
-        row_tag = "row_even" if row_idx % 2 == 0 else "row_odd"
+
+        row_tag = "row_even" if row_number % 2 == 0 else "row_odd"
         widget.tag_add(row_tag, f"{line_no}.0", f"{line_no}.end")
-        for start, end, col_name in positions:
-            if col_name == time_column:
+
+        if row_number == header_row_index:
+            widget.tag_add("header", f"{line_no}.0", f"{line_no}.end")
+        if row_number == first_data_row_index:
+            widget.tag_add("data_start", f"{line_no}.0", f"{line_no}.end")
+
+        for start, end, col_idx in positions:
+            if time_column_index is not None and col_idx == time_column_index:
                 widget.tag_add("highlight_time", f"{line_no}.{start}", f"{line_no}.{end}")
-            elif col_name == pressure_column:
+            if pressure_column_index is not None and col_idx == pressure_column_index:
                 widget.tag_add("highlight_pressure", f"{line_no}.{start}", f"{line_no}.{end}")
+
         line_no += 1
 
     widget.configure(state="disabled")
     widget.tag_raise("highlight_time")
     widget.tag_raise("highlight_pressure")
+    widget.tag_raise("data_start")
     widget.tag_raise("header")
 
 
@@ -488,6 +497,7 @@ def launch_import_configuration_dialog(
         ("Semicolon (;)", ";"),
         ("Pipe (|)", "|"),
         ("Space", " "),
+        ("Colon (:)", ":"),
     ]
 
     def _label_for_separator(value: Optional[str]) -> str:
@@ -495,6 +505,72 @@ def launch_import_configuration_dialog(
             if value == candidate:
                 return label
         return "Auto-detect"
+
+    def _resolve_separator_from_label(label: str) -> Optional[str]:
+        for option_label, value in delimiter_options:
+            if option_label == label:
+                return value
+        return None
+
+    def _effective_separator(value: Optional[str]) -> Optional[str]:
+        if value is not None:
+            return value
+        return preview.detected_separator
+
+    raw_lines = list(preview.raw_lines)
+    if not raw_lines:
+        with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for _ in range(200):
+                line = handle.readline()
+                if not line:
+                    break
+                raw_lines.append(line.rstrip("\r\n"))
+
+    def _split_line(line: str, separator: Optional[str]) -> List[str]:
+        if not line:
+            return []
+        if separator is None:
+            return [tok for tok in re.split(r"\s+", line.strip()) if tok]
+        if separator == " ":
+            stripped = line.strip()
+            if not stripped:
+                return []
+            return [tok for tok in re.split(r"\s+", stripped) if tok]
+        try:
+            return next(csv.reader([line], delimiter=separator))
+        except Exception:
+            return line.split(separator)
+
+    def _split_preview_lines(separator: Optional[str]) -> List[List[str]]:
+        effective = _effective_separator(separator)
+        return [_split_line(line, effective) for line in raw_lines]
+
+    initial_separator = separator_override if separator_override is not None else preview.detected_separator
+    current_rows = _split_preview_lines(initial_separator)
+
+    if preview.skiprows:
+        header_default = max(1, max(preview.skiprows) + 1)
+    else:
+        header_default = 1
+    max_available_rows = max(len(raw_lines), 1)
+    header_default = min(header_default, max_available_rows)
+    first_data_default = header_default + 1 if header_default < max_available_rows else header_default + 1
+
+    default_time_index = 1
+    default_pressure_index = 2 if len(preview.column_names) >= 2 else 1
+    if preview.column_names:
+        if time_default in preview.column_names:
+            default_time_index = preview.column_names.index(time_default) + 1
+        if pressure_default in preview.column_names:
+            default_pressure_index = preview.column_names.index(pressure_default) + 1
+    if default_pressure_index == default_time_index:
+        if len(preview.column_names) >= 2:
+            for idx in range(1, len(preview.column_names) + 1):
+                if idx != default_time_index:
+                    default_pressure_index = idx
+                    break
+        if default_pressure_index == default_time_index:
+            default_pressure_index = max(1, min(default_time_index + 1, len(preview.column_names) or 1))
 
     root = tk.Tk()
     root.title("Import options")
@@ -509,10 +585,10 @@ def launch_import_configuration_dialog(
 
     controls_frame = ttk.Frame(main_frame)
     controls_frame.grid(row=0, column=0, sticky="ew", pady=(0, 12))
-    controls_frame.columnconfigure(5, weight=1)
+    controls_frame.columnconfigure(6, weight=1)
 
     ttk.Label(controls_frame, text="Delimiter:").grid(row=0, column=0, sticky="w")
-    delimiter_var = tk.StringVar(value=_label_for_separator(separator_override or preview.detected_separator))
+    delimiter_var = tk.StringVar(value=_label_for_separator(initial_separator))
     delimiter_combo = ttk.Combobox(
         controls_frame,
         state="readonly",
@@ -522,27 +598,47 @@ def launch_import_configuration_dialog(
     )
     delimiter_combo.grid(row=0, column=1, sticky="w", padx=(8, 24))
 
-    ttk.Label(controls_frame, text="Time column:").grid(row=0, column=2, sticky="w")
-    time_var = tk.StringVar(value=time_default)
+    ttk.Label(controls_frame, text="Header row:").grid(row=0, column=2, sticky="w")
+    header_var = tk.IntVar(value=header_default)
+    header_spin = tk.Spinbox(
+        controls_frame,
+        from_=1,
+        to=max(max_available_rows, header_default + 100),
+        textvariable=header_var,
+        width=8,
+    )
+    header_spin.grid(row=0, column=3, sticky="w", padx=(8, 24))
+
+    ttk.Label(controls_frame, text="First data row:").grid(row=0, column=4, sticky="w")
+    first_data_var = tk.IntVar(value=first_data_default)
+    first_data_spin = tk.Spinbox(
+        controls_frame,
+        from_=1,
+        to=max(max_available_rows, first_data_default + 100),
+        textvariable=first_data_var,
+        width=8,
+    )
+    first_data_spin.grid(row=0, column=5, sticky="w")
+
+    ttk.Label(controls_frame, text="Time column:").grid(row=1, column=0, sticky="w", pady=(12, 0))
+    time_var = tk.StringVar()
     time_combo = ttk.Combobox(
         controls_frame,
         state="readonly",
         textvariable=time_var,
-        values=preview.column_names,
-        width=18,
+        width=24,
     )
-    time_combo.grid(row=0, column=3, sticky="w", padx=(8, 24))
+    time_combo.grid(row=1, column=1, sticky="w", padx=(8, 24), pady=(12, 0))
 
-    ttk.Label(controls_frame, text="Pressure column:").grid(row=0, column=4, sticky="w")
-    pressure_var = tk.StringVar(value=pressure_default)
+    ttk.Label(controls_frame, text="Pressure column:").grid(row=1, column=2, sticky="w", pady=(12, 0))
+    pressure_var = tk.StringVar()
     pressure_combo = ttk.Combobox(
         controls_frame,
         state="readonly",
         textvariable=pressure_var,
-        values=preview.column_names,
-        width=18,
+        width=24,
     )
-    pressure_combo.grid(row=0, column=5, sticky="w")
+    pressure_combo.grid(row=1, column=3, sticky="w", padx=(8, 24), pady=(12, 0))
 
     ttk.Label(
         main_frame,
@@ -576,6 +672,7 @@ def launch_import_configuration_dialog(
     preview_text.tag_configure("row_odd", background="#ededed")
     preview_text.tag_configure("highlight_time", background="#dbeafe")
     preview_text.tag_configure("highlight_pressure", background="#fdeac5")
+    preview_text.tag_configure("data_start", background="#e7f5e4")
 
     error_var = tk.StringVar(value="")
     error_label = ttk.Label(main_frame, textvariable=error_var, foreground="red")
@@ -585,115 +682,309 @@ def launch_import_configuration_dialog(
     button_frame.grid(row=4, column=0, sticky="e", pady=(16, 0))
 
     result: Dict[str, object] = {}
-    current_preview: Dict[str, object] = {
+    current_preview_state: Dict[str, object] = {
         "preview": preview,
-        "separator": separator_override if separator_override is not None else preview.detected_separator,
+        "separator": initial_separator,
+        "resolved_separator": _effective_separator(initial_separator),
+        "rows": current_rows,
+        "header_row": header_default,
+        "first_data_row": first_data_default,
     }
 
+    column_option_map: Dict[str, int] = {}
+
     def _current_preview() -> BPFilePreview:
-        stored = current_preview.get("preview")
+        stored = current_preview_state.get("preview")
         if isinstance(stored, BPFilePreview):
             return stored
         return preview
 
+    def _current_rows() -> List[List[str]]:
+        rows = current_preview_state.get("rows")
+        if isinstance(rows, list):
+            return rows
+        return current_rows
+
+    def _parse_column_index(value: str) -> Optional[int]:
+        if not value:
+            return None
+        if value in column_option_map:
+            return column_option_map[value]
+        prefix = value.split(":", 1)[0].strip()
+        if prefix.isdigit():
+            return int(prefix)
+        return None
+
+    def _get_header_row() -> int:
+        try:
+            value = int(header_var.get())
+        except (tk.TclError, ValueError):
+            value = header_default
+        return max(1, value)
+
+    def _get_first_data_row() -> int:
+        try:
+            value = int(first_data_var.get())
+        except (tk.TclError, ValueError):
+            value = first_data_default
+        return max(1, value)
+
+    def _build_column_options() -> List[Tuple[str, int]]:
+        rows = _current_rows()
+        header_index = _get_header_row()
+        if rows:
+            header_index = min(header_index, len(rows))
+        header_values: Sequence[str] = []
+        if 1 <= header_index <= len(rows):
+            header_values = rows[header_index - 1]
+        sample_rows = rows[:50]
+        column_count = max((len(row) for row in sample_rows), default=len(preview.column_names))
+        column_count = max(column_count, len(header_values))
+        if column_count == 0:
+            column_count = len(preview.column_names) or 1
+        options: List[Tuple[str, int]] = []
+        for idx in range(column_count):
+            header_label = ""
+            if idx < len(header_values):
+                raw_value = header_values[idx]
+                header_label = str(raw_value).strip() if raw_value is not None else ""
+            if not header_label:
+                header_label = f"Column {idx + 1}"
+            options.append((f"{idx + 1}: {header_label}", idx + 1))
+        return options
+
+    def _select_label_for_index(options: Sequence[Tuple[str, int]], desired_index: int) -> str:
+        for label, idx in options:
+            if idx == desired_index:
+                return label
+        return options[0][0] if options else ""
+
+    def _update_column_options(initial: bool = False) -> None:
+        nonlocal column_option_map
+        options = _build_column_options()
+        column_option_map = {label: idx for label, idx in options}
+        labels = [label for label, _ in options]
+        time_combo.configure(values=labels)
+        pressure_combo.configure(values=labels)
+
+        if not options:
+            time_var.set("")
+            pressure_var.set("")
+            return
+
+        current_time_index = _parse_column_index(time_var.get()) or default_time_index
+        current_pressure_index = _parse_column_index(pressure_var.get()) or default_pressure_index
+
+        if initial:
+            current_time_index = default_time_index
+            current_pressure_index = default_pressure_index
+
+        current_time_index = max(1, min(current_time_index, options[-1][1]))
+        current_pressure_index = max(1, min(current_pressure_index, options[-1][1]))
+
+        if current_pressure_index == current_time_index and len(options) > 1:
+            for _, idx in options:
+                if idx != current_time_index:
+                    current_pressure_index = idx
+                    break
+
+        time_var.set(_select_label_for_index(options, current_time_index))
+        pressure_var.set(_select_label_for_index(options, current_pressure_index))
+
+    def _get_time_index() -> Optional[int]:
+        return _parse_column_index(time_var.get())
+
+    def _get_pressure_index() -> Optional[int]:
+        return _parse_column_index(pressure_var.get())
+
     def _update_preview_widget() -> None:
-        active_preview = _current_preview()
+        rows = _current_rows()
+        header_index = _get_header_row()
+        data_index = _get_first_data_row()
+        time_index = _get_time_index()
+        pressure_index = _get_pressure_index()
         _render_preview_to_text_widget(
             preview_text,
-            active_preview.preview,
-            time_column=time_var.get(),
-            pressure_column=pressure_var.get(),
+            rows,
+            header_row_index=header_index,
+            first_data_row_index=data_index,
+            time_column_index=(time_index - 1) if time_index else None,
+            pressure_column_index=(pressure_index - 1) if pressure_index else None,
         )
-
-    def _resolve_separator_from_label(label: str) -> Optional[str]:
-        for option_label, value in delimiter_options:
-            if option_label == label:
-                return value
-        return None
 
     def _refresh_preview_from_separator(*_: object) -> None:
         selection = delimiter_var.get()
         desired_separator = _resolve_separator_from_label(selection)
-        try:
-            new_preview = _scan_bp_file(
-                file_path,
-                max_numeric_rows=50,
-                separator_override=desired_separator,
-            )
-        except Exception as exc:
-            error_var.set(f"Failed to preview file with selected delimiter: {exc}")
-            return
+        rows = _split_preview_lines(desired_separator)
+        current_preview_state["rows"] = rows
+        current_preview_state["separator"] = desired_separator
+        current_preview_state["resolved_separator"] = _effective_separator(desired_separator)
+        _update_column_options()
+        _update_preview_widget()
 
+    def _on_structure_change(*_: object) -> None:
         error_var.set("")
-        current_preview["preview"] = new_preview
-        current_preview["separator"] = desired_separator
-
-        column_names = new_preview.column_names
-        time_combo.configure(values=column_names)
-        pressure_combo.configure(values=column_names)
-
-        if time_var.get() not in column_names:
-            time_var.set(_default_column_selection(column_names, None, fallback="Time"))
-
-        if pressure_var.get() not in column_names or pressure_var.get() == time_var.get():
-            remaining = [name for name in column_names if name != time_var.get()]
-            pressure_var.set(
-                _default_column_selection(
-                    remaining if remaining else column_names,
-                    None,
-                    fallback="reBAP",
-                )
-            )
-
+        current_preview_state["header_row"] = _get_header_row()
+        current_preview_state["first_data_row"] = _get_first_data_row()
+        _update_column_options()
         _update_preview_widget()
 
-    def _on_column_change(*_: object) -> None:
-        if time_var.get() == pressure_var.get():
-            if not error_var.get().startswith("Time and pressure"):
-                error_var.set("Time and pressure selections must differ.")
-        elif error_var.get().startswith("Time and pressure"):
-            error_var.set("")
-        _update_preview_widget()
+    def _build_preview_dataframe(
+        column_names: Sequence[str],
+        skiprows: Sequence[int],
+        resolved_separator: Optional[str],
+    ) -> pd.DataFrame:
+        read_kwargs = dict(
+            filepath_or_buffer=file_path,
+            header=None,
+            names=list(column_names),
+            skiprows=list(skiprows),
+            nrows=50,
+            na_values=["nan", "NaN", "NA"],
+            dtype=float,
+        )
+        if resolved_separator:
+            try:
+                engine = "c" if len(resolved_separator) == 1 else "python"
+                return pd.read_csv(sep=resolved_separator, engine=engine, **read_kwargs)
+            except Exception:
+                return pd.read_csv(delim_whitespace=True, engine="python", **read_kwargs)
+        return pd.read_csv(delim_whitespace=True, engine="python", **read_kwargs)
+
+    def _read_tokens_for_line(line_number: int, separator: Optional[str]) -> List[str]:
+        if line_number <= len(raw_lines):
+            return _split_line(raw_lines[line_number - 1], separator)
+        with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for idx, raw_line in enumerate(handle, start=1):
+                if idx == line_number:
+                    return _split_line(raw_line.rstrip("\r\n"), separator)
+        return []
+
+    def _derive_column_names(header_tokens: Sequence[str], column_count: int) -> List[str]:
+        names: List[str] = []
+        seen: Dict[str, int] = {}
+        for idx in range(column_count):
+            raw_value = header_tokens[idx] if idx < len(header_tokens) else ""
+            candidate = str(raw_value).strip() if raw_value is not None else ""
+            if not candidate:
+                candidate = f"column_{idx + 1}"
+            base = candidate
+            suffix = 1
+            while candidate in seen:
+                suffix += 1
+                candidate = f"{base}_{suffix}"
+            seen[candidate] = suffix
+            names.append(candidate)
+        return names
 
     def _confirm() -> None:
-        time_choice = time_var.get()
-        pressure_choice = pressure_var.get()
-        if not time_choice or not pressure_choice:
+        header_index = _get_header_row()
+        data_index = _get_first_data_row()
+        time_index = _get_time_index()
+        pressure_index = _get_pressure_index()
+
+        if time_index is None or pressure_index is None:
             error_var.set("Select both time and pressure columns.")
             return
-        if time_choice == pressure_choice:
+        if time_index == pressure_index:
             error_var.set("Time and pressure selections must differ.")
             return
-        result["time"] = time_choice
-        result["pressure"] = pressure_choice
-        result["separator"] = current_preview.get("separator")
-        result["preview"] = _current_preview()
+        if data_index <= header_index:
+            error_var.set("First data row must be after the header row.")
+            return
+
+        rows = _current_rows()
+        resolved_separator = current_preview_state.get("resolved_separator")
+        if not isinstance(resolved_separator, str):
+            resolved_separator = _effective_separator(current_preview_state.get("separator"))
+
+        header_tokens = _read_tokens_for_line(header_index, resolved_separator)
+        sample_rows = rows[:50]
+        column_count = max((len(row) for row in sample_rows), default=0)
+        column_count = max(column_count, len(header_tokens), time_index, pressure_index)
+        if column_count <= 0:
+            column_count = max(time_index, pressure_index)
+
+        column_names = _derive_column_names(header_tokens, column_count)
+        if time_index > len(column_names) or pressure_index > len(column_names):
+            error_var.set("Selected columns exceed detected column count.")
+            return
+
+        skiprows = set(preview.skiprows)
+        skiprows.update(range(max(0, data_index - 1)))
+        skiprows_list = sorted(skiprows)
+
+        try:
+            preview_df = _build_preview_dataframe(column_names, skiprows_list, resolved_separator)
+        except Exception as exc:  # pragma: no cover - interactive feedback
+            error_var.set(f"Failed to build preview: {exc}")
+            return
+
+        updated_preview = BPFilePreview(
+            metadata=preview.metadata,
+            column_names=column_names,
+            preview=preview_df,
+            skiprows=skiprows_list,
+            detected_separator=resolved_separator,
+            raw_lines=raw_lines,
+        )
+
+        current_preview_state["preview"] = updated_preview
+        current_preview_state["header_row"] = header_index
+        current_preview_state["first_data_row"] = data_index
+
+        result["time"] = column_names[time_index - 1]
+        result["pressure"] = column_names[pressure_index - 1]
+        result["time_index"] = time_index
+        result["pressure_index"] = pressure_index
+        result["separator"] = current_preview_state.get("separator")
+        result["preview"] = updated_preview
+        result["header_row"] = header_index
+        result["first_data_row"] = data_index
+        error_var.set("")
         root.quit()
 
     def _cancel() -> None:
         result.clear()
         root.quit()
 
+    _update_column_options(initial=True)
+    _update_preview_widget()
+
+    delimiter_var.trace_add("write", _refresh_preview_from_separator)
+    header_var.trace_add("write", _on_structure_change)
+    first_data_var.trace_add("write", _on_structure_change)
+    time_var.trace_add("write", lambda *_: _update_preview_widget())
+    pressure_var.trace_add("write", lambda *_: _update_preview_widget())
+
     ttk.Button(button_frame, text="Cancel", command=_cancel).grid(row=0, column=0, padx=(0, 8))
     ttk.Button(button_frame, text="Import", command=_confirm).grid(row=0, column=1)
 
-    delimiter_var.trace_add("write", _refresh_preview_from_separator)
-    time_var.trace_add("write", _on_column_change)
-    pressure_var.trace_add("write", _on_column_change)
-
     root.protocol("WM_DELETE_WINDOW", _cancel)
-
-    _update_preview_widget()
 
     root.mainloop()
     root.destroy()
 
-    if {"time", "pressure", "preview"}.issubset(result.keys()):
+    required_keys = {
+        "time",
+        "pressure",
+        "preview",
+        "separator",
+        "header_row",
+        "first_data_row",
+        "time_index",
+        "pressure_index",
+    }
+    if required_keys.issubset(result.keys()):
         return ImportDialogResult(
             preview=result["preview"],
             separator=result.get("separator"),
             time_column=str(result["time"]),
             pressure_column=str(result["pressure"]),
+            header_row=int(result["header_row"]),
+            first_data_row=int(result["first_data_row"]),
+            time_column_index=int(result["time_index"]),
+            pressure_column_index=int(result["pressure_index"]),
         )
 
     return None
