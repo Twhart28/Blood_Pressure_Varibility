@@ -14,6 +14,11 @@ Run the module directly to open a file picker and visualise a recording::
 The script will plot the waveform and overlay the detected beat
 landmarks.  It also prints summary statistics for the detected beats and
 flags potential artefacts using simple heuristics.
+
+Command-line flags allow overriding the column separator used when
+reading whitespace-heavy exports (``--separator``) and limiting the
+number of raw samples rendered in the interactive plot
+(``--plot-max-points``) to speed up large-file analysis.
 """
 
 from __future__ import annotations
@@ -54,6 +59,11 @@ try:
     import numpy as np
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
     raise SystemExit("numpy is required to run this script. Please install it and retry.") from exc
+
+try:  # pragma: no cover - optional acceleration for rolling statistics
+    from numpy.lib.stride_tricks import sliding_window_view
+except Exception:  # pragma: no cover - fallback when unavailable
+    sliding_window_view = None  # type: ignore[assignment]
 
 try:
     import pandas as pd
@@ -162,7 +172,7 @@ def _parse_bp_header(
     skiprows: List[int] = []
     column_count: Optional[int] = None
     first_numeric_row_idx: Optional[int] = None
-    first_numeric_raw: Optional[str] = None
+    numeric_samples: List[str] = []
     numeric_lines_checked = 0
 
     if max_data_lines <= 0:
@@ -206,7 +216,7 @@ def _parse_bp_header(
 
                 column_count = int(values.size)
                 first_numeric_row_idx = idx
-                first_numeric_raw = raw_line.rstrip("\n")
+                numeric_samples.append(raw_line.rstrip("\n"))
                 numeric_lines_checked = 1
 
                 if numeric_lines_checked >= max_data_lines:
@@ -236,6 +246,7 @@ def _parse_bp_header(
                     f"line {idx + 1}: expected {column_count}, found {int(values.size)}."
                 )
 
+            numeric_samples.append(raw_line.rstrip("\n"))
             numeric_lines_checked += 1
             if numeric_lines_checked >= max_data_lines:
                 break
@@ -250,11 +261,27 @@ def _parse_bp_header(
         column_names = [f"col_{idx}" for idx in range(column_count)]
 
     detected_separator: Optional[str] = None
-    if first_numeric_raw is not None:
+    if numeric_samples:
+        candidate_lines = numeric_samples
+
+        def _consistently_splits(delimiter: str, *, allow_blank_tokens: bool = False) -> bool:
+            for line in candidate_lines:
+                stripped_line = line.strip()
+                parts = stripped_line.split(delimiter)
+                if len(parts) != column_count:
+                    return False
+                if not allow_blank_tokens and any(part == "" for part in parts):
+                    return False
+            return True
+
         for delimiter in ("\t", ",", ";", "|"):
-            if delimiter in first_numeric_raw:
+            if all(delimiter in line for line in candidate_lines) and _consistently_splits(delimiter, allow_blank_tokens=True):
                 detected_separator = delimiter
                 break
+
+        if detected_separator is None and all("\t" not in line for line in candidate_lines):
+            if _consistently_splits(" "):
+                detected_separator = " "
 
     return metadata, skiprows, column_names, detected_separator
 
@@ -264,12 +291,16 @@ def _scan_bp_file(
     max_numeric_rows: int = 20,
     *,
     header_sample_lines: int = 5,
+    separator_override: Optional[str] = None,
 ) -> BPFilePreview:
     """Perform a quick pass to gather metadata and column previews."""
 
     metadata, skiprows, column_names, detected_separator = _parse_bp_header(
         file_path, max_data_lines=header_sample_lines
     )
+
+    if separator_override:
+        detected_separator = separator_override
 
     read_kwargs = dict(
         filepath_or_buffer=file_path,
@@ -282,13 +313,21 @@ def _scan_bp_file(
         dtype=float,
     )
 
+    preview_frame: pd.DataFrame
     if detected_separator:
         try:
-            preview_frame = pd.read_csv(
-                sep=detected_separator,
-                engine="c",
-                **read_kwargs,
-            )
+            if len(detected_separator) == 1:
+                preview_frame = pd.read_csv(
+                    sep=detected_separator,
+                    engine="c",
+                    **read_kwargs,
+                )
+            else:
+                preview_frame = pd.read_csv(
+                    sep=detected_separator,
+                    engine="python",
+                    **read_kwargs,
+                )
         except Exception:
             preview_frame = pd.read_csv(
                 delim_whitespace=True,
@@ -458,11 +497,14 @@ def load_bp_file(
     preview: Optional[BPFilePreview] = None,
     time_column: Optional[str] = None,
     pressure_column: Optional[str] = None,
+    separator: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """Load the selected columns from a waveform export."""
 
     if preview is None:
-        preview = _scan_bp_file(file_path)
+        preview = _scan_bp_file(file_path, separator_override=separator)
+    elif separator:
+        preview.detected_separator = separator
 
     if time_column is None or time_column not in preview.column_names or pressure_column is None or pressure_column not in preview.column_names:
         time_column, pressure_column = select_time_pressure_columns(
@@ -487,13 +529,22 @@ def load_bp_file(
         dtype=dtype_map,
     )
 
-    if preview.detected_separator:
+    detected_separator = preview.detected_separator
+    frame: pd.DataFrame
+    if detected_separator:
         try:
-            frame = pd.read_csv(
-                sep=preview.detected_separator,
-                engine="c",
-                **read_kwargs,
-            )
+            if len(detected_separator) == 1:
+                frame = pd.read_csv(
+                    sep=detected_separator,
+                    engine="c",
+                    **read_kwargs,
+                )
+            else:
+                frame = pd.read_csv(
+                    sep=detected_separator,
+                    engine="python",
+                    **read_kwargs,
+                )
         except Exception:
             frame = pd.read_csv(
                 delim_whitespace=True,
@@ -1181,25 +1232,51 @@ def _rolling_median_and_mad(values: np.ndarray, window: int) -> Tuple[np.ndarray
     if window % 2 == 0:
         raise ValueError("window must be odd to compute centred statistics")
 
-    medians = np.full_like(values, np.nan, dtype=float)
-    mads = np.full_like(values, np.nan, dtype=float)
-    half_window = window // 2
+    values = np.asarray(values, dtype=float)
+    medians = np.full(values.shape, np.nan, dtype=float)
+    mads = np.full(values.shape, np.nan, dtype=float)
 
-    for idx in range(len(values)):
-        start = max(0, idx - half_window)
-        end = min(len(values), idx + half_window + 1)
-        segment = values[start:end]
-        segment = segment[np.isfinite(segment)]
-        if segment.size < 3:
-            continue
-        median = float(np.median(segment))
-        deviations = np.abs(segment - median)
-        mad = float(1.4826 * np.median(deviations)) if deviations.size else 0.0
-        if mad < 1e-3:
-            # Fallback to standard deviation when the MAD is tiny (near-constant segment).
-            mad = float(np.std(segment, ddof=0))
-        medians[idx] = median
-        mads[idx] = mad
+    if values.size == 0:
+        return medians, mads
+
+    if sliding_window_view is not None:
+        half_window = window // 2
+        padded = np.pad(values, (half_window, half_window), mode="constant", constant_values=np.nan)
+        windows = sliding_window_view(padded, window_shape=window)
+        finite_counts = np.sum(np.isfinite(windows), axis=1)
+        valid_mask = finite_counts >= 3
+
+        if not np.any(valid_mask):
+            return medians, mads
+
+        valid_windows = windows[valid_mask]
+        medians_valid = np.nanmedian(valid_windows, axis=1)
+        medians[valid_mask] = medians_valid
+
+        deviations = np.abs(valid_windows - medians_valid[:, None])
+        mad_valid = 1.4826 * np.nanmedian(deviations, axis=1)
+        fallback_mask = (mad_valid < 1e-3) | ~np.isfinite(mad_valid)
+        if np.any(fallback_mask):
+            mad_valid[fallback_mask] = np.nanstd(valid_windows[fallback_mask], axis=1, ddof=0)
+
+        mads[valid_mask] = mad_valid
+        return medians, mads
+
+    # Fallback path when sliding_window_view is unavailable (older NumPy).
+    series = pd.Series(values, dtype=float)
+    rolling = series.rolling(window, center=True, min_periods=3)
+    medians_series = rolling.median()
+    medians = medians_series.to_numpy(dtype=float)
+
+    deviations = (series - medians_series).abs()
+    mad_series = deviations.rolling(window, center=True, min_periods=3).median() * 1.4826
+    mads = mad_series.to_numpy(dtype=float)
+
+    fallback_mask = (mads < 1e-3) | ~np.isfinite(mads)
+    if np.any(fallback_mask):
+        std_series = rolling.std(ddof=0)
+        std_values = std_series.to_numpy(dtype=float)
+        mads[fallback_mask] = std_values[fallback_mask]
 
     return medians, mads
 
@@ -1296,6 +1373,7 @@ def plot_waveform(
     *,
     show: bool = True,
     save_path: Optional[Path] = None,
+    max_points: Optional[int] = 50000,
 ) -> None:
     """Plot the waveform with annotated beat landmarks."""
 
@@ -1303,7 +1381,24 @@ def plot_waveform(
         raise RuntimeError("matplotlib is required for plotting")
 
     plt.figure(figsize=(12, 6))
-    plt.plot(time, pressure, label="reBAP", color="tab:blue")
+    time_values = np.asarray(time, dtype=float)
+    pressure_values = np.asarray(pressure, dtype=float)
+
+    if max_points is not None and max_points > 0 and time_values.size > max_points:
+        stride = int(math.ceil(time_values.size / float(max_points)))
+        stride = max(1, stride)
+        downsampled_time = time_values[::stride]
+        downsampled_pressure = pressure_values[::stride]
+        if downsampled_time.size == 0 or downsampled_time[-1] != time_values[-1]:
+            downsampled_time = np.append(downsampled_time, time_values[-1])
+            downsampled_pressure = np.append(downsampled_pressure, pressure_values[-1])
+        plot_time = downsampled_time
+        plot_pressure = downsampled_pressure
+    else:
+        plot_time = time_values
+        plot_pressure = pressure_values
+
+    plt.plot(plot_time, plot_pressure, label="reBAP", color="tab:blue")
 
     systolic_times = [b.systolic_time for b in beats]
     systolic_pressures = [b.systolic_pressure for b in beats]
@@ -1584,6 +1679,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--psd", action="store_true", help="Compute Welch PSD for clean beat series.")
     parser.add_argument("--psd-fs", type=float, default=4.0, help="Resampling frequency for PSD (Hz).")
     parser.add_argument("--psd-nperseg", type=int, default=256, help="nperseg parameter for Welch PSD.")
+    parser.add_argument(
+        "--separator",
+        help="Override the column separator if auto-detection fails (e.g., ',' or \\t).",
+    )
+    parser.add_argument(
+        "--plot-max-points",
+        type=int,
+        default=50000,
+        help="Maximum waveform samples to render (set to 0 to disable downsampling).",
+    )
     parser.add_argument("--out", type=Path, help="Optional path to export the beat summary CSV.")
     parser.add_argument("--savefig", type=Path, help="Save the plot to this path instead of/as well as showing it.")
     parser.add_argument("--no-plot", action="store_true", help="Skip interactive plot display.")
@@ -1596,6 +1701,23 @@ def main(argv: Sequence[str]) -> int:
 
     if args.min_rr >= args.max_rr:
         parser.error("--min-rr must be less than --max-rr")
+
+    if args.plot_max_points is not None and args.plot_max_points < 0:
+        parser.error("--plot-max-points must be zero or a positive integer")
+
+    separator_override: Optional[str] = None
+    if args.separator:
+        raw_separator = args.separator
+        try:
+            raw_separator = bytes(raw_separator, "utf-8").decode("unicode_escape")
+        except Exception:
+            pass
+        lowered = raw_separator.lower()
+        if lowered == "tab":
+            raw_separator = "\t"
+        elif lowered == "space":
+            raw_separator = " "
+        separator_override = raw_separator if raw_separator else None
 
     if args.file:
         file_path = Path(args.file)
@@ -1610,7 +1732,7 @@ def main(argv: Sequence[str]) -> int:
         return 1
 
     try:
-        preview = _scan_bp_file(file_path)
+        preview = _scan_bp_file(file_path, separator_override=separator_override)
     except Exception as exc:  # pragma: no cover - interactive feedback
         print(f"Failed to parse file header: {exc}")
         return 1
@@ -1631,6 +1753,7 @@ def main(argv: Sequence[str]) -> int:
             preview=preview,
             time_column=selected_time_column,
             pressure_column=selected_pressure_column,
+            separator=separator_override,
         )
     except Exception as exc:  # pragma: no cover - interactive feedback
         print(f"Failed to load file: {exc}")
@@ -1762,7 +1885,14 @@ def main(argv: Sequence[str]) -> int:
     if plt is None and (show_plot or args.savefig):
         print("matplotlib is required to visualise or save the waveform plot.")
     elif show_plot or args.savefig:
-        plot_waveform(time, pressure, beats, show=show_plot, save_path=args.savefig)
+        plot_waveform(
+            time,
+            pressure,
+            beats,
+            show=show_plot,
+            save_path=args.savefig,
+            max_points=None if args.plot_max_points == 0 else args.plot_max_points,
+        )
 
     return 0
 
