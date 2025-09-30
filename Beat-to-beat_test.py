@@ -71,6 +71,11 @@ try:
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
     raise SystemExit("pandas is required to run this script. Please install it and retry.") from exc
 
+try:  # pragma: no cover - optional fast moving-window statistics
+    import bottleneck as bn
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    bn = None  # type: ignore[assignment]
+
 try:  # pragma: no cover - optional dependency for zero-phase filtering/PSD
     from scipy import signal as sp_signal
 except ModuleNotFoundError:  # pragma: no cover - optional dependency
@@ -1103,6 +1108,8 @@ def detect_systolic_peaks(
     if cursor < signal.size:
         segment_boundaries.append((cursor, signal.size))
 
+    stride = max(1, int(round(fs / 125.0)))
+
     for seg_start, seg_end in segment_boundaries:
         seg_len = seg_end - seg_start
         if seg_len < 3:
@@ -1110,7 +1117,29 @@ def detect_systolic_peaks(
         window = min(default_window, seg_len if seg_len % 2 == 1 else seg_len - 1)
         if window < 3:
             continue
-        seg_med, seg_mad = _rolling_median_and_mad(positive_velocity[seg_start:seg_end], window)
+        segment = positive_velocity[seg_start:seg_end]
+        if stride == 1:
+            seg_med, seg_mad = _rolling_median_and_mad(segment, window)
+        else:
+            reduced_series = segment[::stride]
+            if reduced_series.size < 3:
+                seg_med, seg_mad = _rolling_median_and_mad(segment, window)
+            else:
+                reduced_window = max(3, int(round(window / stride)))
+                if reduced_window % 2 == 0:
+                    reduced_window += 1
+                if reduced_window > reduced_series.size:
+                    reduced_window = reduced_series.size
+                    if reduced_window % 2 == 0:
+                        reduced_window -= 1
+                if reduced_window < 3:
+                    seg_med, seg_mad = _rolling_median_and_mad(segment, window)
+                else:
+                    reduced_med, reduced_mad = _rolling_median_and_mad(
+                        reduced_series, reduced_window
+                    )
+                    seg_med = np.repeat(reduced_med, stride)[:seg_len]
+                    seg_mad = np.repeat(reduced_mad, stride)[:seg_len]
         local_medians[seg_start:seg_end] = seg_med
         local_mads[seg_start:seg_end] = seg_mad
 
@@ -1210,6 +1239,32 @@ def detect_systolic_peaks(
     order = np.argsort(candidate_peaks, kind="mergesort")
     candidate_peaks = candidate_peaks[order]
 
+    precomputed_prominences: Optional[np.ndarray]
+    if candidate_peaks.size and sp_signal is not None:
+        try:
+            wlen = int(min(signal.size, 2 * max_distance))
+            wlen = max(wlen, 3)
+            if wlen % 2 == 0:
+                wlen = max(3, wlen - 1)
+            precomputed_prominences, _, _ = sp_signal.peak_prominences(
+                signal,
+                candidate_peaks,
+                wlen=wlen,
+            )
+        except Exception:
+            precomputed_prominences = None
+    else:
+        precomputed_prominences = None
+
+    negative_mask = np.isfinite(velocity) & (velocity <= 0)
+    if negative_mask.size >= sustained_negative:
+        downstroke_kernel = np.ones(sustained_negative, dtype=int)
+        downstroke_counts = np.convolve(
+            negative_mask.astype(int), downstroke_kernel, mode="valid"
+        )
+    else:
+        downstroke_counts = np.array([], dtype=int)
+
     def _estimate_prominence(peak_idx: int) -> Optional[float]:
         left = signal[max(0, peak_idx - max_distance) : peak_idx + 1]
         right = signal[peak_idx : min(signal.size, peak_idx + max_distance)]
@@ -1244,7 +1299,7 @@ def detect_systolic_peaks(
                         notch_idx = local_start + notch_rel
         return notch_idx
 
-    def _has_sustained_downstroke(peak_idx: int) -> bool:
+    def _legacy_has_sustained_downstroke(peak_idx: int) -> bool:
         window_end = min(signal.size, peak_idx + sustained_negative + downstroke_grace + 1)
         if window_end <= peak_idx:
             return False
@@ -1259,14 +1314,40 @@ def detect_systolic_peaks(
         sustained = np.convolve(negative_mask.astype(int), kernel, mode="valid")
         return bool(np.any(sustained >= sustained_negative))
 
+    def _has_sustained_downstroke(peak_idx: int) -> bool:
+        if downstroke_counts.size:
+            window_end = min(
+                signal.size, peak_idx + sustained_negative + downstroke_grace + 1
+            )
+            if window_end - peak_idx < sustained_negative:
+                return False
+            max_start = downstroke_counts.size - 1
+            start = peak_idx
+            if start > max_start:
+                return False
+            stop = min(window_end - sustained_negative, max_start)
+            if stop < start:
+                return False
+            return bool(
+                np.any(downstroke_counts[start : stop + 1] >= sustained_negative)
+            )
+        return _legacy_has_sustained_downstroke(peak_idx)
+
     peaks: List[int] = []
     prominences: List[float] = []
     notches: List[int] = []
     suppress_until = -1
 
-    for peak_idx in candidate_peaks:
-        prominence = _estimate_prominence(peak_idx)
-        if prominence is None or prominence < min_prominence:
+    for idx, peak_idx in enumerate(candidate_peaks):
+        if precomputed_prominences is not None:
+            prominence = float(precomputed_prominences[idx])
+            if not np.isfinite(prominence):
+                continue
+        else:
+            prominence = _estimate_prominence(peak_idx)
+            if prominence is None:
+                continue
+        if prominence < min_prominence:
             continue
         if not _has_sustained_downstroke(peak_idx):
             continue
@@ -1566,6 +1647,25 @@ def _rolling_median_and_mad(values: np.ndarray, window: int) -> Tuple[np.ndarray
     mads = np.full(values.shape, np.nan, dtype=float)
 
     if values.size == 0:
+        return medians, mads
+
+    if bn is not None:
+        medians_bn = bn.move_median(values, window=window, center=True, min_count=3)
+        medians[:] = medians_bn
+
+        deviations = np.abs(values - medians_bn)
+        mad_bn = bn.move_median(deviations, window=window, center=True, min_count=3)
+        mad_bn = np.asarray(mad_bn, dtype=float) * 1.4826
+        fallback_mask = (mad_bn < 1e-3) | ~np.isfinite(mad_bn)
+        if np.any(fallback_mask):
+            std_bn = bn.move_std(
+                values, window=window, center=True, ddof=0, min_count=3
+            )
+            std_bn = np.asarray(std_bn, dtype=float)
+            mad_bn = mad_bn.copy()
+            mad_bn[fallback_mask] = std_bn[fallback_mask]
+
+        mads[:] = mad_bn
         return medians, mads
 
     if sliding_window_view is not None:
