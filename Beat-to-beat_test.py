@@ -516,7 +516,7 @@ def load_bp_file(
     desired = [time_column, pressure_column]
     # ``dict.fromkeys`` preserves order while removing duplicates.
     usecols = list(dict.fromkeys(desired))
-    dtype_map = {name: float for name in usecols}
+    dtype_map = {name: np.float32 for name in usecols}
 
     read_kwargs = dict(
         filepath_or_buffer=file_path,
@@ -1762,19 +1762,23 @@ def main(argv: Sequence[str]) -> int:
     print(f"Loaded columns: time='{selected_time_column}', pressure='{selected_pressure_column}'")
 
     if selected_time_column in frame.columns:
-        time_series = pd.to_numeric(frame[selected_time_column], errors="coerce")
+        time_series = pd.to_numeric(
+            frame[selected_time_column], errors="coerce", downcast="float"
+        ).astype(np.float32, copy=False)
         time = time_series.to_numpy()
     else:
         time = None
 
-    pressure_series = pd.to_numeric(frame[selected_pressure_column], errors="coerce")
+    pressure_series = pd.to_numeric(
+        frame[selected_pressure_column], errors="coerce", downcast="float"
+    ).astype(np.float32, copy=False)
     pressure = pressure_series.to_numpy()
 
     interval = parse_interval(metadata, frame)
     fs = 1.0 / interval if interval > 0 else 1.0
 
     if time is None or not np.any(np.isfinite(time)):
-        time = np.arange(len(frame), dtype=float) * interval
+        time = np.arange(len(frame), dtype=np.float32) * np.float32(interval)
 
     config = ArtifactConfig(
         systolic_mad_multiplier=args.systolic_mad_multiplier,
