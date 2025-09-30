@@ -1117,6 +1117,80 @@ def select_time_pressure_columns(
     return _select_columns_via_cli(column_names, default_time=time_default, default_pressure=pressure_default)
 
 
+def _load_selected_columns_fast(
+    file_path: Path,
+    *,
+    column_indices: Sequence[int],
+    column_names: Sequence[str],
+    first_data_row: int,
+    separator: Optional[str],
+) -> Optional[pd.DataFrame]:
+    """Attempt to load numeric columns using NumPy's fast text parsers."""
+
+    if not column_indices:
+        return None
+
+    delimiter: Optional[str]
+    if separator is None or separator.isspace():
+        delimiter = None
+    else:
+        if len(separator) != 1:
+            return None
+        delimiter = separator
+
+    skiprows = max(0, first_data_row - 1)
+    usecols = tuple(column_indices)
+
+    try:
+        data = np.loadtxt(
+            file_path,
+            delimiter=delimiter,
+            comments="#",
+            usecols=usecols,
+            skiprows=skiprows,
+            dtype=np.float32,
+            ndmin=2,
+            encoding="utf-8",
+            invalid_raise=False,
+        )
+    except Exception:
+        try:
+            data = np.genfromtxt(
+                file_path,
+                delimiter=delimiter,
+                comments="#",
+                usecols=usecols,
+                skip_header=skiprows,
+                dtype=np.float32,
+                invalid_raise=False,
+                filling_values=np.nan,
+                encoding="utf-8",
+            )
+        except Exception:
+            return None
+
+        if isinstance(data, np.ma.MaskedArray):
+            data = data.filled(np.nan)
+
+        if data.size == 0:
+            return pd.DataFrame(columns=[column_names[idx] for idx in usecols])
+
+        data = np.asarray(data, dtype=np.float32)
+        if data.ndim == 1:
+            data = data.reshape(-1, len(usecols))
+    else:
+        if data.size == 0:
+            return pd.DataFrame(columns=[column_names[idx] for idx in usecols])
+
+    if data.ndim == 1:
+        data = data.reshape(-1, len(usecols))
+
+    frame = pd.DataFrame(data, columns=[column_names[idx] for idx in usecols])
+    if not frame.empty:
+        frame = frame.dropna(how="all")
+    return frame
+
+
 def load_bp_file(
     file_path: Path,
     *,
@@ -1124,6 +1198,7 @@ def load_bp_file(
     time_column: Optional[str] = None,
     pressure_column: Optional[str] = None,
     separator: Optional[str] = None,
+    import_settings: Optional[ImportDialogResult] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """Load the selected columns from a waveform export."""
 
@@ -1156,18 +1231,45 @@ def load_bp_file(
     )
 
     detected_separator = preview.detected_separator
-    frame: pd.DataFrame
-    if detected_separator:
+    resolved_separator = separator if separator is not None else detected_separator
+
+    frame: Optional[pd.DataFrame] = None
+    if import_settings is not None:
+        index_lookup = {
+            import_settings.time_column: import_settings.time_column_index - 1,
+            import_settings.pressure_column: import_settings.pressure_column_index - 1,
+        }
+        fast_usecols: List[int] = []
+        for column_name in usecols:
+            idx = index_lookup.get(column_name)
+            if idx is None:
+                fast_usecols = []
+                break
+            fast_usecols.append(idx)
+
+        if fast_usecols:
+            frame = _load_selected_columns_fast(
+                file_path,
+                column_indices=fast_usecols,
+                column_names=preview.column_names,
+                first_data_row=import_settings.first_data_row,
+                separator=resolved_separator,
+            )
+
+    if frame is not None:
+        return frame, preview.metadata
+
+    if resolved_separator:
         try:
-            if len(detected_separator) == 1:
+            if len(resolved_separator) == 1:
                 frame = pd.read_csv(
-                    sep=detected_separator,
+                    sep=resolved_separator,
                     engine="c",
                     **read_kwargs,
                 )
             else:
                 frame = pd.read_csv(
-                    sep=detected_separator,
+                    sep=resolved_separator,
                     engine="python",
                     **read_kwargs,
                 )
@@ -2482,6 +2584,7 @@ def main(argv: Sequence[str]) -> int:
     selected_time_column: Optional[str] = None
     selected_pressure_column: Optional[str] = None
     dialog_shown = False
+    dialog_result: Optional[ImportDialogResult] = None
 
     if tk is not None:
         try:
@@ -2521,6 +2624,7 @@ def main(argv: Sequence[str]) -> int:
             time_column=selected_time_column,
             pressure_column=selected_pressure_column,
             separator=separator_override,
+            import_settings=dialog_result,
         )
     except Exception as exc:  # pragma: no cover - interactive feedback
         print(f"Failed to load file: {exc}")
