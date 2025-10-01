@@ -69,6 +69,7 @@ except Exception:  # pragma: no cover - fallback when unavailable
 
 try:
     import pandas as pd
+    from pandas import DataFrame
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
     raise SystemExit("pandas is required to run this script. Please install it and retry.") from exc
 
@@ -123,10 +124,11 @@ class BPFilePreview:
 
     metadata: Dict[str, str]
     column_names: List[str]
-    preview: pd.DataFrame
+    preview: Optional[DataFrame]
     skiprows: List[int]
     detected_separator: Optional[str]
     raw_lines: List[str]
+    preview_rows: int = 50
 
 
 @dataclass
@@ -325,45 +327,6 @@ def _scan_bp_file(
     if separator_override:
         detected_separator = separator_override
 
-    read_kwargs = dict(
-        filepath_or_buffer=file_path,
-        comment="#",
-        header=None,
-        names=column_names,
-        skiprows=skiprows,
-        nrows=max_numeric_rows,
-        na_values=["nan", "NaN", "NA"],
-        dtype=float,
-    )
-
-    preview_frame: pd.DataFrame
-    if detected_separator:
-        try:
-            if len(detected_separator) == 1:
-                preview_frame = pd.read_csv(
-                    sep=detected_separator,
-                    engine="c",
-                    **read_kwargs,
-                )
-            else:
-                preview_frame = pd.read_csv(
-                    sep=detected_separator,
-                    engine="python",
-                    **read_kwargs,
-                )
-        except Exception:
-            preview_frame = pd.read_csv(
-                delim_whitespace=True,
-                engine="python",
-                **read_kwargs,
-            )
-    else:
-        preview_frame = pd.read_csv(
-            delim_whitespace=True,
-            engine="python",
-            **read_kwargs,
-        )
-
     preview_line_cap = max(max_numeric_rows, 200)
     raw_lines: List[str] = []
     with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
@@ -376,11 +339,42 @@ def _scan_bp_file(
     return BPFilePreview(
         metadata=metadata,
         column_names=column_names,
-        preview=preview_frame,
+        preview=None,
         skiprows=skiprows,
         detected_separator=detected_separator,
         raw_lines=raw_lines,
+        preview_rows=max_numeric_rows,
     )
+
+
+def _build_preview_dataframe(
+    file_path: Path,
+    *,
+    column_names: Sequence[str],
+    skiprows: Sequence[int],
+    separator: Optional[str],
+    max_rows: int,
+) -> DataFrame:
+    """Construct a small DataFrame preview for the selected layout."""
+
+    read_kwargs = dict(
+        filepath_or_buffer=file_path,
+        header=None,
+        names=list(column_names),
+        skiprows=list(skiprows),
+        nrows=max_rows,
+        na_values=["nan", "NaN", "NA"],
+        dtype=float,
+    )
+
+    if separator:
+        try:
+            engine = "c" if len(separator) == 1 else "python"
+            return pd.read_csv(sep=separator, engine=engine, **read_kwargs)
+        except Exception:
+            return pd.read_csv(delim_whitespace=True, engine="python", **read_kwargs)
+
+    return pd.read_csv(delim_whitespace=True, engine="python", **read_kwargs)
 
 
 def _default_column_selection(column_names: Sequence[str], requested: Optional[str], *, fallback: Optional[str] = None) -> str:
@@ -689,6 +683,7 @@ def launch_import_configuration_dialog(
         "rows": current_rows,
         "header_row": header_default,
         "first_data_row": first_data_default,
+        "preview_rows": preview.preview_rows,
     }
 
     column_option_map: Dict[str, int] = {}
@@ -829,28 +824,6 @@ def launch_import_configuration_dialog(
         _update_column_options()
         _update_preview_widget()
 
-    def _build_preview_dataframe(
-        column_names: Sequence[str],
-        skiprows: Sequence[int],
-        resolved_separator: Optional[str],
-    ) -> pd.DataFrame:
-        read_kwargs = dict(
-            filepath_or_buffer=file_path,
-            header=None,
-            names=list(column_names),
-            skiprows=list(skiprows),
-            nrows=50,
-            na_values=["nan", "NaN", "NA"],
-            dtype=float,
-        )
-        if resolved_separator:
-            try:
-                engine = "c" if len(resolved_separator) == 1 else "python"
-                return pd.read_csv(sep=resolved_separator, engine=engine, **read_kwargs)
-            except Exception:
-                return pd.read_csv(delim_whitespace=True, engine="python", **read_kwargs)
-        return pd.read_csv(delim_whitespace=True, engine="python", **read_kwargs)
-
     def _read_tokens_for_line(line_number: int, separator: Optional[str]) -> List[str]:
         if line_number <= len(raw_lines):
             return _split_line(raw_lines[line_number - 1], separator)
@@ -894,8 +867,10 @@ def launch_import_configuration_dialog(
             return
 
         rows = _current_rows()
-        resolved_separator = current_preview_state.get("resolved_separator")
-        if not isinstance(resolved_separator, str):
+        resolved_candidate = current_preview_state.get("resolved_separator")
+        if isinstance(resolved_candidate, str) or resolved_candidate is None:
+            resolved_separator = resolved_candidate
+        else:
             resolved_separator = _effective_separator(current_preview_state.get("separator"))
 
         header_tokens = _read_tokens_for_line(header_index, resolved_separator)
@@ -914,8 +889,20 @@ def launch_import_configuration_dialog(
         skiprows.update(range(max(0, data_index - 1)))
         skiprows_list = sorted(skiprows)
 
+        preview_row_limit = current_preview_state.get("preview_rows")
+        if isinstance(preview_row_limit, int) and preview_row_limit > 0:
+            max_rows = preview_row_limit
+        else:
+            max_rows = preview.preview_rows
+
         try:
-            preview_df = _build_preview_dataframe(column_names, skiprows_list, resolved_separator)
+            preview_df = _build_preview_dataframe(
+                file_path,
+                column_names=column_names,
+                skiprows=skiprows_list,
+                separator=resolved_separator,
+                max_rows=max_rows,
+            )
         except Exception as exc:  # pragma: no cover - interactive feedback
             error_var.set(f"Failed to build preview: {exc}")
             return
@@ -927,11 +914,13 @@ def launch_import_configuration_dialog(
             skiprows=skiprows_list,
             detected_separator=resolved_separator,
             raw_lines=raw_lines,
+            preview_rows=max_rows,
         )
 
         current_preview_state["preview"] = updated_preview
         current_preview_state["header_row"] = header_index
         current_preview_state["first_data_row"] = data_index
+        current_preview_state["preview_rows"] = max_rows
 
         result["time"] = column_names[time_index - 1]
         result["pressure"] = column_names[pressure_index - 1]
@@ -1124,7 +1113,7 @@ def _load_selected_columns_fast(
     column_names: Sequence[str],
     first_data_row: int,
     separator: Optional[str],
-) -> Optional[pd.DataFrame]:
+) -> Optional[DataFrame]:
     """Attempt to load numeric columns using NumPy's fast text parsers."""
 
     if not column_indices:
@@ -1199,7 +1188,7 @@ def load_bp_file(
     pressure_column: Optional[str] = None,
     separator: Optional[str] = None,
     import_settings: Optional[ImportDialogResult] = None,
-) -> Tuple[pd.DataFrame, Dict[str, str]]:
+) -> Tuple[DataFrame, Dict[str, str]]:
     """Load the selected columns from a waveform export."""
 
     if preview is None:
@@ -1233,7 +1222,7 @@ def load_bp_file(
     detected_separator = preview.detected_separator
     resolved_separator = separator if separator is not None else detected_separator
 
-    frame: Optional[pd.DataFrame] = None
+    frame: Optional[DataFrame] = None
     if import_settings is not None:
         index_lookup = {
             import_settings.time_column: import_settings.time_column_index - 1,
@@ -1289,7 +1278,7 @@ def load_bp_file(
     return frame, preview.metadata
 
 
-def parse_interval(metadata: Dict[str, str], frame: pd.DataFrame) -> float:
+def parse_interval(metadata: Dict[str, str], frame: DataFrame) -> float:
     """Extract the sampling interval from metadata or infer it from the data."""
 
     metadata_interval: Optional[float] = None
@@ -2290,7 +2279,7 @@ def plot_waveform(
         plt.close()
 
 
-def summarise_beats(beats: Sequence[Beat]) -> pd.DataFrame:
+def summarise_beats(beats: Sequence[Beat]) -> DataFrame:
     """Build a DataFrame summarising the detected beats."""
 
     base_columns = {
@@ -2419,7 +2408,7 @@ def compute_rr_metrics(rr_intervals: np.ndarray, *, pnn_threshold: float) -> Dic
     }
 
 
-def print_column_overview(frame: pd.DataFrame) -> None:
+def print_column_overview(frame: DataFrame) -> None:
     """Display column names, dtypes, and first numeric samples to aid selection."""
 
     print("\nAvailable columns:")
@@ -2607,7 +2596,24 @@ def main(argv: Sequence[str]) -> int:
 
     print(f"Loaded file preview: {file_path}")
     print("\nColumn preview (first 50 rows loaded for preview):")
-    print_column_overview(preview.preview)
+    preview_frame = preview.preview
+    if preview_frame is None:
+        try:
+            preview_frame = _build_preview_dataframe(
+                file_path,
+                column_names=preview.column_names,
+                skiprows=preview.skiprows,
+                separator=preview.detected_separator,
+                max_rows=preview.preview_rows,
+            )
+            preview.preview = preview_frame
+        except Exception as exc:  # pragma: no cover - interactive feedback
+            print(f"  Unable to build preview table: {exc}")
+            preview_frame = None
+    if preview_frame is not None:
+        print_column_overview(preview_frame)
+    else:
+        print("  Preview will be available after import.")
 
     if selected_time_column is None or selected_pressure_column is None:
         selected_time_column, selected_pressure_column = select_time_pressure_columns(
