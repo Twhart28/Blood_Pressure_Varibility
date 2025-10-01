@@ -269,7 +269,6 @@ def _build_preview_dataframe(
         skiprows=list(skiprows),
         nrows=max_rows,
         na_values=["nan", "NaN", "NA"],
-        dtype=float,
     )
 
     if separator:
@@ -886,12 +885,12 @@ def launch_import_configuration_dialog(
     return None
 
 
-def _prompt_fast_parser_fallback(error_message: str) -> bool:
-    """Ask the user whether to proceed with the slower parser after failure."""
+def _prompt_fast_parser_decision(*, title: str, summary: str, details: str) -> bool:
+    """Display a dialog explaining why the fast parser is unavailable or failed."""
 
     message = (
-        "The fast parser was unable to load the selected columns.\n\n"
-        f"Reason:\n{error_message.strip()}\n\n"
+        f"{summary}\n\n"
+        f"Details:\n{details.strip()}\n\n"
         "Would you like to continue with the slower parser?"
     )
 
@@ -901,7 +900,7 @@ def _prompt_fast_parser_fallback(error_message: str) -> bool:
             dialog_root = tk.Tk()
             dialog_root.withdraw()
             result = messagebox.askyesno(
-                "Fast import failed",
+                title,
                 message,
                 parent=dialog_root,
             )
@@ -913,8 +912,9 @@ def _prompt_fast_parser_fallback(error_message: str) -> bool:
                 dialog_root.destroy()
 
     print(
-        "Fast parser failed. Falling back to the slower parser. "
-        f"Reason: {error_message.strip()}"
+        f"{title}: {summary} "
+        f"Details: {details.strip()} "
+        "Proceeding with the slower parser."
     )
     return True
 
@@ -1170,38 +1170,88 @@ def load_bp_file(
 
     frame: Optional[DataFrame] = None
     fast_failure_reason: Optional[str] = None
-    if import_settings is not None:
+    fast_unavailable_reason: Optional[str] = None
+
+    fast_usecols: Optional[List[int]] = None
+    fast_debug_indices: Optional[List[int]] = None
+    if import_settings is None:
+        fast_unavailable_reason = (
+            "Fast parser requires the interactive import dialog to capture column indices "
+            f"(time column: '{time_column}', pressure column: '{pressure_column}')."
+        )
+    else:
         index_lookup = {
             import_settings.time_column: import_settings.time_column_index - 1,
             import_settings.pressure_column: import_settings.pressure_column_index - 1,
         }
-        fast_usecols: List[int] = []
+        fast_usecols = []
         for column_name in usecols:
             idx = index_lookup.get(column_name)
             if idx is None:
-                fast_usecols = []
+                fast_unavailable_reason = (
+                    f"Column '{column_name}' does not have a recorded index from the preview dialog, "
+                    "so the fast parser cannot be configured."
+                )
+                fast_usecols = None
                 break
             fast_usecols.append(idx)
 
-        if fast_usecols:
-            try:
-                frame = _load_selected_columns_fast(
-                    file_path,
-                    column_indices=fast_usecols,
-                    column_names=preview.column_names,
-                    first_data_row=import_settings.first_data_row,
-                    separator=resolved_separator,
+        if fast_usecols is not None:
+            if resolved_separator and not resolved_separator.isspace() and len(resolved_separator) != 1:
+                fast_unavailable_reason = (
+                    "The fast parser only supports whitespace or single-character delimiters, "
+                    f"but '{resolved_separator}' was selected."
                 )
-            except FastParserError as exc:
-                fast_failure_reason = exc.message
+                fast_usecols = None
+
+    if fast_usecols:
+        fast_debug_indices = list(fast_usecols)
+        try:
+            frame = _load_selected_columns_fast(
+                file_path,
+                column_indices=fast_usecols,
+                column_names=preview.column_names,
+                first_data_row=import_settings.first_data_row if import_settings else 1,
+                separator=resolved_separator,
+            )
+        except FastParserError as exc:
+            debug_lines = [exc.message]
+            debug_lines.append(
+                "Resolved separator: "
+                + (repr(resolved_separator) if resolved_separator is not None else "None")
+            )
+            debug_lines.append(f"Requested columns: {usecols}")
+            if fast_debug_indices is not None:
+                debug_lines.append(f"Column indices: {fast_debug_indices}")
+            fast_failure_reason = "\n".join(debug_lines)
 
     if frame is not None:
         return frame, preview.metadata
 
     if fast_failure_reason:
-        if not _prompt_fast_parser_fallback(fast_failure_reason):
+        if not _prompt_fast_parser_decision(
+            title="Fast parser failed",
+            summary="The fast parser was unable to load the selected columns.",
+            details=fast_failure_reason,
+        ):
             raise RuntimeError(
                 "Import cancelled after fast parser failure."
+            )
+    elif fast_unavailable_reason:
+        debug_lines = [fast_unavailable_reason]
+        debug_lines.append(
+            "Resolved separator: "
+            + (repr(resolved_separator) if resolved_separator is not None else "None")
+        )
+        debug_lines.append(f"Requested columns: {usecols}")
+        fast_unavailable_reason = "\n".join(debug_lines)
+        if not _prompt_fast_parser_decision(
+            title="Fast parser unavailable",
+            summary="The fast parser could not be used for this file.",
+            details=fast_unavailable_reason,
+        ):
+            raise RuntimeError(
+                "Import cancelled because the fast parser could not be used."
             )
 
     if resolved_separator:
