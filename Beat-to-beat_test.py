@@ -1053,76 +1053,69 @@ def _load_selected_columns_fast(
     column_names: Sequence[str],
     first_data_row: int,
     separator: Optional[str],
+    skiprows: Sequence[int],
 ) -> DataFrame:
-    """Attempt to load numeric columns using NumPy's fast text parsers."""
+    """Attempt to load selected columns quickly using pandas' PyArrow engine."""
 
     if not column_indices:
         raise FastParserError("No column indices were provided for fast parsing.")
 
-    delimiter: Optional[str]
-    if separator is None or separator.isspace():
-        delimiter = None
-    else:
-        if len(separator) != 1:
-            raise FastParserError(
-                "Fast parser only supports single-character delimiters "
-                f"(received '{separator}')."
-            )
-        delimiter = separator
+    try:
+        usecols = [column_names[idx] for idx in column_indices]
+    except IndexError as exc:
+        raise FastParserError(
+            "One or more requested column indices are outside the detected column range."
+        ) from exc
 
-    skiprows = max(0, first_data_row - 1)
-    usecols = tuple(column_indices)
+    if separator is None:
+        raise FastParserError(
+            "Fast parser requires a resolved delimiter to use the PyArrow engine."
+        )
 
-    errors: List[str] = []
-    data: Optional[np.ndarray]
+    if not separator or (len(separator) != 1 and not separator.isspace()):
+        raise FastParserError(
+            "Fast parser using the PyArrow engine supports only single-character delimiters."
+        )
+
+    # Normalise whitespace-only separators (e.g., multiple spaces) to their first character.
+    delimiter = separator[0] if separator.isspace() else separator
+
+    combined_skiprows = set(skiprows)
+    combined_skiprows.update(range(max(0, first_data_row - 1)))
+    skiprows_list = sorted(combined_skiprows)
+
+    read_kwargs = dict(
+        filepath_or_buffer=file_path,
+        engine="pyarrow",
+        sep=delimiter,
+        header=None,
+        names=list(column_names),
+        usecols=usecols,
+        skiprows=skiprows_list,
+        comment="#",
+    )
 
     try:
-        data = np.loadtxt(
-            file_path,
-            delimiter=delimiter,
-            comments="#",
-            usecols=usecols,
-            skiprows=skiprows,
-            dtype=np.float32,
-            ndmin=2,
-            encoding="utf-8",
-            invalid_raise=False,
-        )
+        frame = pd.read_csv(dtype_backend="pyarrow", **read_kwargs)
+    except TypeError:
+        # Older pandas versions may not support dtype_backend; retry without it.
+        frame = pd.read_csv(**read_kwargs)
     except Exception as exc:
-        errors.append(f"np.loadtxt failed: {exc}")
-        data = None
+        raise FastParserError(f"pandas (PyArrow engine) failed: {exc}") from exc
 
-    if data is None:
+    if frame.empty:
+        return frame
+
+    # Ensure numeric columns are represented as float32 for downstream compatibility.
+    for column in frame.columns:
         try:
-            data = np.genfromtxt(
-                file_path,
-                delimiter=delimiter,
-                comments="#",
-                usecols=usecols,
-                skip_header=skiprows,
-                dtype=np.float32,
-                invalid_raise=False,
-                filling_values=np.nan,
-                encoding="utf-8",
+            frame[column] = pd.to_numeric(frame[column], errors="coerce").astype(
+                np.float32, copy=False
             )
-        except Exception as exc:
-            errors.append(f"np.genfromtxt failed: {exc}")
-            raise FastParserError("\n".join(errors)) from exc
+        except Exception:
+            frame[column] = frame[column]
 
-        if isinstance(data, np.ma.MaskedArray):
-            data = data.filled(np.nan)
-
-        data = np.asarray(data, dtype=np.float32)
-
-    if data.size == 0:
-        return pd.DataFrame(columns=[column_names[idx] for idx in usecols])
-
-    if data.ndim == 1:
-        data = data.reshape(-1, len(usecols))
-
-    frame = pd.DataFrame(data, columns=[column_names[idx] for idx in usecols])
-    if not frame.empty:
-        frame = frame.dropna(how="all")
+    frame = frame.dropna(how="all")
     return frame
 
 
@@ -1197,9 +1190,16 @@ def load_bp_file(
             fast_usecols.append(idx)
 
         if fast_usecols is not None:
-            if resolved_separator and not resolved_separator.isspace() and len(resolved_separator) != 1:
+            if resolved_separator is None:
                 fast_unavailable_reason = (
-                    "The fast parser only supports whitespace or single-character delimiters, "
+                    "The fast parser requires a resolved delimiter to use the PyArrow engine."
+                )
+                fast_usecols = None
+            elif not resolved_separator or (
+                len(resolved_separator) != 1 and not resolved_separator.isspace()
+            ):
+                fast_unavailable_reason = (
+                    "The fast parser using the PyArrow engine supports only single-character delimiters, "
                     f"but '{resolved_separator}' was selected."
                 )
                 fast_usecols = None
@@ -1213,6 +1213,7 @@ def load_bp_file(
                 column_names=preview.column_names,
                 first_data_row=import_settings.first_data_row if import_settings else 1,
                 separator=resolved_separator,
+                skiprows=preview.skiprows,
             )
         except FastParserError as exc:
             debug_lines = [exc.message]
