@@ -129,7 +129,7 @@ class BPFilePreview:
     skiprows: List[int]
     detected_separator: Optional[str]
     raw_lines: List[str]
-    preview_rows: int = 50
+    preview_rows: int = 200
 
 
 @dataclass
@@ -154,189 +154,42 @@ class FastParserError(RuntimeError):
         self.message = message
 
 
-def _parse_list_field(raw_value: str) -> List[str]:
-    """Split a metadata field that contains multiple values.
+def _tokenise_preview_line(line: str, separator: Optional[str]) -> List[str]:
+    """Split a raw preview line using the provided separator."""
 
-    The files we ingest typically separate list fields using tabs.  When
-    tabs are not present, we fall back to any amount of whitespace.
-    """
-
-    raw_value = raw_value.strip()
-    if not raw_value:
+    if not line:
         return []
 
-    # Try splitting on one or more tab characters first.
-    parts = [item.strip() for item in re.split(r"\t+", raw_value) if item.strip()]
-    if parts:
-        return parts
+    if separator is None:
+        stripped = line.strip()
+        if not stripped:
+            return []
+        return [tok for tok in re.split(r"\s+", stripped) if tok]
 
-    # Fallback: split on whitespace while keeping multi-word labels intact
-    # by joining adjacent capitalised tokens (e.g., "Respiratory Belt").
-    tokens = [tok for tok in raw_value.split(" ") if tok]
-    merged: List[str] = []
-    buffer: List[str] = []
-    for tok in tokens:
-        if tok and tok[0].isupper() and not tok.isupper():
-            if buffer:
-                merged.append(" ".join(buffer))
-                buffer = []
-            buffer.append(tok)
-        elif buffer:
-            buffer.append(tok)
-        else:
-            merged.append(tok)
-    if buffer:
-        merged.append(" ".join(buffer))
+    if separator == " ":
+        stripped = line.strip()
+        if not stripped:
+            return []
+        return [tok for tok in re.split(r"\s+", stripped) if tok]
 
-    return merged or tokens
-
-
-def _parse_bp_header(
-    file_path: Path, *, max_data_lines: int = 5
-) -> Tuple[Dict[str, str], List[int], List[str], Optional[str]]:
-    """Return metadata, line numbers to skip, and inferred column names.
-
-    The parser treats blank lines, comments, and ``key=value`` metadata entries
-    as non-numeric content.  All remaining rows are expected to contain the
-    same number of whitespace-delimited values; inconsistent rows raise a
-    ``ValueError`` instead of being silently truncated.
-    """
-
-    metadata: Dict[str, str] = {}
-    skiprows: List[int] = []
-    column_count: Optional[int] = None
-    first_numeric_row_idx: Optional[int] = None
-    numeric_samples: List[str] = []
-    numeric_lines_checked = 0
-
-    if max_data_lines <= 0:
-        max_data_lines = 1
-
-    def _numeric_values(candidate: str) -> np.ndarray:
-        tokens = [tok for tok in re.split(r"[\s,;|]+", candidate) if tok]
-        if not tokens:
-            return np.array([], dtype=float)
-        try:
-            return np.asarray([float(tok) for tok in tokens], dtype=float)
-        except ValueError:
-            return np.array([], dtype=float)
-
-    with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
-        for idx, raw_line in enumerate(handle):
-            stripped = raw_line.strip()
-
-            if first_numeric_row_idx is None:
-                if not stripped:
-                    skiprows.append(idx)
-                    continue
-
-                candidate = stripped
-                if "#" in candidate:
-                    candidate = candidate.split("#", 1)[0].strip()
-                    if not candidate:
-                        skiprows.append(idx)
-                        continue
-
-                if "=" in candidate and not re.match(r"^[+-]?[0-9]", candidate):
-                    key, value = candidate.split("=", 1)
-                    metadata[key.strip()] = value.strip()
-                    skiprows.append(idx)
-                    continue
-
-                values = _numeric_values(candidate)
-                if values.size == 0:
-                    skiprows.append(idx)
-                    continue
-
-                column_count = int(values.size)
-                first_numeric_row_idx = idx
-                numeric_samples.append(raw_line.rstrip("\n"))
-                numeric_lines_checked = 1
-
-                if numeric_lines_checked >= max_data_lines:
-                    break
-                continue
-
-            # Once numeric data begins, avoid adding more skip rows and only
-            # validate a limited sample for column consistency.
-            if not stripped:
-                break
-
-            candidate = stripped
-            if "#" in candidate:
-                candidate = candidate.split("#", 1)[0].strip()
-                if not candidate:
-                    break
-
-            values = _numeric_values(candidate)
-            if values.size == 0:
-                break
-
-            if column_count is None:
-                column_count = int(values.size)
-            elif int(values.size) != column_count:
-                raise ValueError(
-                    "Encountered data row with an unexpected column count at "
-                    f"line {idx + 1}: expected {column_count}, found {int(values.size)}."
-                )
-
-            numeric_samples.append(raw_line.rstrip("\n"))
-            numeric_lines_checked += 1
-            if numeric_lines_checked >= max_data_lines:
-                break
-
-    if column_count is None or first_numeric_row_idx is None:
-        raise ValueError("No numeric data found in file.")
-
-    channels = _parse_list_field(metadata.get("ChannelTitle", ""))
-    if channels and column_count == len(channels) + 1:
-        column_names = ["Time"] + channels
-    else:
-        column_names = [f"col_{idx}" for idx in range(column_count)]
-
-    detected_separator: Optional[str] = None
-    if numeric_samples:
-        candidate_lines = numeric_samples
-
-        def _consistently_splits(delimiter: str, *, allow_blank_tokens: bool = False) -> bool:
-            for line in candidate_lines:
-                stripped_line = line.strip()
-                parts = stripped_line.split(delimiter)
-                if len(parts) != column_count:
-                    return False
-                if not allow_blank_tokens and any(part == "" for part in parts):
-                    return False
-            return True
-
-        for delimiter in ("\t", ",", ";", "|"):
-            if all(delimiter in line for line in candidate_lines) and _consistently_splits(delimiter, allow_blank_tokens=True):
-                detected_separator = delimiter
-                break
-
-        if detected_separator is None and all("\t" not in line for line in candidate_lines):
-            if _consistently_splits(" "):
-                detected_separator = " "
-
-    return metadata, skiprows, column_names, detected_separator
+    try:
+        return next(csv.reader([line], delimiter=separator))
+    except Exception:
+        return line.split(separator)
 
 
 def _scan_bp_file(
     file_path: Path,
-    max_numeric_rows: int = 50,
+    max_preview_rows: int = 200,
     *,
-    header_sample_lines: int = 5,
     separator_override: Optional[str] = None,
 ) -> BPFilePreview:
-    """Perform a quick pass to gather metadata and column previews."""
+    """Read a lightweight preview without inferring structure."""
 
-    metadata, skiprows, column_names, detected_separator = _parse_bp_header(
-        file_path, max_data_lines=header_sample_lines
-    )
+    metadata: Dict[str, str] = {}
+    skiprows: List[int] = []
 
-    if separator_override:
-        detected_separator = separator_override
-
-    preview_line_cap = max(max_numeric_rows, 200)
+    preview_line_cap = max(max_preview_rows, 200)
     raw_lines: List[str] = []
     with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
         for _ in range(preview_line_cap):
@@ -345,6 +198,49 @@ def _scan_bp_file(
                 break
             raw_lines.append(line.rstrip("\r\n"))
 
+    meaningful_lines = [line for line in raw_lines if line.strip() and not line.strip().startswith("#")]
+
+    detected_separator: Optional[str] = separator_override
+    if detected_separator is None:
+        sample = meaningful_lines[:20]
+
+        def _consistent_split(delimiter: Optional[str]) -> bool:
+            if not sample:
+                return False
+            lengths: List[int] = []
+            has_multiple = False
+            for line in sample:
+                tokens = _tokenise_preview_line(line, delimiter)
+                if not tokens:
+                    return False
+                if len(tokens) > 1:
+                    has_multiple = True
+                lengths.append(len(tokens))
+            return has_multiple and len(set(lengths)) == 1
+
+        for delimiter in ("\t", ",", ";", "|"):
+            if _consistent_split(delimiter):
+                detected_separator = delimiter
+                break
+
+        if detected_separator is None and _consistent_split(" "):
+            detected_separator = " "
+
+    preview_rows = max_preview_rows if max_preview_rows > 0 else 200
+
+    column_names: List[str] = []
+    lines_for_tokens = meaningful_lines if meaningful_lines else raw_lines
+    if lines_for_tokens:
+        effective_separator = detected_separator if detected_separator is not None else None
+        column_count = 0
+        for line in lines_for_tokens:
+            tokens = _tokenise_preview_line(line, effective_separator)
+            if tokens:
+                column_count = len(tokens)
+                break
+        if column_count:
+            column_names = [f"column_{idx + 1}" for idx in range(column_count)]
+
     return BPFilePreview(
         metadata=metadata,
         column_names=column_names,
@@ -352,7 +248,7 @@ def _scan_bp_file(
         skiprows=skiprows,
         detected_separator=detected_separator,
         raw_lines=raw_lines,
-        preview_rows=max_numeric_rows,
+        preview_rows=preview_rows,
     )
 
 
@@ -409,7 +305,7 @@ def _render_preview_to_text_widget(
     first_data_row_index: int,
     time_column_index: Optional[int],
     pressure_column_index: Optional[int],
-    max_rows: int = 50,
+    max_rows: int = 200,
 ) -> None:
     """Render a preview table into a Tkinter text widget with highlights."""
 
@@ -437,7 +333,15 @@ def _render_preview_to_text_widget(
         ]
         widths.append(max((len(value) for value in col_values), default=0))
 
-    line_no = 1
+    header_line_parts = [f"{'#':>{row_number_width}} "]
+    for col_idx in range(column_count):
+        label = str(col_idx + 1)
+        header_line_parts.append(label.ljust(widths[col_idx] + 2))
+    header_text = "".join(header_line_parts)
+    widget.insert("end", header_text + "\n")
+    widget.tag_add("column_index", "1.0", "1.end")
+
+    line_no = 2
     for row_number, row_values in enumerate(display_rows, start=1):
         line_parts: List[str] = [f"{row_number:>{row_number_width}} "]
         cursor = len(line_parts[0])
@@ -474,6 +378,7 @@ def _render_preview_to_text_widget(
         line_no += 1
 
     widget.configure(state="disabled")
+    widget.tag_raise("column_index")
     widget.tag_raise("highlight_time")
     widget.tag_raise("highlight_pressure")
     widget.tag_raise("data_start")
@@ -530,19 +435,7 @@ def launch_import_configuration_dialog(
                 raw_lines.append(line.rstrip("\r\n"))
 
     def _split_line(line: str, separator: Optional[str]) -> List[str]:
-        if not line:
-            return []
-        if separator is None:
-            return [tok for tok in re.split(r"\s+", line.strip()) if tok]
-        if separator == " ":
-            stripped = line.strip()
-            if not stripped:
-                return []
-            return [tok for tok in re.split(r"\s+", stripped) if tok]
-        try:
-            return next(csv.reader([line], delimiter=separator))
-        except Exception:
-            return line.split(separator)
+        return _tokenise_preview_line(line, separator)
 
     def _split_preview_lines(separator: Optional[str]) -> List[List[str]]:
         effective = _effective_separator(separator)
@@ -645,7 +538,7 @@ def launch_import_configuration_dialog(
 
     ttk.Label(
         main_frame,
-        text="Data preview (first 50 rows)",
+        text="Data preview (first 200 rows)",
         font=("TkDefaultFont", 10, "bold"),
     ).grid(row=1, column=0, sticky="w")
 
@@ -670,6 +563,7 @@ def launch_import_configuration_dialog(
     x_scroll.grid(row=1, column=0, sticky="ew")
     preview_text.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
 
+    preview_text.tag_configure("column_index", background="#ccd6f6", font=("Courier New", 10, "bold"))
     preview_text.tag_configure("header", background="#d9d9d9", font=("Courier New", 10, "bold"))
     preview_text.tag_configure("row_even", background="#f5f5f5")
     preview_text.tag_configure("row_odd", background="#ededed")
@@ -807,6 +701,9 @@ def launch_import_configuration_dialog(
         data_index = _get_first_data_row()
         time_index = _get_time_index()
         pressure_index = _get_pressure_index()
+        preview_limit = current_preview_state.get("preview_rows")
+        if not isinstance(preview_limit, int) or preview_limit <= 0:
+            preview_limit = _current_preview().preview_rows
         _render_preview_to_text_widget(
             preview_text,
             rows,
@@ -814,6 +711,7 @@ def launch_import_configuration_dialog(
             first_data_row_index=data_index,
             time_column_index=(time_index - 1) if time_index else None,
             pressure_column_index=(pressure_index - 1) if pressure_index else None,
+            max_rows=preview_limit,
         )
 
     def _refresh_preview_from_separator(*_: object) -> None:
@@ -2617,7 +2515,7 @@ def main(argv: Sequence[str]) -> int:
     try:
         preview = _scan_bp_file(file_path, separator_override=separator_override)
     except Exception as exc:  # pragma: no cover - interactive feedback
-        print(f"Failed to parse file header: {exc}")
+        print(f"Failed to load file preview: {exc}")
         return 1
 
     time_default = _default_column_selection(preview.column_names, args.time_column, fallback="Time")
@@ -2653,7 +2551,7 @@ def main(argv: Sequence[str]) -> int:
             selected_pressure_column = dialog_result.pressure_column
 
     print(f"Loaded file preview: {file_path}")
-    print("\nColumn preview (first 50 rows loaded for preview):")
+    print("\nColumn preview (first 200 rows loaded for preview):")
     preview_frame = preview.preview
     if preview_frame is None:
         try:
