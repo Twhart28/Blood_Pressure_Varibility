@@ -34,10 +34,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 try:
     import tkinter as tk
-    from tkinter import filedialog, ttk
+    from tkinter import filedialog, messagebox, ttk
 except Exception:  # pragma: no cover - tkinter may be unavailable in some envs.
     tk = None
     filedialog = None
+    messagebox = None
     ttk = None
 
 try:
@@ -143,6 +144,14 @@ class ImportDialogResult:
     first_data_row: int
     time_column_index: int
     pressure_column_index: int
+
+
+class FastParserError(RuntimeError):
+    """Raised when the fast column loader fails to parse the file."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
 
 
 def _parse_list_field(raw_value: str) -> List[str]:
@@ -979,6 +988,39 @@ def launch_import_configuration_dialog(
     return None
 
 
+def _prompt_fast_parser_fallback(error_message: str) -> bool:
+    """Ask the user whether to proceed with the slower parser after failure."""
+
+    message = (
+        "The fast parser was unable to load the selected columns.\n\n"
+        f"Reason:\n{error_message.strip()}\n\n"
+        "Would you like to continue with the slower parser?"
+    )
+
+    if tk is not None and messagebox is not None:
+        dialog_root: Optional[tk.Tk] = None
+        try:
+            dialog_root = tk.Tk()
+            dialog_root.withdraw()
+            result = messagebox.askyesno(
+                "Fast import failed",
+                message,
+                parent=dialog_root,
+            )
+            return bool(result)
+        except Exception:
+            pass
+        finally:
+            if dialog_root is not None:
+                dialog_root.destroy()
+
+    print(
+        "Fast parser failed. Falling back to the slower parser. "
+        f"Reason: {error_message.strip()}"
+    )
+    return True
+
+
 def _select_columns_via_cli(
     column_names: Sequence[str],
     *,
@@ -1113,22 +1155,28 @@ def _load_selected_columns_fast(
     column_names: Sequence[str],
     first_data_row: int,
     separator: Optional[str],
-) -> Optional[DataFrame]:
+) -> DataFrame:
     """Attempt to load numeric columns using NumPy's fast text parsers."""
 
     if not column_indices:
-        return None
+        raise FastParserError("No column indices were provided for fast parsing.")
 
     delimiter: Optional[str]
     if separator is None or separator.isspace():
         delimiter = None
     else:
         if len(separator) != 1:
-            return None
+            raise FastParserError(
+                "Fast parser only supports single-character delimiters "
+                f"(received '{separator}')."
+            )
         delimiter = separator
 
     skiprows = max(0, first_data_row - 1)
     usecols = tuple(column_indices)
+
+    errors: List[str] = []
+    data: Optional[np.ndarray]
 
     try:
         data = np.loadtxt(
@@ -1142,7 +1190,11 @@ def _load_selected_columns_fast(
             encoding="utf-8",
             invalid_raise=False,
         )
-    except Exception:
+    except Exception as exc:
+        errors.append(f"np.loadtxt failed: {exc}")
+        data = None
+
+    if data is None:
         try:
             data = np.genfromtxt(
                 file_path,
@@ -1155,21 +1207,17 @@ def _load_selected_columns_fast(
                 filling_values=np.nan,
                 encoding="utf-8",
             )
-        except Exception:
-            return None
+        except Exception as exc:
+            errors.append(f"np.genfromtxt failed: {exc}")
+            raise FastParserError("\n".join(errors)) from exc
 
         if isinstance(data, np.ma.MaskedArray):
             data = data.filled(np.nan)
 
-        if data.size == 0:
-            return pd.DataFrame(columns=[column_names[idx] for idx in usecols])
-
         data = np.asarray(data, dtype=np.float32)
-        if data.ndim == 1:
-            data = data.reshape(-1, len(usecols))
-    else:
-        if data.size == 0:
-            return pd.DataFrame(columns=[column_names[idx] for idx in usecols])
+
+    if data.size == 0:
+        return pd.DataFrame(columns=[column_names[idx] for idx in usecols])
 
     if data.ndim == 1:
         data = data.reshape(-1, len(usecols))
@@ -1223,6 +1271,7 @@ def load_bp_file(
     resolved_separator = separator if separator is not None else detected_separator
 
     frame: Optional[DataFrame] = None
+    fast_failure_reason: Optional[str] = None
     if import_settings is not None:
         index_lookup = {
             import_settings.time_column: import_settings.time_column_index - 1,
@@ -1237,16 +1286,25 @@ def load_bp_file(
             fast_usecols.append(idx)
 
         if fast_usecols:
-            frame = _load_selected_columns_fast(
-                file_path,
-                column_indices=fast_usecols,
-                column_names=preview.column_names,
-                first_data_row=import_settings.first_data_row,
-                separator=resolved_separator,
-            )
+            try:
+                frame = _load_selected_columns_fast(
+                    file_path,
+                    column_indices=fast_usecols,
+                    column_names=preview.column_names,
+                    first_data_row=import_settings.first_data_row,
+                    separator=resolved_separator,
+                )
+            except FastParserError as exc:
+                fast_failure_reason = exc.message
 
     if frame is not None:
         return frame, preview.metadata
+
+    if fast_failure_reason:
+        if not _prompt_fast_parser_fallback(fast_failure_reason):
+            raise RuntimeError(
+                "Import cancelled after fast parser failure."
+            )
 
     if resolved_separator:
         try:
