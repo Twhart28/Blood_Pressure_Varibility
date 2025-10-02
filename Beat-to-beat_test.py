@@ -144,6 +144,8 @@ class ImportDialogResult:
     first_data_row: int
     time_column_index: int
     pressure_column_index: int
+    comment_column: Optional[str] = None
+    comment_column_index: Optional[int] = None
 
 
 class FastParserError(RuntimeError):
@@ -535,6 +537,48 @@ def launch_import_configuration_dialog(
     )
     pressure_combo.grid(row=1, column=3, sticky="w", padx=(8, 24), pady=(12, 0))
 
+    comment_enabled_var = tk.BooleanVar(value=False)
+    comment_index_var = tk.StringVar(value="")
+
+    def _on_comment_toggle(*_: object) -> None:
+        enabled = bool(comment_enabled_var.get())
+        state = "normal" if enabled else "disabled"
+        comment_entry.configure(state=state)
+        if not enabled:
+            comment_index_var.set("")
+        _update_column_options()
+        _update_preview_widget()
+
+    def _on_comment_index_change(*_: object) -> None:
+        _update_column_options()
+        _update_preview_widget()
+
+    ttk.Checkbutton(
+        controls_frame,
+        text="Include comment column",
+        variable=comment_enabled_var,
+        command=_on_comment_toggle,
+    ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+    ttk.Label(controls_frame, text="Column #:").grid(row=2, column=2, sticky="w", pady=(12, 0))
+    comment_entry = ttk.Entry(
+        controls_frame,
+        width=8,
+        textvariable=comment_index_var,
+        state="disabled",
+    )
+    comment_entry.grid(row=2, column=3, sticky="w", padx=(8, 24), pady=(12, 0))
+
+    initial_comment_index: Optional[int] = None
+    for idx, name in enumerate(preview.column_names, start=1):
+        if str(name).strip().lower() == "comment":
+            initial_comment_index = idx
+            break
+    if initial_comment_index is not None:
+        comment_enabled_var.set(True)
+        comment_entry.configure(state="normal")
+        comment_index_var.set(str(initial_comment_index))
+
     ttk.Label(
         main_frame,
         text="Data preview (first 200 rows)",
@@ -612,6 +656,19 @@ def launch_import_configuration_dialog(
             return int(prefix)
         return None
 
+    def _parse_comment_index() -> Optional[int]:
+        if not comment_enabled_var.get():
+            return None
+        raw = comment_index_var.get().strip()
+        if not raw:
+            return None
+        if not raw.isdigit():
+            return None
+        value = int(raw)
+        if value <= 0:
+            return None
+        return value
+
     def _get_header_row() -> int:
         try:
             value = int(header_var.get())
@@ -637,6 +694,9 @@ def launch_import_configuration_dialog(
         sample_rows = rows[:50]
         column_count = max((len(row) for row in sample_rows), default=len(preview.column_names))
         column_count = max(column_count, len(header_values))
+        comment_index = _parse_comment_index()
+        if comment_index:
+            column_count = max(column_count, comment_index)
         if column_count == 0:
             column_count = len(preview.column_names) or 1
         options: List[Tuple[str, int]] = []
@@ -646,7 +706,10 @@ def launch_import_configuration_dialog(
                 raw_value = header_values[idx]
                 header_label = str(raw_value).strip() if raw_value is not None else ""
             if not header_label:
-                header_label = f"Column {idx + 1}"
+                if comment_index and (idx + 1) == comment_index:
+                    header_label = "Comment"
+                else:
+                    header_label = f"Column {idx + 1}"
             options.append((f"{idx + 1}: {header_label}", idx + 1))
         return options
 
@@ -694,6 +757,9 @@ def launch_import_configuration_dialog(
     def _get_pressure_index() -> Optional[int]:
         return _parse_column_index(pressure_var.get())
 
+    def _get_comment_index() -> Optional[int]:
+        return _parse_comment_index()
+
     def _update_preview_widget() -> None:
         rows = _current_rows()
         header_index = _get_header_row()
@@ -739,14 +805,22 @@ def launch_import_configuration_dialog(
                     return _split_line(raw_line.rstrip("\r\n"), separator)
         return []
 
-    def _derive_column_names(header_tokens: Sequence[str], column_count: int) -> List[str]:
+    def _derive_column_names(
+        header_tokens: Sequence[str],
+        column_count: int,
+        *,
+        comment_index: Optional[int] = None,
+    ) -> List[str]:
         names: List[str] = []
         seen: Dict[str, int] = {}
         for idx in range(column_count):
             raw_value = header_tokens[idx] if idx < len(header_tokens) else ""
             candidate = str(raw_value).strip() if raw_value is not None else ""
             if not candidate:
-                candidate = f"column_{idx + 1}"
+                if comment_index and (idx + 1) == comment_index:
+                    candidate = "Comment"
+                else:
+                    candidate = f"column_{idx + 1}"
             base = candidate
             suffix = 1
             while candidate in seen:
@@ -761,12 +835,16 @@ def launch_import_configuration_dialog(
         data_index = _get_first_data_row()
         time_index = _get_time_index()
         pressure_index = _get_pressure_index()
+        comment_index = _get_comment_index()
 
         if time_index is None or pressure_index is None:
             error_var.set("Select both time and pressure columns.")
             return
         if time_index == pressure_index:
             error_var.set("Time and pressure selections must differ.")
+            return
+        if comment_enabled_var.get() and comment_index is None:
+            error_var.set("Enter a valid comment column number.")
             return
         if data_index <= header_index:
             error_var.set("First data row must be after the header row.")
@@ -783,12 +861,21 @@ def launch_import_configuration_dialog(
         sample_rows = rows[:50]
         column_count = max((len(row) for row in sample_rows), default=0)
         column_count = max(column_count, len(header_tokens), time_index, pressure_index)
+        if comment_index:
+            column_count = max(column_count, comment_index)
         if column_count <= 0:
             column_count = max(time_index, pressure_index)
 
-        column_names = _derive_column_names(header_tokens, column_count)
+        column_names = _derive_column_names(
+            header_tokens,
+            column_count,
+            comment_index=comment_index,
+        )
         if time_index > len(column_names) or pressure_index > len(column_names):
             error_var.set("Selected columns exceed detected column count.")
+            return
+        if comment_index and comment_index > len(column_names):
+            error_var.set("Comment column exceeds detected column count.")
             return
 
         skiprows = set(preview.skiprows)
@@ -832,6 +919,12 @@ def launch_import_configuration_dialog(
         result["pressure"] = column_names[pressure_index - 1]
         result["time_index"] = time_index
         result["pressure_index"] = pressure_index
+        if comment_index:
+            result["comment_index"] = comment_index
+            result["comment_name"] = column_names[comment_index - 1]
+        else:
+            result["comment_index"] = None
+            result["comment_name"] = None
         result["separator"] = current_preview_state.get("separator")
         result["preview"] = updated_preview
         result["header_row"] = header_index
@@ -851,6 +944,7 @@ def launch_import_configuration_dialog(
     first_data_var.trace_add("write", _on_structure_change)
     time_var.trace_add("write", lambda *_: _update_preview_widget())
     pressure_var.trace_add("write", lambda *_: _update_preview_widget())
+    comment_index_var.trace_add("write", _on_comment_index_change)
 
     ttk.Button(button_frame, text="Cancel", command=_cancel).grid(row=0, column=0, padx=(0, 8))
     ttk.Button(button_frame, text="Import", command=_confirm).grid(row=0, column=1)
@@ -880,6 +974,16 @@ def launch_import_configuration_dialog(
             first_data_row=int(result["first_data_row"]),
             time_column_index=int(result["time_index"]),
             pressure_column_index=int(result["pressure_index"]),
+            comment_column=(
+                str(result["comment_name"])
+                if result.get("comment_name") not in (None, "")
+                else None
+            ),
+            comment_column_index=(
+                int(result["comment_index"])
+                if isinstance(result.get("comment_index"), int)
+                else None
+            ),
         )
 
     return None
@@ -1061,11 +1165,17 @@ def _load_selected_columns_fast(
         raise FastParserError("No column indices were provided for fast parsing.")
 
     try:
-        usecols = [column_names[idx] for idx in column_indices]
-    except IndexError as exc:
-        raise FastParserError(
-            "One or more requested column indices are outside the detected column range."
-        ) from exc
+        resolved_indices = [int(idx) for idx in column_indices]
+    except Exception as exc:
+        raise FastParserError("Column indices for fast parsing must be integers.") from exc
+
+    for idx in resolved_indices:
+        if idx < 0 or idx >= len(column_names):
+            raise FastParserError(
+                "One or more requested column indices are outside the detected column range."
+            )
+
+    selected_column_names = [column_names[idx] for idx in resolved_indices]
 
     if separator is None:
         raise FastParserError(
@@ -1114,7 +1224,7 @@ def _load_selected_columns_fast(
         sep=delimiter,
         header=None,
         names=list(column_names),
-        usecols=usecols,
+        usecols=resolved_indices,
         comment="#",
     )
 
@@ -1132,7 +1242,10 @@ def _load_selected_columns_fast(
         # Older pandas versions may not support dtype_backend; retry without it.
         frame = pd.read_csv(**read_kwargs)
     except Exception as exc:
-        raise FastParserError(f"pandas (PyArrow engine) failed: {exc}") from exc
+        raise FastParserError(
+            "pandas (PyArrow engine) failed: "
+            f"{exc}. Requested columns: {selected_column_names}"
+        ) from exc
 
     if frame.empty:
         return frame
