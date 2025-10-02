@@ -1226,7 +1226,7 @@ def _load_selected_columns_fast(
 
     # Some exports append a free-text comment column without updating the header.
     # When that happens PyArrow raises an error about mismatched field counts.
-    # Detect the widest row in a small sample and pad the schema with throwaway
+    # Detect the widest row in the file and pad the schema with throwaway
     # placeholder names so that extra columns are ignored by the fast reader.
     max_observed_columns = len(padded_column_names)
 
@@ -1237,20 +1237,15 @@ def _load_selected_columns_fast(
                     if not handle.readline():
                         break
 
-                sample_rows_checked = 0
-                while sample_rows_checked < 256:
-                    line = handle.readline()
-                    if not line:
-                        break
-
-                    sample_rows_checked += 1
+                for line in handle:
                     stripped = line.rstrip("\r\n")
                     if not stripped:
                         continue
 
                     fields = _tokenise_preview_line(stripped, delimiter)
-                    if len(fields) > max_observed_columns:
-                        max_observed_columns = len(fields)
+                    field_count = len(fields)
+                    if field_count > max_observed_columns:
+                        max_observed_columns = field_count
         except OSError:
             pass
 
