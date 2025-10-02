@@ -1095,8 +1095,13 @@ def _load_selected_columns_fast(
         comment="#",
     )
 
+    pyarrow_kwargs = {k: v for k, v in read_kwargs.items() if k != "comment"}
+
     try:
-        frame = pd.read_csv(dtype_backend="pyarrow", **read_kwargs)
+        frame = pd.read_csv(dtype_backend="pyarrow", **pyarrow_kwargs)
+    except TypeError:
+        # Older pandas versions may not support dtype_backend; retry without it.
+        frame = pd.read_csv(**pyarrow_kwargs)
     except TypeError:
         # Older pandas versions may not support dtype_backend; retry without it.
         frame = pd.read_csv(**read_kwargs)
@@ -1153,6 +1158,7 @@ def load_bp_file(
         header=None,
         names=preview.column_names,
         usecols=usecols,
+
         skiprows=preview.skiprows,
         na_values=["nan", "NaN", "NA"],
         dtype=dtype_map,
