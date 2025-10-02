@@ -1084,6 +1084,30 @@ def _load_selected_columns_fast(
     combined_skiprows.update(range(max(0, first_data_row - 1)))
     skiprows_list = sorted(combined_skiprows)
 
+    # The PyArrow engine currently only accepts ``skiprows`` as an integer (skip
+    # the first *n* rows).  If we need to drop rows beyond the initial header we
+    # must fall back to the slower parser so that pandas' Python engine can
+    # honour the explicit indices.
+    contiguous_prefix = 0
+    for expected, row_index in enumerate(skiprows_list):
+        if row_index != expected:
+            break
+        contiguous_prefix = expected + 1
+
+    non_contiguous_skips = skiprows_list[contiguous_prefix:]
+    if non_contiguous_skips:
+        raise FastParserError(
+            "pandas (PyArrow engine) requires 'skiprows' to be an integer, "
+            "but specific rows beyond the initial header were requested: "
+            f"{non_contiguous_skips}."
+        )
+
+    skiprows_value: Optional[int]
+    if contiguous_prefix:
+        skiprows_value = contiguous_prefix
+    else:
+        skiprows_value = None
+
     read_kwargs = dict(
         filepath_or_buffer=file_path,
         engine="pyarrow",
@@ -1091,9 +1115,11 @@ def _load_selected_columns_fast(
         header=None,
         names=list(column_names),
         usecols=usecols,
-        skiprows=skiprows_list,
         comment="#",
     )
+
+    if skiprows_value is not None:
+        read_kwargs["skiprows"] = skiprows_value
 
     pyarrow_kwargs = {k: v for k, v in read_kwargs.items() if k != "comment"}
 
