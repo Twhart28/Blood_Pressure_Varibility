@@ -1222,9 +1222,52 @@ def _load_selected_columns_fast(
 
     file_path_str = str(file_path)
 
+    padded_column_names = list(column_names)
+
+    # Some exports append a free-text comment column without updating the header.
+    # When that happens PyArrow raises an error about mismatched field counts.
+    # Detect the widest row in a small sample and pad the schema with throwaway
+    # placeholder names so that extra columns are ignored by the fast reader.
+    max_observed_columns = len(padded_column_names)
+
+    if delimiter:
+        try:
+            with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
+                for _ in range(skip_rows_count):
+                    if not handle.readline():
+                        break
+
+                sample_rows_checked = 0
+                while sample_rows_checked < 256:
+                    line = handle.readline()
+                    if not line:
+                        break
+
+                    sample_rows_checked += 1
+                    stripped = line.rstrip("\r\n")
+                    if not stripped:
+                        continue
+
+                    fields = _tokenise_preview_line(stripped, delimiter)
+                    if len(fields) > max_observed_columns:
+                        max_observed_columns = len(fields)
+        except OSError:
+            pass
+
+    if max_observed_columns > len(padded_column_names):
+        existing_names = set(padded_column_names)
+        next_suffix = 0
+        while len(padded_column_names) < max_observed_columns:
+            candidate = f"__ignored_extra_{next_suffix}"
+            next_suffix += 1
+            if candidate in existing_names:
+                continue
+            padded_column_names.append(candidate)
+            existing_names.add(candidate)
+
     try:
         read_options = pa_csv.ReadOptions(
-            column_names=list(column_names),
+            column_names=padded_column_names,
             skip_rows=skip_rows_count,
         )
         parse_options = pa_csv.ParseOptions(delimiter=delimiter)
