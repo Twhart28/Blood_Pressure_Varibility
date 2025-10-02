@@ -74,6 +74,13 @@ try:
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
     raise SystemExit("pandas is required to run this script. Please install it and retry.") from exc
 
+try:  # pragma: no cover - optional dependency for fast CSV ingestion
+    import pyarrow as pa
+    import pyarrow.csv as pa_csv
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    pa = None  # type: ignore[assignment]
+    pa_csv = None  # type: ignore[assignment]
+
 try:  # pragma: no cover - optional fast moving-window statistics
     import bottleneck as bn
 except ModuleNotFoundError:  # pragma: no cover - optional dependency
@@ -1159,7 +1166,10 @@ def _load_selected_columns_fast(
     separator: Optional[str],
     skiprows: Sequence[int],
 ) -> DataFrame:
-    """Attempt to load selected columns quickly using pandas' PyArrow engine."""
+    """Attempt to load selected columns quickly using PyArrow's CSV reader."""
+
+    if pa_csv is None or pa is None:
+        raise FastParserError("PyArrow is not installed; fast parsing is unavailable.")
 
     if not column_indices:
         raise FastParserError("No column indices were provided for fast parsing.")
@@ -1178,26 +1188,19 @@ def _load_selected_columns_fast(
     selected_column_names = [column_names[idx] for idx in resolved_indices]
 
     if separator is None:
+        raise FastParserError("Fast parser requires a resolved delimiter to use the PyArrow reader.")
+
+    if not separator or len(separator) != 1:
         raise FastParserError(
-            "Fast parser requires a resolved delimiter to use the PyArrow engine."
+            "Fast parser using the PyArrow reader supports only single-character delimiters."
         )
 
-    if not separator or (len(separator) != 1 and not separator.isspace()):
-        raise FastParserError(
-            "Fast parser using the PyArrow engine supports only single-character delimiters."
-        )
-
-    # Normalise whitespace-only separators (e.g., multiple spaces) to their first character.
-    delimiter = separator[0] if separator.isspace() else separator
+    delimiter = separator
 
     combined_skiprows = set(skiprows)
     combined_skiprows.update(range(max(0, first_data_row - 1)))
     skiprows_list = sorted(combined_skiprows)
 
-    # The PyArrow engine currently only accepts ``skiprows`` as an integer (skip
-    # the first *n* rows).  If we need to drop rows beyond the initial header we
-    # must fall back to the slower parser so that pandas' Python engine can
-    # honour the explicit indices.
     contiguous_prefix = 0
     for expected, row_index in enumerate(skiprows_list):
         if row_index != expected:
@@ -1207,50 +1210,48 @@ def _load_selected_columns_fast(
     non_contiguous_skips = skiprows_list[contiguous_prefix:]
     if non_contiguous_skips:
         raise FastParserError(
-            "pandas (PyArrow engine) requires 'skiprows' to be an integer, "
-            "but specific rows beyond the initial header were requested: "
+            "PyArrow's CSV reader only supports skipping an initial contiguous block of rows, "
+            "but additional rows were requested: "
             f"{non_contiguous_skips}."
         )
 
-    skiprows_value: Optional[int]
-    if contiguous_prefix:
-        skiprows_value = contiguous_prefix
-    else:
-        skiprows_value = None
+    skip_rows_count = contiguous_prefix
 
-    read_kwargs = dict(
-        filepath_or_buffer=file_path,
-        engine="pyarrow",
-        sep=delimiter,
-        header=None,
-        names=list(column_names),
-        usecols=resolved_indices,
-        comment="#",
-    )
+    if not column_names:
+        raise FastParserError("No column names were provided for fast parsing.")
 
-    if skiprows_value is not None:
-        read_kwargs["skiprows"] = skiprows_value
-
-    pyarrow_kwargs = {k: v for k, v in read_kwargs.items() if k != "comment"}
+    file_path_str = str(file_path)
 
     try:
-        frame = pd.read_csv(dtype_backend="pyarrow", **pyarrow_kwargs)
-    except TypeError:
-        # Older pandas versions may not support dtype_backend; retry without it.
-        frame = pd.read_csv(**pyarrow_kwargs)
-    except TypeError:
-        # Older pandas versions may not support dtype_backend; retry without it.
-        frame = pd.read_csv(**read_kwargs)
+        read_options = pa_csv.ReadOptions(
+            column_names=list(column_names),
+            skip_rows=skip_rows_count,
+        )
+        parse_options = pa_csv.ParseOptions(delimiter=delimiter)
+        convert_options = pa_csv.ConvertOptions(
+            include_columns=selected_column_names,
+            column_types={name: pa.float32() for name in selected_column_names},
+            strings_can_be_null=True,
+            null_values=["", "nan", "NaN", "NA"],
+        )
+        table = pa_csv.read_csv(
+            file_path_str,
+            read_options=read_options,
+            parse_options=parse_options,
+            convert_options=convert_options,
+        )
     except Exception as exc:
         raise FastParserError(
-            "pandas (PyArrow engine) failed: "
+            "PyArrow CSV reader failed to parse the selected columns: "
             f"{exc}. Requested columns: {selected_column_names}"
         ) from exc
 
-    if frame.empty:
-        return frame
+    if table.num_rows == 0:
+        return pd.DataFrame(columns=selected_column_names)
 
-    # Ensure numeric columns are represented as float32 for downstream compatibility.
+    frame = table.to_pandas(self_destruct=True, split_blocks=True)
+    frame = frame.reindex(columns=selected_column_names)
+
     for column in frame.columns:
         try:
             frame[column] = pd.to_numeric(frame[column], errors="coerce").astype(
@@ -1337,14 +1338,12 @@ def load_bp_file(
         if fast_usecols is not None:
             if resolved_separator is None:
                 fast_unavailable_reason = (
-                    "The fast parser requires a resolved delimiter to use the PyArrow engine."
+                    "The fast parser requires a resolved delimiter to use the PyArrow reader."
                 )
                 fast_usecols = None
-            elif not resolved_separator or (
-                len(resolved_separator) != 1 and not resolved_separator.isspace()
-            ):
+            elif not resolved_separator or len(resolved_separator) != 1:
                 fast_unavailable_reason = (
-                    "The fast parser using the PyArrow engine supports only single-character delimiters, "
+                    "The fast parser using the PyArrow reader supports only single-character delimiters, "
                     f"but '{resolved_separator}' was selected."
                 )
                 fast_usecols = None
