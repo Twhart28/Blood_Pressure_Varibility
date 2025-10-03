@@ -23,11 +23,11 @@ number of raw samples rendered in the interactive plot
 
 from __future__ import annotations
 
-import csv
+import argparse
 import math
 import re
 import sys
-import argparse
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -74,12 +74,11 @@ try:
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
     raise SystemExit("pandas is required to run this script. Please install it and retry.") from exc
 
-try:  # pragma: no cover - optional dependency for fast CSV ingestion
+try:
     import pyarrow as pa
-    import pyarrow.csv as pa_csv
-except ModuleNotFoundError:  # pragma: no cover - optional dependency
-    pa = None  # type: ignore[assignment]
-    pa_csv = None  # type: ignore[assignment]
+    import pyarrow.csv as pv
+except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
+    raise SystemExit("pyarrow is required to load waveform files. Please install it and retry.") from exc
 
 try:  # pragma: no cover - optional fast moving-window statistics
     import bottleneck as bn
@@ -126,908 +125,158 @@ class ArtifactConfig:
     max_missing_gap: float = 10.0
 
 
-@dataclass
-class BPFilePreview:
-    """Lightweight summary of an export gathered without full ingestion."""
+def find_data_start_and_titles(path: Path) -> Tuple[int, List[str]]:
+    """Locate the first data row and construct canonical column titles."""
 
-    metadata: Dict[str, str]
-    column_names: List[str]
-    preview: Optional[DataFrame]
-    skiprows: List[int]
-    detected_separator: Optional[str]
-    raw_lines: List[str]
-    preview_rows: int = 200
-
-
-@dataclass
-class ImportDialogResult:
-    """Selections made in the delimiter/column configuration dialog."""
-
-    preview: BPFilePreview
-    separator: Optional[str]
-    time_column: str
-    pressure_column: str
-    header_row: int
-    first_data_row: int
-    time_column_index: int
-    pressure_column_index: int
-    comment_column: Optional[str] = None
-    comment_column_index: Optional[int] = None
+    data_start = 0
+    channel_titles: List[str] = []
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for idx, line in enumerate(handle):
+            if line.startswith("ChannelTitle="):
+                parts = line.rstrip("\n").split("\t")
+                channel_titles = parts[1:] if len(parts) > 1 else []
+            if line.startswith("Range="):
+                data_start = idx + 1
+                break
+    names = ["Index"] + channel_titles + ["Comment"]
+    return data_start, names
 
 
-class FastParserError(RuntimeError):
-    """Raised when the fast column loader fails to parse the file."""
-
-    def __init__(self, message: str):
-        super().__init__(message)
-        self.message = message
-
-
-def _tokenise_preview_line(line: str, separator: Optional[str]) -> List[str]:
-    """Split a raw preview line using the provided separator."""
-
-    if not line:
-        return []
-
-    if separator is None:
-        stripped = line.strip()
-        if not stripped:
-            return []
-        return [tok for tok in re.split(r"\s+", stripped) if tok]
-
-    if separator == " ":
-        stripped = line.strip()
-        if not stripped:
-            return []
-        return [tok for tok in re.split(r"\s+", stripped) if tok]
-
-    try:
-        return next(csv.reader([line], delimiter=separator))
-    except Exception:
-        return line.split(separator)
-
-
-def _scan_bp_file(
-    file_path: Path,
-    max_preview_rows: int = 200,
-    *,
-    separator_override: Optional[str] = None,
-) -> BPFilePreview:
-    """Read a lightweight preview without inferring structure."""
+def read_header_metadata(path: Path, data_start: int) -> Dict[str, str]:
+    """Parse key-value metadata pairs that appear before the data section."""
 
     metadata: Dict[str, str] = {}
-    skiprows: List[int] = []
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for idx, line in enumerate(handle):
+            if idx >= data_start:
+                break
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            metadata[key.strip()] = value.strip()
+    return metadata
 
-    preview_line_cap = max(max_preview_rows, 200)
-    raw_lines: List[str] = []
-    with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
-        for _ in range(preview_line_cap):
-            line = handle.readline()
+
+def sanitize_to_temp(path: Path, data_start: int, expected_cols: int, delimiter: str = "\t") -> Path:
+    """Copy ``path`` to a temporary file with normalised comment columns."""
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tsv")
+    tmp_path = Path(tmp.name)
+    tmp.close()
+
+    with path.open("r", encoding="utf-8", errors="ignore") as src, tmp_path.open("w", encoding="utf-8", errors="ignore") as dst:
+        for idx, line in enumerate(src):
+            if idx < data_start:
+                dst.write(line)
+                continue
+
+            line = line.rstrip("\n").rstrip("\r")
             if not line:
-                break
-            raw_lines.append(line.rstrip("\r\n"))
+                continue
 
-    meaningful_lines = [line for line in raw_lines if line.strip() and not line.strip().startswith("#")]
+            parts = line.split(delimiter)
+            if len(parts) > expected_cols:
+                head = parts[: expected_cols - 1]
+                tail = delimiter.join(parts[expected_cols - 1 :])
+                parts = head + [tail]
+            elif len(parts) < expected_cols:
+                parts = parts + [""] * (expected_cols - len(parts))
 
-    detected_separator: Optional[str] = separator_override
-    if detected_separator is None:
-        sample = meaningful_lines[:20]
+            dst.write(delimiter.join(parts) + "\n")
 
-        def _consistent_split(delimiter: Optional[str]) -> bool:
-            if not sample:
-                return False
-            lengths: List[int] = []
-            has_multiple = False
-            for line in sample:
-                tokens = _tokenise_preview_line(line, delimiter)
-                if not tokens:
-                    return False
-                if len(tokens) > 1:
-                    has_multiple = True
-                lengths.append(len(tokens))
-            return has_multiple and len(set(lengths)) == 1
-
-        for delimiter in ("\t", ",", ";", "|"):
-            if _consistent_split(delimiter):
-                detected_separator = delimiter
-                break
-
-        if detected_separator is None and _consistent_split(" "):
-            detected_separator = " "
-
-    preview_rows = max_preview_rows if max_preview_rows > 0 else 200
-
-    column_names: List[str] = []
-    lines_for_tokens = meaningful_lines if meaningful_lines else raw_lines
-    if lines_for_tokens:
-        effective_separator = detected_separator if detected_separator is not None else None
-        column_count = 0
-        for line in lines_for_tokens:
-            tokens = _tokenise_preview_line(line, effective_separator)
-            if tokens:
-                column_count = len(tokens)
-                break
-        if column_count:
-            column_names = [f"column_{idx + 1}" for idx in range(column_count)]
-
-    return BPFilePreview(
-        metadata=metadata,
-        column_names=column_names,
-        preview=None,
-        skiprows=skiprows,
-        detected_separator=detected_separator,
-        raw_lines=raw_lines,
-        preview_rows=preview_rows,
-    )
+    return tmp_path
 
 
-def _build_preview_dataframe(
-    file_path: Path,
+def interpret_delimiter(value: Optional[str]) -> str:
+    """Interpret common textual representations of delimiters."""
+
+    text = (value or "").strip()
+    if not text:
+        return "\t"
+
+    lowered = text.lower()
+    if lowered in {"\\t", "\t", "tab"}:
+        return "\t"
+    if lowered in {"\\n", "\n", "newline"}:
+        return "\n"
+    if lowered in {"\\r", "\r"}:
+        return "\r"
+
+    try:
+        return bytes(text, "utf-8").decode("unicode_escape")
+    except Exception:
+        return text
+
+
+def read_with_pyarrow(
+    path: Path,
+    data_start: int,
+    names: Sequence[str],
+    selected_cols: Sequence[str],
     *,
-    column_names: Sequence[str],
-    skiprows: Sequence[int],
-    separator: Optional[str],
-    max_rows: int,
+    include_comment: bool = False,
+    row_start: Optional[int] = None,
+    row_end: Optional[int] = None,
+    delimiter: str = "\t",
+    comment_name: Optional[str] = None,
 ) -> DataFrame:
-    """Construct a small DataFrame preview for the selected layout."""
+    """Load ``selected_cols`` from ``path`` using PyArrow's CSV reader."""
 
-    read_kwargs = dict(
-        filepath_or_buffer=file_path,
-        header=None,
-        names=list(column_names),
-        skiprows=list(skiprows),
-        nrows=max_rows,
-        na_values=["nan", "NaN", "NA"],
+    read_options = pv.ReadOptions(skip_rows=data_start, autogenerate_column_names=True, use_threads=True)
+    parse_options = pv.ParseOptions(delimiter=delimiter)
+    convert_options = pv.ConvertOptions(strings_can_be_null=True, null_values=["NaN"])
+
+    table = pv.read_csv(
+        str(path),
+        read_options=read_options,
+        parse_options=parse_options,
+        convert_options=convert_options,
     )
 
-    if separator:
-        try:
-            engine = "c" if len(separator) == 1 else "python"
-            return pd.read_csv(sep=separator, engine=engine, **read_kwargs)
-        except Exception:
-            return pd.read_csv(delim_whitespace=True, engine="python", **read_kwargs)
+    current_n = table.num_columns
+    wanted_n = len(names)
+    if current_n >= wanted_n:
+        extra = [f"EXTRA_{idx}" for idx in range(current_n - wanted_n)]
+        table = table.rename_columns(list(names) + extra)
+    else:
+        padded = list(names) + [f"EXTRA_{idx}" for idx in range(wanted_n - current_n)]
+        table = table.rename_columns(padded[:current_n])
 
-    return pd.read_csv(delim_whitespace=True, engine="python", **read_kwargs)
+    usecols = list(dict.fromkeys(selected_cols))
+    comment_candidates: List[str] = []
+    if comment_name:
+        comment_candidates.append(comment_name)
+    if not comment_name or comment_name != "Comment":
+        comment_candidates.append("Comment")
+    if not include_comment:
+        for candidate in comment_candidates:
+            if candidate in usecols:
+                usecols.remove(candidate)
+
+    table = table.select(usecols)
+
+    if (row_start is not None) or (row_end is not None):
+        start = int(row_start or 0)
+        if (row_end is not None) and (row_end > start):
+            length = int(row_end - start)
+            table = table.slice(start, length)
+        else:
+            table = table.slice(start)
+
+    df = table.to_pandas(types_mapper=pd.ArrowDtype)
+    return df
 
 
 def _default_column_selection(column_names: Sequence[str], requested: Optional[str], *, fallback: Optional[str] = None) -> str:
-    """Return a sensible default column name."""
+    """Choose a sensible default column from ``column_names``."""
 
     if requested and requested in column_names:
         return requested
-
     if fallback and fallback in column_names:
         return fallback
-
     if column_names:
         return column_names[0]
-
     raise ValueError("No columns available for selection.")
-
-
-def _render_preview_to_text_widget(
-    widget: tk.Text,
-    preview_rows: Sequence[Sequence[str]],
-    *,
-    header_row_index: int,
-    first_data_row_index: int,
-    time_column_index: Optional[int],
-    pressure_column_index: Optional[int],
-    max_rows: int = 200,
-) -> None:
-    """Render a preview table into a Tkinter text widget with highlights."""
-
-    if tk is None:
-        return
-
-    widget.configure(state="normal")
-    widget.delete("1.0", "end")
-
-    if not preview_rows:
-        widget.insert("1.0", "No preview data available.")
-        widget.configure(state="disabled")
-        return
-
-    total_rows = len(preview_rows)
-    display_rows = list(preview_rows[:max_rows])
-    column_count = max((len(row) for row in display_rows), default=0)
-    row_number_width = max(3, len(str(min(total_rows, max_rows)))) + 1
-
-    widths: List[int] = []
-    for col_idx in range(column_count):
-        col_values = [
-            str(row[col_idx]) if col_idx < len(row) and row[col_idx] is not None else ""
-            for row in display_rows
-        ]
-        widths.append(max((len(value) for value in col_values), default=0))
-
-    header_line_parts = [f"{'#':>{row_number_width}} "]
-    for col_idx in range(column_count):
-        label = str(col_idx + 1)
-        header_line_parts.append(label.ljust(widths[col_idx] + 2))
-    header_text = "".join(header_line_parts)
-    widget.insert("end", header_text + "\n")
-    widget.tag_add("column_index", "1.0", "1.end")
-
-    line_no = 2
-    for row_number, row_values in enumerate(display_rows, start=1):
-        line_parts: List[str] = [f"{row_number:>{row_number_width}} "]
-        cursor = len(line_parts[0])
-        positions: List[Tuple[int, int, int]] = []
-
-        for col_idx in range(column_count):
-            value = ""
-            if col_idx < len(row_values) and row_values[col_idx] is not None:
-                value = str(row_values[col_idx])
-            padded = value.ljust(widths[col_idx] + 2)
-            start = cursor
-            end = cursor + len(padded)
-            positions.append((start, end, col_idx))
-            line_parts.append(padded)
-            cursor = end
-
-        line_text = "".join(line_parts)
-        widget.insert("end", line_text + "\n")
-
-        row_tag = "row_even" if row_number % 2 == 0 else "row_odd"
-        widget.tag_add(row_tag, f"{line_no}.0", f"{line_no}.end")
-
-        if row_number == header_row_index:
-            widget.tag_add("header", f"{line_no}.0", f"{line_no}.end")
-        if row_number == first_data_row_index:
-            widget.tag_add("data_start", f"{line_no}.0", f"{line_no}.end")
-
-        for start, end, col_idx in positions:
-            if time_column_index is not None and col_idx == time_column_index:
-                widget.tag_add("highlight_time", f"{line_no}.{start}", f"{line_no}.{end}")
-            if pressure_column_index is not None and col_idx == pressure_column_index:
-                widget.tag_add("highlight_pressure", f"{line_no}.{start}", f"{line_no}.{end}")
-
-        line_no += 1
-
-    widget.configure(state="disabled")
-    widget.tag_raise("column_index")
-    widget.tag_raise("highlight_time")
-    widget.tag_raise("highlight_pressure")
-    widget.tag_raise("data_start")
-    widget.tag_raise("header")
-
-
-def launch_import_configuration_dialog(
-    file_path: Path,
-    preview: BPFilePreview,
-    *,
-    time_default: str,
-    pressure_default: str,
-    separator_override: Optional[str] = None,
-) -> Optional[ImportDialogResult]:
-    """Display a dialog allowing the user to adjust delimiter and column selections."""
-
-    if tk is None or ttk is None:
-        return None
-
-    delimiter_options: List[Tuple[str, Optional[str]]] = [
-        ("Auto-detect", None),
-        ("Tab (\\t)", "\t"),
-        ("Comma (,)", ","),
-        ("Semicolon (;)", ";"),
-        ("Pipe (|)", "|"),
-        ("Space", " "),
-        ("Colon (:)", ":"),
-    ]
-
-    def _label_for_separator(value: Optional[str]) -> str:
-        for label, candidate in delimiter_options:
-            if value == candidate:
-                return label
-        return "Auto-detect"
-
-    def _resolve_separator_from_label(label: str) -> Optional[str]:
-        for option_label, value in delimiter_options:
-            if option_label == label:
-                return value
-        return None
-
-    def _effective_separator(value: Optional[str]) -> Optional[str]:
-        if value is not None:
-            return value
-        return preview.detected_separator
-
-    raw_lines = list(preview.raw_lines)
-    if not raw_lines:
-        with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
-            for _ in range(200):
-                line = handle.readline()
-                if not line:
-                    break
-                raw_lines.append(line.rstrip("\r\n"))
-
-    def _split_line(line: str, separator: Optional[str]) -> List[str]:
-        return _tokenise_preview_line(line, separator)
-
-    def _split_preview_lines(separator: Optional[str]) -> List[List[str]]:
-        effective = _effective_separator(separator)
-        return [_split_line(line, effective) for line in raw_lines]
-
-    initial_separator = separator_override if separator_override is not None else preview.detected_separator
-    current_rows = _split_preview_lines(initial_separator)
-
-    if preview.skiprows:
-        header_default = max(1, max(preview.skiprows) + 1)
-    else:
-        header_default = 1
-    max_available_rows = max(len(raw_lines), 1)
-    header_default = min(header_default, max_available_rows)
-    first_data_default = header_default + 1 if header_default < max_available_rows else header_default + 1
-
-    default_time_index = 1
-    default_pressure_index = 2 if len(preview.column_names) >= 2 else 1
-    if preview.column_names:
-        if time_default in preview.column_names:
-            default_time_index = preview.column_names.index(time_default) + 1
-        if pressure_default in preview.column_names:
-            default_pressure_index = preview.column_names.index(pressure_default) + 1
-    if default_pressure_index == default_time_index:
-        if len(preview.column_names) >= 2:
-            for idx in range(1, len(preview.column_names) + 1):
-                if idx != default_time_index:
-                    default_pressure_index = idx
-                    break
-        if default_pressure_index == default_time_index:
-            default_pressure_index = max(1, min(default_time_index + 1, len(preview.column_names) or 1))
-
-    root = tk.Tk()
-    root.title("Import options")
-    root.geometry("960x640")
-
-    main_frame = ttk.Frame(root, padding=16)
-    main_frame.grid(row=0, column=0, sticky="nsew")
-    root.columnconfigure(0, weight=1)
-    root.rowconfigure(0, weight=1)
-    main_frame.columnconfigure(0, weight=1)
-    main_frame.rowconfigure(2, weight=1)
-
-    controls_frame = ttk.Frame(main_frame)
-    controls_frame.grid(row=0, column=0, sticky="ew", pady=(0, 12))
-    controls_frame.columnconfigure(6, weight=1)
-
-    ttk.Label(controls_frame, text="Delimiter:").grid(row=0, column=0, sticky="w")
-    delimiter_var = tk.StringVar(value=_label_for_separator(initial_separator))
-    delimiter_combo = ttk.Combobox(
-        controls_frame,
-        state="readonly",
-        values=[label for label, _ in delimiter_options],
-        textvariable=delimiter_var,
-        width=18,
-    )
-    delimiter_combo.grid(row=0, column=1, sticky="w", padx=(8, 24))
-
-    ttk.Label(controls_frame, text="Header row:").grid(row=0, column=2, sticky="w")
-    header_var = tk.IntVar(value=header_default)
-    header_spin = tk.Spinbox(
-        controls_frame,
-        from_=1,
-        to=max(max_available_rows, header_default + 100),
-        textvariable=header_var,
-        width=8,
-    )
-    header_spin.grid(row=0, column=3, sticky="w", padx=(8, 24))
-
-    ttk.Label(controls_frame, text="First data row:").grid(row=0, column=4, sticky="w")
-    first_data_var = tk.IntVar(value=first_data_default)
-    first_data_spin = tk.Spinbox(
-        controls_frame,
-        from_=1,
-        to=max(max_available_rows, first_data_default + 100),
-        textvariable=first_data_var,
-        width=8,
-    )
-    first_data_spin.grid(row=0, column=5, sticky="w")
-
-    ttk.Label(controls_frame, text="Time column:").grid(row=1, column=0, sticky="w", pady=(12, 0))
-    time_var = tk.StringVar()
-    time_combo = ttk.Combobox(
-        controls_frame,
-        state="readonly",
-        textvariable=time_var,
-        width=24,
-    )
-    time_combo.grid(row=1, column=1, sticky="w", padx=(8, 24), pady=(12, 0))
-
-    ttk.Label(controls_frame, text="Pressure column:").grid(row=1, column=2, sticky="w", pady=(12, 0))
-    pressure_var = tk.StringVar()
-    pressure_combo = ttk.Combobox(
-        controls_frame,
-        state="readonly",
-        textvariable=pressure_var,
-        width=24,
-    )
-    pressure_combo.grid(row=1, column=3, sticky="w", padx=(8, 24), pady=(12, 0))
-
-    comment_enabled_var = tk.BooleanVar(value=False)
-    comment_index_var = tk.StringVar(value="")
-
-    def _on_comment_toggle(*_: object) -> None:
-        enabled = bool(comment_enabled_var.get())
-        state = "normal" if enabled else "disabled"
-        comment_entry.configure(state=state)
-        if not enabled:
-            comment_index_var.set("")
-        _update_column_options()
-        _update_preview_widget()
-
-    def _on_comment_index_change(*_: object) -> None:
-        _update_column_options()
-        _update_preview_widget()
-
-    ttk.Checkbutton(
-        controls_frame,
-        text="Include comment column",
-        variable=comment_enabled_var,
-        command=_on_comment_toggle,
-    ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
-
-    ttk.Label(controls_frame, text="Column #:").grid(row=2, column=2, sticky="w", pady=(12, 0))
-    comment_entry = ttk.Entry(
-        controls_frame,
-        width=8,
-        textvariable=comment_index_var,
-        state="disabled",
-    )
-    comment_entry.grid(row=2, column=3, sticky="w", padx=(8, 24), pady=(12, 0))
-
-    initial_comment_index: Optional[int] = None
-    for idx, name in enumerate(preview.column_names, start=1):
-        if str(name).strip().lower() == "comment":
-            initial_comment_index = idx
-            break
-    if initial_comment_index is not None:
-        comment_enabled_var.set(True)
-        comment_entry.configure(state="normal")
-        comment_index_var.set(str(initial_comment_index))
-
-    ttk.Label(
-        main_frame,
-        text="Data preview (first 200 rows)",
-        font=("TkDefaultFont", 10, "bold"),
-    ).grid(row=1, column=0, sticky="w")
-
-    preview_frame = ttk.Frame(main_frame, relief=tk.SOLID, borderwidth=1)
-    preview_frame.grid(row=2, column=0, sticky="nsew")
-    preview_frame.columnconfigure(0, weight=1)
-    preview_frame.rowconfigure(0, weight=1)
-
-    preview_text = tk.Text(
-        preview_frame,
-        wrap="none",
-        font=("Courier New", 10),
-        height=20,
-    )
-    preview_text.grid(row=0, column=0, sticky="nsew")
-    preview_text.configure(cursor="arrow")
-    preview_text.bind("<Key>", lambda _: "break")
-
-    y_scroll = ttk.Scrollbar(preview_frame, orient="vertical", command=preview_text.yview)
-    y_scroll.grid(row=0, column=1, sticky="ns")
-    x_scroll = ttk.Scrollbar(preview_frame, orient="horizontal", command=preview_text.xview)
-    x_scroll.grid(row=1, column=0, sticky="ew")
-    preview_text.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
-
-    preview_text.tag_configure("column_index", background="#ccd6f6", font=("Courier New", 10, "bold"))
-    preview_text.tag_configure("header", background="#d9d9d9", font=("Courier New", 10, "bold"))
-    preview_text.tag_configure("row_even", background="#f5f5f5")
-    preview_text.tag_configure("row_odd", background="#ededed")
-    preview_text.tag_configure("highlight_time", background="#dbeafe")
-    preview_text.tag_configure("highlight_pressure", background="#fdeac5")
-    preview_text.tag_configure("data_start", background="#e7f5e4")
-
-    error_var = tk.StringVar(value="")
-    error_label = ttk.Label(main_frame, textvariable=error_var, foreground="red")
-    error_label.grid(row=3, column=0, sticky="w", pady=(8, 0))
-
-    button_frame = ttk.Frame(main_frame)
-    button_frame.grid(row=4, column=0, sticky="e", pady=(16, 0))
-
-    result: Dict[str, object] = {}
-    current_preview_state: Dict[str, object] = {
-        "preview": preview,
-        "separator": initial_separator,
-        "resolved_separator": _effective_separator(initial_separator),
-        "rows": current_rows,
-        "header_row": header_default,
-        "first_data_row": first_data_default,
-        "preview_rows": preview.preview_rows,
-    }
-
-    column_option_map: Dict[str, int] = {}
-
-    def _current_preview() -> BPFilePreview:
-        stored = current_preview_state.get("preview")
-        if isinstance(stored, BPFilePreview):
-            return stored
-        return preview
-
-    def _current_rows() -> List[List[str]]:
-        rows = current_preview_state.get("rows")
-        if isinstance(rows, list):
-            return rows
-        return current_rows
-
-    def _parse_column_index(value: str) -> Optional[int]:
-        if not value:
-            return None
-        if value in column_option_map:
-            return column_option_map[value]
-        prefix = value.split(":", 1)[0].strip()
-        if prefix.isdigit():
-            return int(prefix)
-        return None
-
-    def _parse_comment_index() -> Optional[int]:
-        if not comment_enabled_var.get():
-            return None
-        raw = comment_index_var.get().strip()
-        if not raw:
-            return None
-        if not raw.isdigit():
-            return None
-        value = int(raw)
-        if value <= 0:
-            return None
-        return value
-
-    def _get_header_row() -> int:
-        try:
-            value = int(header_var.get())
-        except (tk.TclError, ValueError):
-            value = header_default
-        return max(1, value)
-
-    def _get_first_data_row() -> int:
-        try:
-            value = int(first_data_var.get())
-        except (tk.TclError, ValueError):
-            value = first_data_default
-        return max(1, value)
-
-    def _build_column_options() -> List[Tuple[str, int]]:
-        rows = _current_rows()
-        header_index = _get_header_row()
-        if rows:
-            header_index = min(header_index, len(rows))
-        header_values: Sequence[str] = []
-        if 1 <= header_index <= len(rows):
-            header_values = rows[header_index - 1]
-        sample_rows = rows[:50]
-        column_count = max((len(row) for row in sample_rows), default=len(preview.column_names))
-        column_count = max(column_count, len(header_values))
-        comment_index = _parse_comment_index()
-        if comment_index:
-            column_count = max(column_count, comment_index)
-        if column_count == 0:
-            column_count = len(preview.column_names) or 1
-        options: List[Tuple[str, int]] = []
-        for idx in range(column_count):
-            header_label = ""
-            if idx < len(header_values):
-                raw_value = header_values[idx]
-                header_label = str(raw_value).strip() if raw_value is not None else ""
-            if not header_label:
-                if comment_index and (idx + 1) == comment_index:
-                    header_label = "Comment"
-                else:
-                    header_label = f"Column {idx + 1}"
-            options.append((f"{idx + 1}: {header_label}", idx + 1))
-        return options
-
-    def _select_label_for_index(options: Sequence[Tuple[str, int]], desired_index: int) -> str:
-        for label, idx in options:
-            if idx == desired_index:
-                return label
-        return options[0][0] if options else ""
-
-    def _update_column_options(initial: bool = False) -> None:
-        nonlocal column_option_map
-        options = _build_column_options()
-        column_option_map = {label: idx for label, idx in options}
-        labels = [label for label, _ in options]
-        time_combo.configure(values=labels)
-        pressure_combo.configure(values=labels)
-
-        if not options:
-            time_var.set("")
-            pressure_var.set("")
-            return
-
-        current_time_index = _parse_column_index(time_var.get()) or default_time_index
-        current_pressure_index = _parse_column_index(pressure_var.get()) or default_pressure_index
-
-        if initial:
-            current_time_index = default_time_index
-            current_pressure_index = default_pressure_index
-
-        current_time_index = max(1, min(current_time_index, options[-1][1]))
-        current_pressure_index = max(1, min(current_pressure_index, options[-1][1]))
-
-        if current_pressure_index == current_time_index and len(options) > 1:
-            for _, idx in options:
-                if idx != current_time_index:
-                    current_pressure_index = idx
-                    break
-
-        time_var.set(_select_label_for_index(options, current_time_index))
-        pressure_var.set(_select_label_for_index(options, current_pressure_index))
-
-    def _get_time_index() -> Optional[int]:
-        return _parse_column_index(time_var.get())
-
-    def _get_pressure_index() -> Optional[int]:
-        return _parse_column_index(pressure_var.get())
-
-    def _get_comment_index() -> Optional[int]:
-        return _parse_comment_index()
-
-    def _update_preview_widget() -> None:
-        rows = _current_rows()
-        header_index = _get_header_row()
-        data_index = _get_first_data_row()
-        time_index = _get_time_index()
-        pressure_index = _get_pressure_index()
-        preview_limit = current_preview_state.get("preview_rows")
-        if not isinstance(preview_limit, int) or preview_limit <= 0:
-            preview_limit = _current_preview().preview_rows
-        _render_preview_to_text_widget(
-            preview_text,
-            rows,
-            header_row_index=header_index,
-            first_data_row_index=data_index,
-            time_column_index=(time_index - 1) if time_index else None,
-            pressure_column_index=(pressure_index - 1) if pressure_index else None,
-            max_rows=preview_limit,
-        )
-
-    def _refresh_preview_from_separator(*_: object) -> None:
-        selection = delimiter_var.get()
-        desired_separator = _resolve_separator_from_label(selection)
-        rows = _split_preview_lines(desired_separator)
-        current_preview_state["rows"] = rows
-        current_preview_state["separator"] = desired_separator
-        current_preview_state["resolved_separator"] = _effective_separator(desired_separator)
-        _update_column_options()
-        _update_preview_widget()
-
-    def _on_structure_change(*_: object) -> None:
-        error_var.set("")
-        current_preview_state["header_row"] = _get_header_row()
-        current_preview_state["first_data_row"] = _get_first_data_row()
-        _update_column_options()
-        _update_preview_widget()
-
-    def _read_tokens_for_line(line_number: int, separator: Optional[str]) -> List[str]:
-        if line_number <= len(raw_lines):
-            return _split_line(raw_lines[line_number - 1], separator)
-        with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
-            for idx, raw_line in enumerate(handle, start=1):
-                if idx == line_number:
-                    return _split_line(raw_line.rstrip("\r\n"), separator)
-        return []
-
-    def _derive_column_names(
-        header_tokens: Sequence[str],
-        column_count: int,
-        *,
-        comment_index: Optional[int] = None,
-    ) -> List[str]:
-        names: List[str] = []
-        seen: Dict[str, int] = {}
-        for idx in range(column_count):
-            raw_value = header_tokens[idx] if idx < len(header_tokens) else ""
-            candidate = str(raw_value).strip() if raw_value is not None else ""
-            if not candidate:
-                if comment_index and (idx + 1) == comment_index:
-                    candidate = "Comment"
-                else:
-                    candidate = f"column_{idx + 1}"
-            base = candidate
-            suffix = 1
-            while candidate in seen:
-                suffix += 1
-                candidate = f"{base}_{suffix}"
-            seen[candidate] = suffix
-            names.append(candidate)
-        return names
-
-    def _confirm() -> None:
-        header_index = _get_header_row()
-        data_index = _get_first_data_row()
-        time_index = _get_time_index()
-        pressure_index = _get_pressure_index()
-        comment_index = _get_comment_index()
-
-        if time_index is None or pressure_index is None:
-            error_var.set("Select both time and pressure columns.")
-            return
-        if time_index == pressure_index:
-            error_var.set("Time and pressure selections must differ.")
-            return
-        if comment_enabled_var.get() and comment_index is None:
-            error_var.set("Enter a valid comment column number.")
-            return
-        if data_index <= header_index:
-            error_var.set("First data row must be after the header row.")
-            return
-
-        rows = _current_rows()
-        resolved_candidate = current_preview_state.get("resolved_separator")
-        if isinstance(resolved_candidate, str) or resolved_candidate is None:
-            resolved_separator = resolved_candidate
-        else:
-            resolved_separator = _effective_separator(current_preview_state.get("separator"))
-
-        header_tokens = _read_tokens_for_line(header_index, resolved_separator)
-        sample_rows = rows[:50]
-        column_count = max((len(row) for row in sample_rows), default=0)
-        column_count = max(column_count, len(header_tokens), time_index, pressure_index)
-        if comment_index:
-            column_count = max(column_count, comment_index)
-        if column_count <= 0:
-            column_count = max(time_index, pressure_index)
-
-        column_names = _derive_column_names(
-            header_tokens,
-            column_count,
-            comment_index=comment_index,
-        )
-        if time_index > len(column_names) or pressure_index > len(column_names):
-            error_var.set("Selected columns exceed detected column count.")
-            return
-        if comment_index and comment_index > len(column_names):
-            error_var.set("Comment column exceeds detected column count.")
-            return
-
-        skiprows = set(preview.skiprows)
-        skiprows.update(range(max(0, data_index - 1)))
-        skiprows_list = sorted(skiprows)
-
-        preview_row_limit = current_preview_state.get("preview_rows")
-        if isinstance(preview_row_limit, int) and preview_row_limit > 0:
-            max_rows = preview_row_limit
-        else:
-            max_rows = preview.preview_rows
-
-        try:
-            preview_df = _build_preview_dataframe(
-                file_path,
-                column_names=column_names,
-                skiprows=skiprows_list,
-                separator=resolved_separator,
-                max_rows=max_rows,
-            )
-        except Exception as exc:  # pragma: no cover - interactive feedback
-            error_var.set(f"Failed to build preview: {exc}")
-            return
-
-        updated_preview = BPFilePreview(
-            metadata=preview.metadata,
-            column_names=column_names,
-            preview=preview_df,
-            skiprows=skiprows_list,
-            detected_separator=resolved_separator,
-            raw_lines=raw_lines,
-            preview_rows=max_rows,
-        )
-
-        current_preview_state["preview"] = updated_preview
-        current_preview_state["header_row"] = header_index
-        current_preview_state["first_data_row"] = data_index
-        current_preview_state["preview_rows"] = max_rows
-
-        result["time"] = column_names[time_index - 1]
-        result["pressure"] = column_names[pressure_index - 1]
-        result["time_index"] = time_index
-        result["pressure_index"] = pressure_index
-        if comment_index:
-            result["comment_index"] = comment_index
-            result["comment_name"] = column_names[comment_index - 1]
-        else:
-            result["comment_index"] = None
-            result["comment_name"] = None
-        result["separator"] = current_preview_state.get("separator")
-        result["preview"] = updated_preview
-        result["header_row"] = header_index
-        result["first_data_row"] = data_index
-        error_var.set("")
-        root.quit()
-
-    def _cancel() -> None:
-        result.clear()
-        root.quit()
-
-    _update_column_options(initial=True)
-    _update_preview_widget()
-
-    delimiter_var.trace_add("write", _refresh_preview_from_separator)
-    header_var.trace_add("write", _on_structure_change)
-    first_data_var.trace_add("write", _on_structure_change)
-    time_var.trace_add("write", lambda *_: _update_preview_widget())
-    pressure_var.trace_add("write", lambda *_: _update_preview_widget())
-    comment_index_var.trace_add("write", _on_comment_index_change)
-
-    ttk.Button(button_frame, text="Cancel", command=_cancel).grid(row=0, column=0, padx=(0, 8))
-    ttk.Button(button_frame, text="Import", command=_confirm).grid(row=0, column=1)
-
-    root.protocol("WM_DELETE_WINDOW", _cancel)
-
-    root.mainloop()
-    root.destroy()
-
-    required_keys = {
-        "time",
-        "pressure",
-        "preview",
-        "separator",
-        "header_row",
-        "first_data_row",
-        "time_index",
-        "pressure_index",
-    }
-    if required_keys.issubset(result.keys()):
-        return ImportDialogResult(
-            preview=result["preview"],
-            separator=result.get("separator"),
-            time_column=str(result["time"]),
-            pressure_column=str(result["pressure"]),
-            header_row=int(result["header_row"]),
-            first_data_row=int(result["first_data_row"]),
-            time_column_index=int(result["time_index"]),
-            pressure_column_index=int(result["pressure_index"]),
-            comment_column=(
-                str(result["comment_name"])
-                if result.get("comment_name") not in (None, "")
-                else None
-            ),
-            comment_column_index=(
-                int(result["comment_index"])
-                if isinstance(result.get("comment_index"), int)
-                else None
-            ),
-        )
-
-    return None
-
-
-def _prompt_fast_parser_decision(*, title: str, summary: str, details: str) -> bool:
-    """Display a dialog explaining why the fast parser is unavailable or failed."""
-
-    message = (
-        f"{summary}\n\n"
-        f"Details:\n{details.strip()}\n\n"
-        "Would you like to continue with the slower parser?"
-    )
-
-    if tk is not None and messagebox is not None:
-        dialog_root: Optional[tk.Tk] = None
-        try:
-            dialog_root = tk.Tk()
-            dialog_root.withdraw()
-            result = messagebox.askyesno(
-                title,
-                message,
-                parent=dialog_root,
-            )
-            return bool(result)
-        except Exception:
-            pass
-        finally:
-            if dialog_root is not None:
-                dialog_root.destroy()
-
-    print(
-        f"{title}: {summary} "
-        f"Details: {details.strip()} "
-        "Proceeding with the slower parser."
-    )
-    return True
 
 
 def _select_columns_via_cli(
@@ -1036,7 +285,7 @@ def _select_columns_via_cli(
     default_time: str,
     default_pressure: str,
 ) -> Tuple[str, str]:
-    """Prompt for time/pressure selection using stdin."""
+    """Prompt the user via stdin to choose time and pressure columns."""
 
     if not sys.stdin.isatty():
         return default_time, default_pressure
@@ -1080,7 +329,7 @@ def _select_columns_via_tk(
     default_time: str,
     default_pressure: str,
 ) -> Tuple[str, str]:
-    """Display a Tkinter dialog for column selection."""
+    """Display a Tkinter dialog for selecting time and pressure columns."""
 
     if tk is None:
         return default_time, default_pressure
@@ -1126,17 +375,15 @@ def _select_columns_via_tk(
 
 
 def select_time_pressure_columns(
-    preview: BPFilePreview,
+    column_names: Sequence[str],
     *,
     requested_time: Optional[str] = None,
     requested_pressure: Optional[str] = None,
     allow_gui: bool = True,
 ) -> Tuple[str, str]:
-    """Resolve the time and pressure columns, prompting the user when possible."""
+    """Resolve time/pressure columns, prompting the user when needed."""
 
-    column_names = preview.column_names
     time_default = _default_column_selection(column_names, requested_time, fallback="Time")
-
     remaining = [name for name in column_names if name != time_default]
     pressure_default = _default_column_selection(
         remaining if remaining else column_names,
@@ -1157,316 +404,65 @@ def select_time_pressure_columns(
     return _select_columns_via_cli(column_names, default_time=time_default, default_pressure=pressure_default)
 
 
-def _load_selected_columns_fast(
-    file_path: Path,
-    *,
-    column_indices: Sequence[int],
-    column_names: Sequence[str],
-    first_data_row: int,
-    separator: Optional[str],
-    skiprows: Sequence[int],
-) -> DataFrame:
-    """Attempt to load selected columns quickly using PyArrow's CSV reader."""
+def resolve_separator_argument(value: Optional[str]) -> str:
+    """Convert command-line ``--separator`` text into a literal delimiter."""
 
-    if pa_csv is None or pa is None:
-        raise FastParserError("PyArrow is not installed; fast parsing is unavailable.")
-
-    if not column_indices:
-        raise FastParserError("No column indices were provided for fast parsing.")
-
-    try:
-        resolved_indices = [int(idx) for idx in column_indices]
-    except Exception as exc:
-        raise FastParserError("Column indices for fast parsing must be integers.") from exc
-
-    for idx in resolved_indices:
-        if idx < 0 or idx >= len(column_names):
-            raise FastParserError(
-                "One or more requested column indices are outside the detected column range."
-            )
-
-    selected_column_names = [column_names[idx] for idx in resolved_indices]
-
-    if separator is None:
-        raise FastParserError("Fast parser requires a resolved delimiter to use the PyArrow reader.")
-
-    if not separator or len(separator) != 1:
-        raise FastParserError(
-            "Fast parser using the PyArrow reader supports only single-character delimiters."
-        )
-
-    delimiter = separator
-
-    combined_skiprows = set(skiprows)
-    combined_skiprows.update(range(max(0, first_data_row - 1)))
-    skiprows_list = sorted(combined_skiprows)
-
-    contiguous_prefix = 0
-    for expected, row_index in enumerate(skiprows_list):
-        if row_index != expected:
-            break
-        contiguous_prefix = expected + 1
-
-    non_contiguous_skips = skiprows_list[contiguous_prefix:]
-    if non_contiguous_skips:
-        raise FastParserError(
-            "PyArrow's CSV reader only supports skipping an initial contiguous block of rows, "
-            "but additional rows were requested: "
-            f"{non_contiguous_skips}."
-        )
-
-    skip_rows_count = contiguous_prefix
-
-    if not column_names:
-        raise FastParserError("No column names were provided for fast parsing.")
-
-    file_path_str = str(file_path)
-
-    padded_column_names = list(column_names)
-
-    # Some exports append a free-text comment column without updating the header.
-    # When that happens PyArrow raises an error about mismatched field counts.
-    # Detect the widest row in the file and pad the schema with throwaway
-    # placeholder names so that extra columns are ignored by the fast reader.
-    max_observed_columns = len(padded_column_names)
-
-    if delimiter:
-        try:
-            with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
-                for _ in range(skip_rows_count):
-                    if not handle.readline():
-                        break
-
-                for line in handle:
-                    stripped = line.rstrip("\r\n")
-                    if not stripped:
-                        continue
-
-                    fields = _tokenise_preview_line(stripped, delimiter)
-                    field_count = len(fields)
-                    if field_count > max_observed_columns:
-                        max_observed_columns = field_count
-        except OSError:
-            pass
-
-    if max_observed_columns > len(padded_column_names):
-        existing_names = set(padded_column_names)
-        next_suffix = 0
-        while len(padded_column_names) < max_observed_columns:
-            candidate = f"__ignored_extra_{next_suffix}"
-            next_suffix += 1
-            if candidate in existing_names:
-                continue
-            padded_column_names.append(candidate)
-            existing_names.add(candidate)
-
-    try:
-        read_options = pa_csv.ReadOptions(
-            column_names=padded_column_names,
-            skip_rows=skip_rows_count,
-        )
-        parse_options = pa_csv.ParseOptions(delimiter=delimiter)
-        convert_options = pa_csv.ConvertOptions(
-            include_columns=selected_column_names,
-            column_types={name: pa.float32() for name in selected_column_names},
-            strings_can_be_null=True,
-            null_values=["", "nan", "NaN", "NA"],
-        )
-        table = pa_csv.read_csv(
-            file_path_str,
-            read_options=read_options,
-            parse_options=parse_options,
-            convert_options=convert_options,
-        )
-    except Exception as exc:
-        raise FastParserError(
-            "PyArrow CSV reader failed to parse the selected columns: "
-            f"{exc}. Requested columns: {selected_column_names}"
-        ) from exc
-
-    if table.num_rows == 0:
-        return pd.DataFrame(columns=selected_column_names)
-
-    frame = table.to_pandas(self_destruct=True, split_blocks=True)
-    frame = frame.reindex(columns=selected_column_names)
-
-    for column in frame.columns:
-        try:
-            frame[column] = pd.to_numeric(frame[column], errors="coerce").astype(
-                np.float32, copy=False
-            )
-        except Exception:
-            frame[column] = frame[column]
-
-    frame = frame.dropna(how="all")
-    return frame
+    return interpret_delimiter(value)
 
 
 def load_bp_file(
     file_path: Path,
     *,
-    preview: Optional[BPFilePreview] = None,
-    time_column: Optional[str] = None,
-    pressure_column: Optional[str] = None,
-    separator: Optional[str] = None,
-    import_settings: Optional[ImportDialogResult] = None,
-) -> Tuple[DataFrame, Dict[str, str]]:
-    """Load the selected columns from a waveform export."""
+    data_start: int,
+    column_names: Sequence[str],
+    time_column: str,
+    pressure_column: str,
+    delimiter: str,
+) -> DataFrame:
+    """Load the time and pressure columns using the PyArrow reader."""
 
-    if preview is None:
-        preview = _scan_bp_file(file_path, separator_override=separator)
-    elif separator:
-        preview.detected_separator = separator
+    if time_column == pressure_column:
+        raise ValueError("Time and pressure columns must be different.")
 
-    if time_column is None or time_column not in preview.column_names or pressure_column is None or pressure_column not in preview.column_names:
-        time_column, pressure_column = select_time_pressure_columns(
-            preview,
-            requested_time=time_column,
-            requested_pressure=pressure_column,
+    selected = []
+    for name in (time_column, pressure_column):
+        if name not in column_names:
+            raise ValueError(f"Column '{name}' not found in file.")
+        if name not in selected:
+            selected.append(name)
+
+    comment_present = "Comment" in column_names
+    read_path = file_path
+    temp_path: Optional[Path] = None
+
+    try:
+        if comment_present:
+            temp_path = sanitize_to_temp(file_path, data_start, len(column_names), delimiter=delimiter)
+            read_path = temp_path
+
+        frame = read_with_pyarrow(
+            read_path,
+            data_start,
+            column_names,
+            selected,
+            include_comment=False,
+            delimiter=delimiter,
         )
+    finally:
+        if temp_path is not None and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
 
-    desired = [time_column, pressure_column]
-    # ``dict.fromkeys`` preserves order while removing duplicates.
-    usecols = list(dict.fromkeys(desired))
-    dtype_map = {name: np.float32 for name in usecols}
+    if frame.empty:
+        return frame
 
-    read_kwargs = dict(
-        filepath_or_buffer=file_path,
-        comment="#",
-        header=None,
-        names=preview.column_names,
-        usecols=usecols,
+    for column in frame.columns:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
 
-        skiprows=preview.skiprows,
-        na_values=["nan", "NaN", "NA"],
-        dtype=dtype_map,
-    )
-
-    detected_separator = preview.detected_separator
-    resolved_separator = separator if separator is not None else detected_separator
-
-    frame: Optional[DataFrame] = None
-    fast_failure_reason: Optional[str] = None
-    fast_unavailable_reason: Optional[str] = None
-
-    fast_usecols: Optional[List[int]] = None
-    fast_debug_indices: Optional[List[int]] = None
-    if import_settings is None:
-        fast_unavailable_reason = (
-            "Fast parser requires the interactive import dialog to capture column indices "
-            f"(time column: '{time_column}', pressure column: '{pressure_column}')."
-        )
-    else:
-        index_lookup = {
-            import_settings.time_column: import_settings.time_column_index - 1,
-            import_settings.pressure_column: import_settings.pressure_column_index - 1,
-        }
-        fast_usecols = []
-        for column_name in usecols:
-            idx = index_lookup.get(column_name)
-            if idx is None:
-                fast_unavailable_reason = (
-                    f"Column '{column_name}' does not have a recorded index from the preview dialog, "
-                    "so the fast parser cannot be configured."
-                )
-                fast_usecols = None
-                break
-            fast_usecols.append(idx)
-
-        if fast_usecols is not None:
-            if resolved_separator is None:
-                fast_unavailable_reason = (
-                    "The fast parser requires a resolved delimiter to use the PyArrow reader."
-                )
-                fast_usecols = None
-            elif not resolved_separator or len(resolved_separator) != 1:
-                fast_unavailable_reason = (
-                    "The fast parser using the PyArrow reader supports only single-character delimiters, "
-                    f"but '{resolved_separator}' was selected."
-                )
-                fast_usecols = None
-
-    if fast_usecols:
-        fast_debug_indices = list(fast_usecols)
-        try:
-            frame = _load_selected_columns_fast(
-                file_path,
-                column_indices=fast_usecols,
-                column_names=preview.column_names,
-                first_data_row=import_settings.first_data_row if import_settings else 1,
-                separator=resolved_separator,
-                skiprows=preview.skiprows,
-            )
-        except FastParserError as exc:
-            debug_lines = [exc.message]
-            debug_lines.append(
-                "Resolved separator: "
-                + (repr(resolved_separator) if resolved_separator is not None else "None")
-            )
-            debug_lines.append(f"Requested columns: {usecols}")
-            if fast_debug_indices is not None:
-                debug_lines.append(f"Column indices: {fast_debug_indices}")
-            fast_failure_reason = "\n".join(debug_lines)
-
-    if frame is not None:
-        return frame, preview.metadata
-
-    if fast_failure_reason:
-        if not _prompt_fast_parser_decision(
-            title="Fast parser failed",
-            summary="The fast parser was unable to load the selected columns.",
-            details=fast_failure_reason,
-        ):
-            raise RuntimeError(
-                "Import cancelled after fast parser failure."
-            )
-    elif fast_unavailable_reason:
-        debug_lines = [fast_unavailable_reason]
-        debug_lines.append(
-            "Resolved separator: "
-            + (repr(resolved_separator) if resolved_separator is not None else "None")
-        )
-        debug_lines.append(f"Requested columns: {usecols}")
-        fast_unavailable_reason = "\n".join(debug_lines)
-        if not _prompt_fast_parser_decision(
-            title="Fast parser unavailable",
-            summary="The fast parser could not be used for this file.",
-            details=fast_unavailable_reason,
-        ):
-            raise RuntimeError(
-                "Import cancelled because the fast parser could not be used."
-            )
-
-    if resolved_separator:
-        try:
-            if len(resolved_separator) == 1:
-                frame = pd.read_csv(
-                    sep=resolved_separator,
-                    engine="c",
-                    **read_kwargs,
-                )
-            else:
-                frame = pd.read_csv(
-                    sep=resolved_separator,
-                    engine="python",
-                    **read_kwargs,
-                )
-        except Exception:
-            frame = pd.read_csv(
-                delim_whitespace=True,
-                engine="python",
-                **read_kwargs,
-            )
-    else:
-        frame = pd.read_csv(
-            delim_whitespace=True,
-            engine="python",
-            **read_kwargs,
-        )
-
-    return frame, preview.metadata
-
-
+    frame = frame.dropna(how="all")
+    return frame
 def parse_interval(metadata: Dict[str, str], frame: DataFrame) -> float:
     """Extract the sampling interval from metadata or infer it from the data."""
 
@@ -2719,19 +1715,7 @@ def main(argv: Sequence[str]) -> int:
     if args.plot_max_points is not None and args.plot_max_points < 0:
         parser.error("--plot-max-points must be zero or a positive integer")
 
-    separator_override: Optional[str] = None
-    if args.separator:
-        raw_separator = args.separator
-        try:
-            raw_separator = bytes(raw_separator, "utf-8").decode("unicode_escape")
-        except Exception:
-            pass
-        lowered = raw_separator.lower()
-        if lowered == "tab":
-            raw_separator = "\t"
-        elif lowered == "space":
-            raw_separator = " "
-        separator_override = raw_separator if raw_separator else None
+    delimiter = resolve_separator_argument(args.separator)
 
     if args.file:
         file_path = Path(args.file)
@@ -2746,98 +1730,59 @@ def main(argv: Sequence[str]) -> int:
         return 1
 
     try:
-        preview = _scan_bp_file(file_path, separator_override=separator_override)
-    except Exception as exc:  # pragma: no cover - interactive feedback
-        print(f"Failed to load file preview: {exc}")
+        data_start, column_names = find_data_start_and_titles(file_path)
+        metadata = read_header_metadata(file_path, data_start)
+    except Exception as exc:
+        print(f"Failed to inspect file header: {exc}")
         return 1
 
-    time_default = _default_column_selection(preview.column_names, args.time_column, fallback="Time")
-    remaining_columns = [name for name in preview.column_names if name != time_default]
-    pressure_default = _default_column_selection(
-        remaining_columns if remaining_columns else preview.column_names,
-        args.column if args.column != time_default else None,
-        fallback="reBAP",
-    )
+    available_columns = list(column_names)
+    if len(available_columns) < 2:
+        print("File does not contain enough columns for analysis.")
+        return 1
 
-    selected_time_column: Optional[str] = None
-    selected_pressure_column: Optional[str] = None
-    dialog_shown = False
-    dialog_result: Optional[ImportDialogResult] = None
+    time_column = args.time_column if args.time_column in available_columns else None
+    pressure_column = args.column if args.column in available_columns else None
 
-    if tk is not None:
-        try:
-            dialog_result = launch_import_configuration_dialog(
-                file_path,
-                preview,
-                time_default=time_default,
-                pressure_default=pressure_default,
-                separator_override=separator_override,
-            )
-            dialog_shown = True
-        except Exception as exc:  # pragma: no cover - interactive feedback
-            print(f"Failed to open import configuration dialog: {exc}")
-            dialog_result = None
-        if dialog_result:
-            preview = dialog_result.preview
-            separator_override = dialog_result.separator
-            selected_time_column = dialog_result.time_column
-            selected_pressure_column = dialog_result.pressure_column
-
-    print(f"Loaded file preview: {file_path}")
-    print("\nColumn preview (first 200 rows loaded for preview):")
-    preview_frame = preview.preview
-    if preview_frame is None:
-        try:
-            preview_frame = _build_preview_dataframe(
-                file_path,
-                column_names=preview.column_names,
-                skiprows=preview.skiprows,
-                separator=preview.detected_separator,
-                max_rows=preview.preview_rows,
-            )
-            preview.preview = preview_frame
-        except Exception as exc:  # pragma: no cover - interactive feedback
-            print(f"  Unable to build preview table: {exc}")
-            preview_frame = None
-    if preview_frame is not None:
-        print_column_overview(preview_frame)
-    else:
-        print("  Preview will be available after import.")
-
-    if selected_time_column is None or selected_pressure_column is None:
-        selected_time_column, selected_pressure_column = select_time_pressure_columns(
-            preview,
+    if not time_column or not pressure_column or time_column == pressure_column:
+        time_column, pressure_column = select_time_pressure_columns(
+            available_columns,
             requested_time=args.time_column,
             requested_pressure=args.column,
-            allow_gui=not dialog_shown,
+            allow_gui=True,
         )
+    else:
+        if time_column == pressure_column:
+            print("Time and pressure columns must be different.")
+            return 1
 
     try:
-        frame, metadata = load_bp_file(
+        frame = load_bp_file(
             file_path,
-            preview=preview,
-            time_column=selected_time_column,
-            pressure_column=selected_pressure_column,
-            separator=separator_override,
-            import_settings=dialog_result,
+            data_start=data_start,
+            column_names=available_columns,
+            time_column=time_column,
+            pressure_column=pressure_column,
+            delimiter=delimiter,
         )
-    except Exception as exc:  # pragma: no cover - interactive feedback
+    except Exception as exc:
         print(f"Failed to load file: {exc}")
         return 1
 
-    print(f"Loaded columns: time='{selected_time_column}', pressure='{selected_pressure_column}'")
+    if frame.empty:
+        print("Loaded file contains no data rows after parsing.")
+        return 1
 
-    if selected_time_column in frame.columns:
-        time_series = pd.to_numeric(
-            frame[selected_time_column], errors="coerce", downcast="float"
-        ).astype(np.float32, copy=False)
-        time = time_series.to_numpy()
-    else:
-        time = None
+    print(f"Loaded columns: time='{time_column}', pressure='{pressure_column}'")
+    print_column_overview(frame)
 
-    pressure_series = pd.to_numeric(
-        frame[selected_pressure_column], errors="coerce", downcast="float"
-    ).astype(np.float32, copy=False)
+    time = None
+    if time_column in frame.columns:
+        time_series = pd.to_numeric(frame[time_column], errors="coerce", downcast="float").astype(np.float32, copy=False)
+        if np.any(np.isfinite(time_series)):
+            time = time_series.to_numpy()
+
+    pressure_series = pd.to_numeric(frame[pressure_column], errors="coerce", downcast="float").astype(np.float32, copy=False)
     pressure = pressure_series.to_numpy()
 
     interval = parse_interval(metadata, frame)
@@ -2861,7 +1806,7 @@ def main(argv: Sequence[str]) -> int:
 
     try:
         beats = derive_beats(time, pressure, fs=fs, config=config)
-    except Exception as exc:  # pragma: no cover - interactive feedback
+    except Exception as exc:
         print(f"Beat detection failed: {exc}")
         return 1
 
@@ -2871,7 +1816,7 @@ def main(argv: Sequence[str]) -> int:
         try:
             summary.to_csv(args.out, index=False)
             print(f"Beat summary exported to {args.out}")
-        except Exception as exc:  # pragma: no cover - filesystem feedback
+        except Exception as exc:
             print(f"Failed to save summary CSV: {exc}")
 
     clean_beats = summary[~summary["artifact"]].copy()
