@@ -8,10 +8,29 @@ import math
 import tkinter as tk
 import tkinter.font as tkfont
 from dataclasses import dataclass, asdict
-from tkinter import ttk, filedialog, messagebox, simpledialog
 from statistics import mean as _pymean
+from tkinter import ttk, filedialog, messagebox, simpledialog
+from typing import Dict, Any, Optional, Tuple, List
+
+import numpy as np
+from matplotlib import colors as mcolors
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 
 # ----------------------------- Core parsing & ARV -----------------------------
+
+def _split_preserving_trailing(text: str, separator: str) -> List[str]:
+    """Split ``text`` while retaining trailing empty fields."""
+    if separator == " ":
+        return text.split()
+    if not separator:
+        return [text]
+    parts = text.split(separator)
+    expected = text.count(separator) + 1
+    if len(parts) < expected:
+        parts.extend([""] * (expected - len(parts)))
+    return parts
+
 
 def parse_header(lines, separator="\t", data_start_override=None):
     """
@@ -25,27 +44,28 @@ def parse_header(lines, separator="\t", data_start_override=None):
     data_start_idx = None
 
     for i, ln in enumerate(lines):
-        l = ln.strip()
+        line = ln.rstrip("\r\n")
+        stripped = line.lstrip()
 
-        if l.startswith("Interval="):
+        if stripped.startswith("Interval="):
             # Often "Interval=\t1 s"
-            parts = [p for p in l.split("\t") if p]
+            parts = [p for p in stripped.split("\t") if p]
             try:
                 val = parts[1] if len(parts) > 1 else parts[0].split("=", 1)[-1]
                 interval_s = float(val.split()[0])
             except Exception:
                 pass
 
-        if l.startswith("ChannelTitle="):
-            titles = l.split("=", 1)[-1].strip()
-            channel_titles = [t.strip() for t in titles.split("\t") if t.strip()]
+        if stripped.startswith("ChannelTitle="):
+            titles = stripped.split("=", 1)[-1]
+            channel_titles = [t.strip() for t in titles.split("\t")]
 
         if data_start_idx is None:
             row = ln.rstrip("\r\n")
             if separator == " ":
                 parts = row.split()
             else:
-                parts = row.split(separator)
+                parts = _split_preserving_trailing(row, separator)
             if len(parts) >= 2 and parts[0].strip().isdigit():
                 data_start_idx = i
 
@@ -87,13 +107,43 @@ def load_series(filepath, layout_config=None):
         if layout_config.first_data_row:
             data_start_override = layout_config.first_data_row - 1
 
-    interval_s, channel_titles, data_start = parse_header(
+    interval_s, raw_channel_titles, data_start = parse_header(
         lines,
         separator=separator,
         data_start_override=data_start_override,
     )
+    channel_titles = []
+    name_counts: Dict[str, int] = {}
+    for idx, raw_name in enumerate(raw_channel_titles):
+        if raw_name:
+            base_name = raw_name
+        else:
+            base_name = f"__unnamed_column_{idx + 2}"
+
+        count = name_counts.get(base_name, 0)
+        if count:
+            resolved_name = f"{base_name}__{count + 1}"
+        else:
+            resolved_name = base_name
+        name_counts[base_name] = count + 1
+        channel_titles.append(resolved_name)
+
     n_channels = len(channel_titles)
     series_map = {name: [] for name in channel_titles}
+
+    comment_key = None
+    if layout_config is not None:
+        try:
+            comment_column = getattr(layout_config, "comment_column", None)
+        except AttributeError:
+            comment_column = None
+        if comment_column:
+            try:
+                mapped_index = int(comment_column) - 2
+            except (TypeError, ValueError):
+                mapped_index = None
+            if mapped_index is not None and 0 <= mapped_index < len(channel_titles):
+                comment_key = channel_titles[mapped_index]
 
     # IMPORTANT: No artificial limit here — reads the ENTIRE dataset
     for ln in lines[data_start:]:
@@ -101,28 +151,22 @@ def load_series(filepath, layout_config=None):
         if separator == " ":
             row = row_txt.split()
         else:
-            row = row_txt.split(separator)
+            row = _split_preserving_trailing(row_txt, separator)
         if not row or not row[0].strip().isdigit():
             continue
         if len(row) < 1 + n_channels:
-            continue
+            row.extend([""] * (1 + n_channels - len(row)))
+        elif len(row) > 1 + n_channels:
+            row = row[: 1 + n_channels]
 
         vals = row[1:1 + n_channels]
         for name, val in zip(channel_titles, vals):
-            series_map[name].append(safe_float(val, decimal=decimal))
+            if comment_key is not None and name == comment_key:
+                series_map[name].append(val)
+            else:
+                series_map[name].append(safe_float(val, decimal=decimal))
 
     return interval_s, series_map, channel_titles
-
-
-def select_window(series, interval_s, start_s, end_s):
-    n = len(series)
-    if n == 0:
-        return []
-    start_idx = 0 if start_s is None else max(0, int(start_s // interval_s))
-    end_idx = n if end_s is None else min(n, int(math.ceil(end_s / interval_s)))
-    if end_idx - start_idx <= 1:
-        return []
-    return series[start_idx:end_idx]
 
 
 def arv(values):
@@ -139,7 +183,148 @@ def arv(values):
     return num / denom if denom > 0 else float("nan")
 
 
+# ----------------------------- Plotting helpers -----------------------------
+
+def _lighten_color(color: str, amount: float = 0.5) -> str:
+    """Return a lighter shade of ``color`` by mixing it with white."""
+    try:
+        rgb = np.array(mcolors.to_rgb(color))
+    except ValueError:
+        rgb = np.array([0.5, 0.5, 0.5])
+    amount = max(0.0, min(1.0, amount))
+    mixed = rgb + (np.array([1.0, 1.0, 1.0]) - rgb) * amount
+    return mcolors.to_hex(mixed.clip(0.0, 1.0))
+
+
+def compute_loess_line(x_values: List[float], y_values: List[float], frac: float = 0.3, degree: int = 1) -> List[float]:
+    """Return LOESS-smoothed ``y`` values evaluated at ``x`` positions.
+
+    Args:
+        x_values: Sequence of x coordinates (e.g., time).
+        y_values: Sequence of y coordinates (e.g., BP readings).
+        frac: Fraction of points used in each local regression window (0 < frac <= 1).
+        degree: Polynomial degree for local regression (typically 1 or 2).
+
+    Returns:
+        List of smoothed values (NaN where insufficient data).
+    """
+
+    if not x_values or not y_values or len(x_values) != len(y_values):
+        return []
+
+    x = np.asarray(x_values, dtype=float)
+    y = np.asarray(y_values, dtype=float)
+    valid_mask = ~(np.isnan(x) | np.isnan(y))
+    if not np.any(valid_mask):
+        return [float("nan")] * len(x_values)
+
+    x = x[valid_mask]
+    y = y[valid_mask]
+    if len(x) == 0:
+        return [float("nan")] * len(x_values)
+
+    order = np.argsort(x)
+    x_sorted = x[order]
+    y_sorted = y[order]
+    n = len(x_sorted)
+
+    frac = float(frac) if frac and not math.isnan(frac) else 0.3
+    if frac <= 0:
+        frac = 0.1
+    if frac > 1:
+        frac = 1.0
+
+    window = max(2, int(math.ceil(frac * n)))
+    degree = max(0, min(int(round(degree)), 2))
+
+    fitted_sorted = np.full(n, np.nan, dtype=float)
+    for idx, xi in enumerate(x_sorted):
+        left = max(0, idx - window // 2)
+        right = min(n, left + window)
+        left = max(0, right - window)
+        x_subset = x_sorted[left:right]
+        y_subset = y_sorted[left:right]
+        if len(x_subset) == 0:
+            continue
+        distances = np.abs(x_subset - xi)
+        max_distance = distances.max() if len(distances) else 0.0
+        if max_distance == 0:
+            weights = np.ones_like(distances)
+        else:
+            scaled = distances / max_distance
+            weights = (1 - scaled ** 3) ** 3
+        deg = min(degree, len(x_subset) - 1)
+        if deg < 0:
+            deg = 0
+        try:
+            coeffs = np.polyfit(x_subset, y_subset, deg, w=weights)
+            fitted_sorted[idx] = np.polyval(coeffs, xi)
+        except Exception:
+            fitted_sorted[idx] = float(np.average(y_subset))
+
+    fitted = np.full(len(x_values), np.nan, dtype=float)
+    fitted_positions = np.nonzero(valid_mask)[0]
+    fitted[fitted_positions[order]] = fitted_sorted
+    return fitted.tolist()
+
+
+PLOT_SERIES_COLORS = {
+    "SBP": "#8b1a1a",
+    "DBP": "#104e8b",
+    "MAP": "#1b7f3a",
+}
+
+MEASURE_ORDER = ("SBP", "DBP", "MAP")
+
+
+def format_time_stamp(seconds: Optional[float]) -> str:
+    if seconds is None or math.isnan(seconds):
+        return ""
+    total = max(0.0, float(seconds))
+    minutes, secs = divmod(total, 60.0)
+    hours, minutes = divmod(minutes, 60.0)
+    if hours >= 1:
+        return f"{int(hours):02d}:{int(minutes):02d}:{secs:05.2f}"
+    return f"{int(minutes):02d}:{secs:05.2f}"
+
+
 # -------------------------- Outlier filtering (artifacts) ---------------------
+
+FILTER_METHOD_ORDER = ["moving_average", "absolute_change", "std_from_mean"]
+FILTER_METHODS = {
+    "moving_average": {"label": "Moving average"},
+    "absolute_change": {"label": "Absolute beat-beat change"},
+    "std_from_mean": {"label": "STD from mean"},
+}
+_FILTER_LABEL_TO_CODE = {info["label"]: code for code, info in FILTER_METHODS.items()}
+_LEGACY_FILTER_ALIASES = {
+    "rolling": "moving_average",
+    "global": "std_from_mean",
+}
+
+
+def normalize_filter_method(value: Optional[str]) -> str:
+    if not value:
+        return "moving_average"
+    if value in FILTER_METHODS:
+        return value
+    if value in _FILTER_LABEL_TO_CODE:
+        return _FILTER_LABEL_TO_CODE[value]
+    lowered = value.lower()
+    if lowered in _LEGACY_FILTER_ALIASES:
+        return _LEGACY_FILTER_ALIASES[lowered]
+    for label, code in _FILTER_LABEL_TO_CODE.items():
+        if lowered == label.lower():
+            return code
+    normalized = lowered.replace(" ", "_")
+    if normalized in FILTER_METHODS:
+        return normalized
+    return "moving_average"
+
+
+def filter_label_from_value(value: Optional[str]) -> str:
+    code = normalize_filter_method(value)
+    return FILTER_METHODS[code]["label"]
 
 def _nanmean(xs):
     vals = [x for x in xs if not math.isnan(x)]
@@ -170,16 +355,88 @@ def _mad(xs):
            else 0.5*(abs_dev[mid2-1]+abs_dev[mid2]))
     return mad
 
-def filter_outliers_global(values, k_sd=3.0):
-    """
-    Simple global filter: drop points > k_sd * SD from the global mean.
-    """
+
+def _filter_global_mask(values, k_sd=3.0):
+    if not values:
+        return []
     m = _nanmean(values)
     s = _nansd(values, ddof=1)
     if math.isnan(m) or math.isnan(s) or s == 0:
-        return [v for v in values if not math.isnan(v)]
-    lo, hi = m - k_sd*s, m + k_sd*s
-    return [v for v in values if (not math.isnan(v)) and (lo <= v <= hi)]
+        return [True] * len(values)
+    lo, hi = m - k_sd * s, m + k_sd * s
+    return [lo <= v <= hi for v in values]
+
+
+def _filter_rolling_mask(values, interval_s, window_s=15.0, k_mad=4.0):
+    n = len(values)
+    if n == 0 or interval_s <= 0:
+        return [True] * n
+    vals = [float(v) for v in values]
+    w = max(3, int(round(window_s / interval_s)))
+    half = w // 2
+    mask = [True] * n
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        window = vals[lo:hi]
+        if not window:
+            mask[i] = True
+            continue
+        ws = sorted(window)
+        mid = len(ws) // 2
+        if len(ws) % 2 == 1:
+            med = ws[mid]
+        else:
+            med = 0.5 * (ws[mid - 1] + ws[mid])
+        abs_dev = sorted(abs(v - med) for v in window)
+        mid2 = len(abs_dev) // 2
+        if not abs_dev:
+            sigma = 0.0
+        elif len(abs_dev) % 2 == 1:
+            sigma = 1.4826 * abs_dev[mid2]
+        else:
+            sigma = 1.4826 * 0.5 * (abs_dev[mid2 - 1] + abs_dev[mid2])
+        x = vals[i]
+        if sigma == 0:
+            mask[i] = abs(x - med) <= 1e-12
+        else:
+            mask[i] = abs(x - med) <= k_mad * sigma
+    return mask
+
+
+def _filter_absolute_change_mask(values, max_delta):
+    if not values:
+        return []
+    try:
+        threshold = float(max_delta)
+    except (TypeError, ValueError):
+        threshold = 0.0
+    if threshold <= 0:
+        return [True] * len(values)
+    mask = []
+    prev = None
+    for v in values:
+        if prev is None:
+            mask.append(True)
+            prev = v
+            continue
+        if abs(v - prev) <= threshold:
+            mask.append(True)
+            prev = v
+        else:
+            mask.append(False)
+    return mask
+
+def filter_outliers_global(values, k_sd=3.0):
+    """
+    Simple global filter: drop points > k_sd * SD from the global mean.
+    Returns (kept_values, excluded_values).
+    """
+    clean = [v for v in values if not math.isnan(v)]
+    mask = _filter_global_mask(clean, k_sd=k_sd)
+    kept = [val for val, keep in zip(clean, mask) if keep]
+    excluded = [val for val, keep in zip(clean, mask) if not keep]
+    return kept, excluded
 
 def filter_outliers_rolling_robust(values, interval_s, window_s=15.0, k_mad=4.0):
     """
@@ -188,63 +445,53 @@ def filter_outliers_rolling_robust(values, interval_s, window_s=15.0, k_mad=4.0)
     - Convert MAD to robust sigma: sigma ≈ 1.4826 * MAD.
     - Drop points with |x - median| > k_mad * sigma_robust.
     """
-    vals = [float(v) for v in values]
-    n = len(vals)
-    if n == 0 or interval_s <= 0:
-        return [v for v in vals if not math.isnan(v)]
-
-    w = max(3, int(round(window_s / interval_s)))  # window length in samples
-    half = w // 2
-
-    kept = []
-    for i in range(n):
-        lo = max(0, i - half)
-        hi = min(n, i + half + 1)
-        window = [v for v in vals[lo:hi] if not math.isnan(v)]
-        if not window:
-            continue
-        # median
-        ws = sorted(window)
-        mid = len(ws)//2
-        med = ws[mid] if len(ws)%2==1 else 0.5*(ws[mid-1]+ws[mid])
-
-        # MAD
-        abs_dev = [abs(v - med) for v in window]
-        abs_dev.sort()
-        mid2 = len(abs_dev)//2
-        mad = abs_dev[mid2] if len(abs_dev)%2==1 else 0.5*(abs_dev[mid2-1]+abs_dev[mid2])
-        sigma = 1.4826 * mad  # ~equivalent to SD if normal
-        x = vals[i]
-        if math.isnan(x):
-            continue
-        if sigma == 0:
-            # if flat window, keep point if exactly med
-            if abs(x - med) <= 1e-12:
-                kept.append(x)
-        else:
-            if abs(x - med) <= k_mad * sigma:
-                kept.append(x)
-    return kept
+    vals = [float(v) for v in values if not math.isnan(v)]
+    mask = _filter_rolling_mask(vals, interval_s=interval_s, window_s=window_s, k_mad=k_mad)
+    kept = [val for val, keep in zip(vals, mask) if keep]
+    excluded = [val for val, keep in zip(vals, mask) if not keep]
+    return kept, excluded
 
 
-def compute_metrics(series, use_filter=False, filter_method="rolling", interval_s=1.0,
-                    k_sd=3.0, window_s=15.0, k_mad=4.0):
+def filter_outliers_absolute_change(values, max_delta):
+    """Exclude beats where the absolute change from the previous kept beat exceeds ``max_delta``."""
+    clean = [v for v in values if not math.isnan(v)]
+    mask = _filter_absolute_change_mask(clean, max_delta=max_delta)
+    kept = [val for val, keep in zip(clean, mask) if keep]
+    excluded = [val for val, keep in zip(clean, mask) if not keep]
+    return kept, excluded
+
+
+def compute_metrics(series, use_filter=False, filter_method="moving_average", interval_s=1.0,
+                    k_sd=3.0, window_s=15.0, k_mad=4.0, delta_cutoff=0.0):
     """
     Returns dict with:
       n_raw, n_kept, mean, sd, cv, arv
     """
-    raw = [v for v in series if not math.isnan(v)]
-    n_raw = len(raw)
+    valid_points = [(idx, val) for idx, val in enumerate(series) if not math.isnan(val)]
+    raw_values = [val for _, val in valid_points]
+    raw_indices = [idx for idx, _ in valid_points]
+    n_raw = len(raw_values)
 
     if not use_filter:
-        kept = raw
+        mask = [True] * n_raw
     else:
-        if filter_method == "global":
-            kept = filter_outliers_global(raw, k_sd=float(k_sd))
+        method_code = normalize_filter_method(filter_method)
+        if method_code == "std_from_mean":
+            mask = _filter_global_mask(raw_values, k_sd=float(k_sd))
+        elif method_code == "absolute_change":
+            mask = _filter_absolute_change_mask(raw_values, max_delta=float(delta_cutoff))
         else:
-            kept = filter_outliers_rolling_robust(raw, interval_s=interval_s,
-                                                  window_s=float(window_s),
-                                                  k_mad=float(k_mad))
+            mask = _filter_rolling_mask(
+                raw_values,
+                interval_s=interval_s,
+                window_s=float(window_s),
+                k_mad=float(k_mad),
+            )
+    kept = [val for val, keep in zip(raw_values, mask) if keep]
+    kept_indices = [idx for idx, keep in zip(raw_indices, mask) if keep]
+    excluded = [val for val, keep in zip(raw_values, mask) if not keep]
+    excluded_indices = [idx for idx, keep in zip(raw_indices, mask) if not keep]
+
     n_kept = len(kept)
     m = _pymean(kept) if n_kept else float("nan")
 
@@ -258,12 +505,15 @@ def compute_metrics(series, use_filter=False, filter_method="rolling", interval_
         "mean": m,
         "sd": sd,
         "cv": cv,
-        "arv": arv_val
+        "arv": arv_val,
+        "excluded_values": excluded,
+        "kept_indices": kept_indices,
+        "excluded_indices": excluded_indices,
     }
 
 
-def compute_all_for_file(path, start_s, end_s, use_filter, filter_method,
-                         k_sd, window_s, k_mad, layout_config=None):
+def compute_all_for_file(path, window_spec, use_filter, filter_method,
+                         k_sd, window_s, k_mad, delta_cutoff, layout_config=None):
     interval_s, series_map, channel_titles = load_series(path, layout_config=layout_config)
 
     layout_cfg = layout_config or LayoutConfig.default()
@@ -286,25 +536,48 @@ def compute_all_for_file(path, start_s, end_s, use_filter, filter_method,
     dbp_key = resolve_column(getattr(layout_cfg, "dbp_column", 3), "DBP")
     map_key = resolve_column(getattr(layout_cfg, "map_column", 4), "MAP")
 
-    sbp = select_window(series_map[sbp_key], interval_s, start_s, end_s)
-    dbp = select_window(series_map[dbp_key], interval_s, start_s, end_s)
-    mapp = select_window(series_map[map_key], interval_s, start_s, end_s)
+    comment_series = None
+    comment_column = getattr(layout_cfg, "comment_column", None)
+    if comment_column:
+        try:
+            comment_key = resolve_column(comment_column, "Comment")
+        except KeyError:
+            comment_key = None
+        if comment_key is not None and comment_key in series_map:
+            comment_series = series_map[comment_key]
+
+    n_samples = len(series_map[sbp_key])
+    start_idx, end_idx, start_time, end_time = resolve_window_spec(
+        window_spec,
+        interval_s,
+        n_samples,
+        comment_series,
+    )
+
+    sbp = series_map[sbp_key][start_idx:end_idx]
+    dbp = series_map[dbp_key][start_idx:end_idx]
+    mapp = series_map[map_key][start_idx:end_idx]
 
     ms_sbp = compute_metrics(
-        sbp, use_filter, filter_method, interval_s, k_sd, window_s, k_mad
+        sbp, use_filter, filter_method, interval_s, k_sd, window_s, k_mad, delta_cutoff
     )
     ms_dbp = compute_metrics(
-        dbp, use_filter, filter_method, interval_s, k_sd, window_s, k_mad
+        dbp, use_filter, filter_method, interval_s, k_sd, window_s, k_mad, delta_cutoff
     )
     ms_map = compute_metrics(
-        mapp, use_filter, filter_method, interval_s, k_sd, window_s, k_mad
+        mapp, use_filter, filter_method, interval_s, k_sd, window_s, k_mad, delta_cutoff
     )
+
+    time_points = [
+        (start_idx + i) * interval_s
+        for i in range(len(sbp))
+    ]
 
     return {
         "file": os.path.basename(path),
         "interval_s": interval_s,
-        "start_s": 0.0 if start_s is None else float(start_s),
-        "end_s": None if end_s is None else float(end_s),
+        "start_s": float(start_time),
+        "end_s": None if end_time is None else float(end_time),
 
         # SBP
         "n_SBP_raw": ms_sbp["n_raw"],
@@ -329,6 +602,29 @@ def compute_all_for_file(path, start_s, end_s, use_filter, filter_method,
         "SD_MAP": ms_map["sd"],
         "CV_MAP_pct": ms_map["cv"],
         "ARV_MAP": ms_map["arv"],
+        "excluded_values": {
+            "SBP": list(ms_sbp.get("excluded_values", [])),
+            "DBP": list(ms_dbp.get("excluded_values", [])),
+            "MAP": list(ms_map.get("excluded_values", [])),
+        },
+        "series": {
+            "time": time_points,
+            "SBP": {
+                "values": list(sbp),
+                "kept_indices": list(ms_sbp.get("kept_indices", [])),
+                "excluded_indices": list(ms_sbp.get("excluded_indices", [])),
+            },
+            "DBP": {
+                "values": list(dbp),
+                "kept_indices": list(ms_dbp.get("kept_indices", [])),
+                "excluded_indices": list(ms_dbp.get("excluded_indices", [])),
+            },
+            "MAP": {
+                "values": list(mapp),
+                "kept_indices": list(ms_map.get("kept_indices", [])),
+                "excluded_indices": list(ms_map.get("excluded_indices", [])),
+            },
+        },
     }
 
 # ----------------------------- Helpers for GUI -----------------------------
@@ -357,6 +653,129 @@ def parse_time_any(s):
         return int(h) * 3600 + int(m) * 60 + float(sec)
     raise ValueError("Time format must be seconds, mm:ss, or hh:mm:ss")
 
+
+def _time_to_index(time_s: Optional[float], interval_s: float, n_samples: int, is_start: bool) -> int:
+    if time_s is None:
+        return 0 if is_start else n_samples
+    if interval_s <= 0:
+        return 0 if is_start else n_samples
+    if is_start:
+        idx = int(math.floor(time_s / interval_s))
+    else:
+        idx = int(math.ceil(time_s / interval_s))
+    if idx < 0:
+        return 0
+    if idx > n_samples:
+        return n_samples
+    return idx
+
+
+def _find_comment_index(comments, text: str, find_last: bool = False) -> Optional[int]:
+    if not comments:
+        return None
+    needle = text.lower()
+    indices = range(len(comments) - 1, -1, -1) if find_last else range(len(comments))
+    for idx in indices:
+        comment = comments[idx]
+        if comment is None:
+            continue
+        if needle in str(comment).lower():
+            return idx
+    return None
+
+
+def resolve_window_spec(
+    window_spec: Dict[str, Dict[str, Any]],
+    interval_s: float,
+    series_length: int,
+    comments,
+) -> Tuple[int, int, float, Optional[float]]:
+    total_time = max(0.0, interval_s * series_length)
+
+    def resolve_endpoint(spec: Dict[str, Any], is_start: bool, label: str) -> Tuple[int, float]:
+        mode = (spec.get("mode") or "none").lower()
+        default_idx = 0 if is_start else series_length
+        default_time = 0.0 if is_start else total_time
+
+        if mode in ("none",):
+            return default_idx, (0.0 if is_start else total_time)
+
+        if mode == "time":
+            time_val = spec.get("value")
+            if time_val is None:
+                return default_idx, (0.0 if is_start else total_time)
+            time_val = float(time_val)
+            if time_val < 0:
+                time_val = 0.0
+            if time_val > total_time:
+                time_val = total_time
+            idx = _time_to_index(time_val, interval_s, series_length, is_start)
+            return idx, time_val
+
+        if mode == "epoch":
+            epoch_val = spec.get("value")
+            if epoch_val is None:
+                return default_idx, (0.0 if is_start else total_time)
+            epoch_val = int(epoch_val)
+            if is_start:
+                idx = max(0, min(series_length, epoch_val - 1))
+            else:
+                idx = max(0, min(series_length, epoch_val))
+            time_val = idx * interval_s
+            if time_val > total_time:
+                time_val = total_time
+            return idx, time_val
+
+        if mode == "comment":
+            if comments is None:
+                raise ValueError(f"{label} comment anchor requires a comment column to be configured.")
+            text = (spec.get("text") or "").strip()
+            if not text:
+                raise ValueError(f"{label} comment text is required to anchor the window.")
+            offset = float(spec.get("offset") or 0.0)
+            idx = _find_comment_index(comments, text, find_last=not is_start)
+            if idx is None:
+                raise ValueError(f"{label} comment containing '{text}' was not found.")
+            time_val = idx * interval_s + offset
+            if time_val < -1e-9:
+                raise ValueError(f"{label} comment offset places the window before the start of the data.")
+            if time_val > total_time + 1e-9:
+                raise ValueError(f"{label} comment offset places the window beyond the end of the data.")
+            idx = _time_to_index(time_val, interval_s, series_length, is_start)
+            return idx, time_val
+
+        raise ValueError(f"Unsupported window mode '{mode}'.")
+
+    start_spec = window_spec.get("start", {}) if window_spec else {}
+    end_spec = window_spec.get("end", {}) if window_spec else {}
+    start_idx, start_time = resolve_endpoint(start_spec, True, "Start")
+    end_idx, end_time = resolve_endpoint(end_spec, False, "End")
+
+    start_mode = (start_spec.get("mode") or "none").lower()
+    end_mode = (end_spec.get("mode") or "none").lower()
+    start_explicit = start_mode == "comment" or (
+        start_mode in ("time", "epoch") and start_spec.get("value") is not None
+    )
+    end_explicit = end_mode == "comment" or (
+        end_mode in ("time", "epoch") and end_spec.get("value") is not None
+    )
+
+    if end_idx < start_idx or (end_idx == start_idx and start_explicit and end_explicit):
+        raise ValueError("End boundary occurs before start boundary after resolving the window specification.")
+
+    if end_idx >= series_length and (end_spec.get("mode") in (None, "", "none") or end_spec.get("value") is None):
+        end_time = None
+    else:
+        if end_time is not None and end_time > total_time:
+            end_time = total_time
+
+    if start_time is None:
+        start_time = 0.0
+    if end_time is not None and end_time < 0:
+        end_time = 0.0
+
+    return start_idx, end_idx, start_time, end_time
+
 def fmt_float(x, digits=6):
     if x is None:
         return ""
@@ -380,6 +799,7 @@ class LayoutConfig:
     sbp_column: int = 2
     dbp_column: int = 3
     map_column: int = 4
+    comment_column: Optional[int] = None
 
     @classmethod
     def default(cls):
@@ -393,6 +813,7 @@ class LayoutConfig:
             sbp_column=2,
             dbp_column=3,
             map_column=4,
+            comment_column=None,
         )
 
     @classmethod
@@ -412,6 +833,9 @@ class LayoutConfig:
         sbp_column = parse_int(data.get("sbp_column"), 2)
         dbp_column = parse_int(data.get("dbp_column"), 3)
         map_column = parse_int(data.get("map_column"), 4)
+        comment_column = parse_int(data.get("comment_column"), None)
+        if comment_column is not None and comment_column < 2:
+            comment_column = None
 
         return cls(
             name=data.get("name", "Unnamed"),
@@ -423,6 +847,7 @@ class LayoutConfig:
             sbp_column=sbp_column,
             dbp_column=dbp_column,
             map_column=map_column,
+            comment_column=comment_column,
         )
 
     def to_dict(self):
@@ -450,24 +875,59 @@ class ARVApp(tk.Tk):
         # Preference state variables
         self.start_var = tk.StringVar(value="")
         self.end_var = tk.StringVar(value="")
+        self.start_mode_var = tk.StringVar(value="Time")
+        self.end_mode_var = tk.StringVar(value="Time")
+        self.start_epoch_var = tk.StringVar(value="")
+        self.end_epoch_var = tk.StringVar(value="")
+        self.start_comment_var = tk.StringVar(value="")
+        self.end_comment_var = tk.StringVar(value="")
+        self.start_offset_var = tk.StringVar(value="0")
+        self.end_offset_var = tk.StringVar(value="0")
         self.filter_on = tk.BooleanVar(value=False)
-        self.filter_method = tk.StringVar(value="rolling")
+        self.filter_method = tk.StringVar(value=FILTER_METHODS["moving_average"]["label"])
         self.k_sd_var = tk.StringVar(value="3.0")
         self.window_s_var = tk.StringVar(value="15")
         self.k_mad_var = tk.StringVar(value="4.0")
+        self.delta_cutoff_var = tk.StringVar(value="20")
+        self.output_std = tk.BooleanVar(value=True)
+        self.output_cov = tk.BooleanVar(value=True)
+        self.output_arv = tk.BooleanVar(value=True)
+        self.loess_span_var = tk.StringVar(value="0.3")
+        self.loess_degree_var = tk.StringVar(value="1")
 
         self._preferences_window = None
+        self._preferences_snapshot = None
+        self._start_mode_frames = {}
+        self._end_mode_frames = {}
+        self._filter_method_frames = {}
+        self._filter_method_combo = None
+        self._filter_method_inputs = []
         self._layout_window = None
         self._layout_preview_tree = None
+        self._layout_preview_row_tree = None
+        self._preview_y_scrollbar = None
+        self._preview_scroll_syncing = False
         self._layout_file_label_var = None
         self._layout_field_vars = {}
         self._layout_field_traces = []
         self._layout_config_combo = None
 
+        self._graph_window = None
+        self._graph_canvas = None
+        self._graph_figure = None
+        self._graph_ax = None
+        self._graph_file_combo = None
+        self._graph_exclusion_tree = None
+        self._graph_prev_button = None
+        self._graph_next_button = None
+        self._graph_selection_var = tk.StringVar()
+        self._graph_results_cache = []
+        self._graph_index = 0
+
         # Styling (optional nicer look)
-        style = ttk.Style(self)
+        self.style = ttk.Style(self)
         try:
-            style.theme_use("clam")
+            self.style.theme_use("clam")
         except Exception:
             pass
 
@@ -507,9 +967,10 @@ class ARVApp(tk.Tk):
 
         ttk.Button(controls, text="Compute", command=self.compute).pack(side=tk.RIGHT)
         ttk.Button(controls, text="Save CSV…", command=self.save_csv).pack(side=tk.RIGHT, padx=(0, 8))
+        ttk.Button(controls, text="View graphs", command=self.view_graphs).pack(side=tk.RIGHT, padx=(0, 8))
 
         # Results table
-        cols = (
+        self._tree_columns = (
             "file", "interval_s", "start_s", "end_s",
             "n_SBP_raw", "n_SBP_kept", "Mean_SBP", "SD_SBP", "CV_SBP_pct", "ARV_SBP",
             "n_DBP_raw", "n_DBP_kept", "Mean_DBP", "SD_DBP", "CV_DBP_pct", "ARV_DBP",
@@ -520,8 +981,8 @@ class ARVApp(tk.Tk):
         tree_container.rowconfigure(0, weight=1)
         tree_container.columnconfigure(0, weight=1)
 
-        self.tree = ttk.Treeview(tree_container, columns=cols, show="headings", height=18)
-        for c in cols:
+        self.tree = ttk.Treeview(tree_container, columns=self._tree_columns, show="headings", height=18)
+        for c in self._tree_columns:
             self.tree.heading(c, text=c)
             base_w = 100
             if c == "file":
@@ -530,7 +991,7 @@ class ARVApp(tk.Tk):
                 w = 110
             else:
                 w = base_w
-            self.tree.column(c, width=w, anchor=tk.CENTER)
+            self.tree.column(c, width=w, anchor=tk.CENTER, stretch=False)
         self.tree.grid(row=0, column=0, sticky="nsew")
 
         tree_y_scroll = ttk.Scrollbar(tree_container, orient=tk.VERTICAL, command=self.tree.yview)
@@ -538,6 +999,8 @@ class ARVApp(tk.Tk):
         tree_x_scroll = ttk.Scrollbar(tree_container, orient=tk.HORIZONTAL, command=self.tree.xview)
         tree_x_scroll.grid(row=1, column=0, sticky="ew")
         self.tree.configure(yscrollcommand=tree_y_scroll.set, xscrollcommand=tree_x_scroll.set)
+
+        self._apply_result_column_preferences()
 
         # Status bar
         self.status = tk.StringVar(value="Ready")
@@ -592,6 +1055,7 @@ class ARVApp(tk.Tk):
         self.update_file_list()
         for i in self.tree.get_children():
             self.tree.delete(i)
+        self._refresh_graph_window()
         self.status.set("Cleared files and results.")
 
     def update_file_list(self):
@@ -632,6 +1096,11 @@ class ARVApp(tk.Tk):
             columns = (columns,)
         if not columns:
             return
+        display_columns = tree.cget("displaycolumns")
+        if display_columns not in (None, "", "#all"):
+            if isinstance(display_columns, str):
+                display_columns = (display_columns,)
+            columns = display_columns
 
         try:
             body_font = tkfont.nametofont(tree.cget("font"))
@@ -653,7 +1122,33 @@ class ARVApp(tk.Tk):
             target_width = max(min_width, content_width + padding)
             if max_width is not None:
                 target_width = min(target_width, max_width)
-            tree.column(col, width=int(target_width))
+            tree.column(col, width=int(target_width), stretch=False)
+
+    def _scroll_preview_y(self, *args):
+        if self._layout_preview_tree is not None:
+            self._layout_preview_tree.yview(*args)
+
+    def _on_preview_y_scroll(self, source, first, last):
+        if self._preview_y_scrollbar is not None:
+            self._preview_y_scrollbar.set(first, last)
+
+        if self._preview_scroll_syncing:
+            return
+
+        other = self._layout_preview_row_tree if source == "data" else self._layout_preview_tree
+        if other is None:
+            return
+
+        try:
+            fraction = float(first)
+        except (TypeError, ValueError):
+            return
+
+        try:
+            self._preview_scroll_syncing = True
+            other.yview_moveto(fraction)
+        finally:
+            self._preview_scroll_syncing = False
 
     # --------------------------- Layout config logic ---------------------
 
@@ -801,6 +1296,22 @@ class ARVApp(tk.Tk):
         dbp_column = parse_column("dbp_column", "DBP", 2)
         map_column = parse_column("map_column", "MAP", 2)
 
+        comment_raw = self._layout_field_vars["comment_column"].get().strip()
+        comment_column = None
+        if comment_raw:
+            try:
+                comment_column = int(comment_raw)
+            except ValueError:
+                if quiet:
+                    return None
+                messagebox.showerror("Layout", "Comment column must be an integer or left blank.")
+                return None
+            if comment_column < 2:
+                if quiet:
+                    return None
+                messagebox.showerror("Layout", "Comment column must be 2 or greater.")
+                return None
+
         if None in (time_column, sbp_column, dbp_column, map_column):
             return None
 
@@ -814,6 +1325,7 @@ class ARVApp(tk.Tk):
             sbp_column=sbp_column,
             dbp_column=dbp_column,
             map_column=map_column,
+            comment_column=comment_column,
         )
 
     def _apply_layout_config_to_fields(self, layout):
@@ -829,6 +1341,10 @@ class ARVApp(tk.Tk):
         self._layout_field_vars["sbp_column"].set(str(layout.sbp_column))
         self._layout_field_vars["dbp_column"].set(str(layout.dbp_column))
         self._layout_field_vars["map_column"].set(str(layout.map_column))
+        if getattr(layout, "comment_column", None) is None:
+            self._layout_field_vars["comment_column"].set("")
+        else:
+            self._layout_field_vars["comment_column"].set(str(layout.comment_column))
 
     def _on_layout_config_selected(self, *_event):
         selected = self.layout_config_var.get()
@@ -920,45 +1436,793 @@ class ARVApp(tk.Tk):
         win.transient(self)
         win.resizable(False, False)
         self._preferences_window = win
-        win.protocol("WM_DELETE_WINDOW", lambda: self._close_preferences(win))
+        self._preferences_snapshot = self._export_preferences()
+        win.protocol("WM_DELETE_WINDOW", lambda: self._cancel_preferences(win))
 
         content = ttk.Frame(win, padding=16)
         content.pack(fill=tk.BOTH, expand=True)
+        self._filter_method_frames = {}
+        self._filter_method_inputs = []
+        self._filter_method_combo = None
 
         # Time window
         time_frame = ttk.LabelFrame(content, text="Time window")
         time_frame.pack(fill=tk.X, expand=True, pady=(0, 12))
+        time_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(time_frame, text="Start (s or mm:ss)").grid(row=0, column=0, sticky="w")
-        ttk.Entry(time_frame, textvariable=self.start_var, width=12).grid(row=0, column=1, padx=(8, 0))
-        ttk.Label(time_frame, text="End (s or mm:ss)").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(time_frame, textvariable=self.end_var, width=12).grid(row=1, column=1, padx=(8, 0), pady=(8, 0))
+        ttk.Label(
+            time_frame,
+            text="Choose how the analysis window boundaries should be resolved.",
+            foreground="gray",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
-        # Calculations
-        calc_frame = ttk.LabelFrame(content, text="Calculations")
-        calc_frame.pack(fill=tk.X, expand=True, pady=(0, 12))
+        ttk.Label(time_frame, text="Start anchor").grid(row=1, column=0, sticky="w")
+        start_mode_combo = ttk.Combobox(
+            time_frame,
+            textvariable=self.start_mode_var,
+            values=["Time", "Epoch", "Comment", "None"],
+            state="readonly",
+            width=14,
+        )
+        start_mode_combo.grid(row=1, column=1, sticky="ew")
 
-        ttk.Checkbutton(calc_frame, text="Apply artifact filtering", variable=self.filter_on).grid(row=0, column=0, sticky="w")
+        start_fields = ttk.Frame(time_frame)
+        start_fields.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 12))
+        start_fields.columnconfigure(0, weight=1)
 
-        ttk.Label(calc_frame, text="Filter method").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Combobox(calc_frame, textvariable=self.filter_method, values=["rolling", "global"], state="readonly", width=12).grid(row=1, column=1, padx=(12, 0), pady=(8, 0), sticky="w")
+        start_time_frame = ttk.Frame(start_fields)
+        ttk.Label(start_time_frame, text="Time (s or mm:ss)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(start_time_frame, textvariable=self.start_var, width=14).grid(row=0, column=1, padx=(8, 0))
 
-        ttk.Label(calc_frame, text="k_SD (global)").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(calc_frame, textvariable=self.k_sd_var, width=8).grid(row=2, column=1, padx=(12, 0), pady=(8, 0), sticky="w")
+        start_epoch_frame = ttk.Frame(start_fields)
+        ttk.Label(start_epoch_frame, text="Epoch # (1-based)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(start_epoch_frame, textvariable=self.start_epoch_var, width=14).grid(row=0, column=1, padx=(8, 0))
 
-        ttk.Label(calc_frame, text="Window seconds (rolling)").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(calc_frame, textvariable=self.window_s_var, width=8).grid(row=3, column=1, padx=(12, 0), pady=(8, 0), sticky="w")
+        start_comment_frame = ttk.Frame(start_fields)
+        start_comment_frame.columnconfigure(1, weight=1)
+        ttk.Label(start_comment_frame, text="Comment contains").grid(row=0, column=0, sticky="w")
+        ttk.Entry(start_comment_frame, textvariable=self.start_comment_var).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        ttk.Label(start_comment_frame, text="Offset (s or mm:ss)").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(start_comment_frame, textvariable=self.start_offset_var, width=14).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
 
-        ttk.Label(calc_frame, text="k_MAD (rolling)").grid(row=4, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(calc_frame, textvariable=self.k_mad_var, width=8).grid(row=4, column=1, padx=(12, 0), pady=(8, 12), sticky="w")
+        self._start_mode_frames = {
+            "Time": start_time_frame,
+            "Epoch": start_epoch_frame,
+            "Comment": start_comment_frame,
+            "None": ttk.Frame(start_fields),
+        }
+        # Placeholder for "None" mode
+        self._start_mode_frames["None"].grid_columnconfigure(0, weight=1)
 
-        for child in calc_frame.winfo_children():
-            child.grid_configure(padx=(0, 8))
+        ttk.Label(time_frame, text="End anchor").grid(row=3, column=0, sticky="w")
+        end_mode_combo = ttk.Combobox(
+            time_frame,
+            textvariable=self.end_mode_var,
+            values=["Time", "Epoch", "Comment", "None"],
+            state="readonly",
+            width=14,
+        )
+        end_mode_combo.grid(row=3, column=1, sticky="ew")
 
-        ttk.Button(content, text="Close", command=lambda: self._close_preferences(win)).pack(anchor="e")
+        end_fields = ttk.Frame(time_frame)
+        end_fields.grid(row=4, column=0, columnspan=2, sticky="ew")
+        end_fields.columnconfigure(0, weight=1)
+
+        end_time_frame = ttk.Frame(end_fields)
+        ttk.Label(end_time_frame, text="Time (s or mm:ss)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(end_time_frame, textvariable=self.end_var, width=14).grid(row=0, column=1, padx=(8, 0))
+
+        end_epoch_frame = ttk.Frame(end_fields)
+        ttk.Label(end_epoch_frame, text="Epoch # (1-based)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(end_epoch_frame, textvariable=self.end_epoch_var, width=14).grid(row=0, column=1, padx=(8, 0))
+
+        end_comment_frame = ttk.Frame(end_fields)
+        end_comment_frame.columnconfigure(1, weight=1)
+        ttk.Label(end_comment_frame, text="Comment contains").grid(row=0, column=0, sticky="w")
+        ttk.Entry(end_comment_frame, textvariable=self.end_comment_var).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        ttk.Label(end_comment_frame, text="Offset (s or mm:ss)").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(end_comment_frame, textvariable=self.end_offset_var, width=14).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+
+        self._end_mode_frames = {
+            "Time": end_time_frame,
+            "Epoch": end_epoch_frame,
+            "Comment": end_comment_frame,
+            "None": ttk.Frame(end_fields),
+        }
+        self._end_mode_frames["None"].grid_columnconfigure(0, weight=1)
+
+        ttk.Label(
+            time_frame,
+            text="Comment offsets accept positive seconds (after) and negative seconds (before) the comment, in s or mm:ss format.",
+            foreground="gray",
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        def _on_start_mode_change(*_args):
+            self._update_window_mode_frames()
+
+        def _on_end_mode_change(*_args):
+            self._update_window_mode_frames()
+
+        start_mode_combo.bind("<<ComboboxSelected>>", _on_start_mode_change)
+        end_mode_combo.bind("<<ComboboxSelected>>", _on_end_mode_change)
+
+        self._update_window_mode_frames()
+
+        # Artifact filtering
+        filter_frame = ttk.LabelFrame(content, text="Artifact filtering")
+        filter_frame.pack(fill=tk.X, expand=True, pady=(0, 12))
+        filter_frame.columnconfigure(1, weight=1)
+
+        ttk.Checkbutton(
+            filter_frame,
+            text="Apply artifact filtering",
+            variable=self.filter_on,
+            command=self._update_filter_controls_state,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        ttk.Label(filter_frame, text="Filter method").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        method_labels = [FILTER_METHODS[code]["label"] for code in FILTER_METHOD_ORDER]
+        method_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.filter_method,
+            values=method_labels,
+            state="readonly",
+            width=26,
+        )
+        method_combo.grid(row=1, column=1, padx=(12, 0), pady=(8, 0), sticky="w")
+        method_combo.bind("<<ComboboxSelected>>", self._update_filter_setting_frames)
+        self._filter_method_combo = method_combo
+
+        moving_frame = ttk.Frame(filter_frame)
+        moving_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(moving_frame, text="Window seconds").grid(row=0, column=0, sticky="w")
+        window_entry = ttk.Entry(moving_frame, textvariable=self.window_s_var, width=8)
+        window_entry.grid(row=0, column=1, sticky="w", padx=(12, 0))
+        ttk.Label(moving_frame, text="k_MAD").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        k_mad_entry = ttk.Entry(moving_frame, textvariable=self.k_mad_var, width=8)
+        k_mad_entry.grid(row=1, column=1, sticky="w", padx=(12, 0), pady=(6, 0))
+
+        delta_frame = ttk.Frame(filter_frame)
+        delta_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(delta_frame, text="Max delta").grid(row=0, column=0, sticky="w")
+        delta_entry = ttk.Entry(delta_frame, textvariable=self.delta_cutoff_var, width=8)
+        delta_entry.grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+        std_frame = ttk.Frame(filter_frame)
+        std_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(std_frame, text="k_SD").grid(row=0, column=0, sticky="w")
+        k_sd_entry = ttk.Entry(std_frame, textvariable=self.k_sd_var, width=8)
+        k_sd_entry.grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+        self._filter_method_frames = {
+            "moving_average": moving_frame,
+            "absolute_change": delta_frame,
+            "std_from_mean": std_frame,
+        }
+        self._filter_method_inputs = [window_entry, k_mad_entry, delta_entry, k_sd_entry]
+        for frame in self._filter_method_frames.values():
+            frame.grid_remove()
+
+        self._update_filter_setting_frames()
+        self._update_filter_controls_state()
+
+        # Output metrics
+        metrics_frame = ttk.LabelFrame(content, text="Output metrics")
+        metrics_frame.pack(fill=tk.X, expand=True, pady=(0, 12))
+        for col_idx in range(3):
+            metrics_frame.columnconfigure(col_idx, weight=1)
+        ttk.Label(
+            metrics_frame,
+            text="Choose which variability metrics should be included in tables and exports.",
+            foreground="gray",
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Checkbutton(
+            metrics_frame,
+            text="Standard deviation",
+            variable=self.output_std,
+            command=self._on_metric_preference_changed,
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(
+            metrics_frame,
+            text="Coefficient of Variation",
+            variable=self.output_cov,
+            command=self._on_metric_preference_changed,
+        ).grid(row=1, column=1, sticky="w", pady=(8, 0), padx=(16, 0))
+        ttk.Checkbutton(
+            metrics_frame,
+            text="Average real variability",
+            variable=self.output_arv,
+            command=self._on_metric_preference_changed,
+        ).grid(row=1, column=2, sticky="w", pady=(8, 0), padx=(16, 0))
+
+        graph_frame = ttk.LabelFrame(content, text="Graph visualization")
+        graph_frame.pack(fill=tk.X, expand=True, pady=(0, 12))
+        graph_frame.columnconfigure(1, weight=1)
+        ttk.Label(
+            graph_frame,
+            text="Configure LOESS smoothing used in blood pressure graphs.",
+            foreground="gray",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        ttk.Label(graph_frame, text="LOESS span (0-1)").grid(row=1, column=0, sticky="w")
+        ttk.Entry(graph_frame, textvariable=self.loess_span_var, width=10).grid(
+            row=1, column=1, sticky="w", padx=(12, 0)
+        )
+        ttk.Label(graph_frame, text="Polynomial degree").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        loess_degree_combo = ttk.Combobox(
+            graph_frame,
+            textvariable=self.loess_degree_var,
+            values=("1", "2"),
+            width=10,
+            state="readonly",
+        )
+        loess_degree_combo.grid(row=2, column=1, sticky="w", padx=(12, 0), pady=(8, 0))
+
+        buttons = ttk.Frame(content)
+        buttons.pack(fill=tk.X, expand=True)
+        ttk.Button(buttons, text="Cancel", command=lambda: self._cancel_preferences(win)).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(buttons, text="Save", command=lambda: self._save_preferences(win)).pack(side=tk.RIGHT)
 
         win.grab_set()
 
+    def _update_window_mode_frames(self):
+        start_mode = (self.start_mode_var.get() or "Time").title()
+        if self._start_mode_frames:
+            for frame in self._start_mode_frames.values():
+                frame.grid_forget()
+            active = self._start_mode_frames.get(start_mode) or self._start_mode_frames.get("Time")
+            if active is not None:
+                active.grid(row=0, column=0, sticky="ew")
+
+        end_mode = (self.end_mode_var.get() or "Time").title()
+        if self._end_mode_frames:
+            for frame in self._end_mode_frames.values():
+                frame.grid_forget()
+            active_end = self._end_mode_frames.get(end_mode) or self._end_mode_frames.get("Time")
+            if active_end is not None:
+                active_end.grid(row=0, column=0, sticky="ew")
+
+    def _result_display_columns(self):
+        columns = [
+            "file", "interval_s", "start_s", "end_s",
+            "n_SBP_raw", "n_SBP_kept", "Mean_SBP",
+        ]
+        if self.output_std.get():
+            columns.append("SD_SBP")
+        if self.output_cov.get():
+            columns.append("CV_SBP_pct")
+        if self.output_arv.get():
+            columns.append("ARV_SBP")
+
+        columns.extend(["n_DBP_raw", "n_DBP_kept", "Mean_DBP"])
+        if self.output_std.get():
+            columns.append("SD_DBP")
+        if self.output_cov.get():
+            columns.append("CV_DBP_pct")
+        if self.output_arv.get():
+            columns.append("ARV_DBP")
+
+        columns.extend(["n_MAP_raw", "n_MAP_kept", "Mean_MAP"])
+        if self.output_std.get():
+            columns.append("SD_MAP")
+        if self.output_cov.get():
+            columns.append("CV_MAP_pct")
+        if self.output_arv.get():
+            columns.append("ARV_MAP")
+
+        return columns
+
+    def _csv_headers(self):
+        headers = [
+            "file", "interval_s", "start_s", "end_s",
+            "n_SBP_raw", "n_SBP_kept", "Mean_SBP",
+        ]
+        if self.output_std.get():
+            headers.append("SD_SBP")
+        if self.output_cov.get():
+            headers.append("CV_SBP_pct")
+        if self.output_arv.get():
+            headers.append("ARV_SBP")
+
+        headers.extend(["n_DBP_raw", "n_DBP_kept", "Mean_DBP"])
+        if self.output_std.get():
+            headers.append("SD_DBP")
+        if self.output_cov.get():
+            headers.append("CV_DBP_pct")
+        if self.output_arv.get():
+            headers.append("ARV_DBP")
+
+        headers.extend(["n_MAP_raw", "n_MAP_kept", "Mean_MAP"])
+        if self.output_std.get():
+            headers.append("SD_MAP")
+        if self.output_cov.get():
+            headers.append("CV_MAP_pct")
+        if self.output_arv.get():
+            headers.append("ARV_MAP")
+
+        headers.append("error")
+        return headers
+
+    def _apply_result_column_preferences(self):
+        if getattr(self, "tree", None) is None:
+            return
+        display_columns = self._result_display_columns()
+        try:
+            self.tree.configure(displaycolumns=display_columns)
+        except tk.TclError:
+            return
+
+    def _on_metric_preference_changed(self, *_args):
+        self._apply_result_column_preferences()
+        self._autofit_tree_columns(self.tree, min_width=90, padding=28, max_width=None)
+
+    def _update_filter_setting_frames(self, *_args):
+        if not self._filter_method_frames:
+            return
+        method = normalize_filter_method(self.filter_method.get())
+        for frame in self._filter_method_frames.values():
+            frame.grid_remove()
+        selected = self._filter_method_frames.get(method)
+        if selected is not None:
+            selected.grid()
+
+    def _update_filter_controls_state(self, *_args):
+        enabled = bool(self.filter_on.get())
+        if self._filter_method_combo is not None:
+            try:
+                self._filter_method_combo.configure(state="readonly" if enabled else "disabled")
+            except tk.TclError:
+                pass
+        state = "normal" if enabled else "disabled"
+        for widget in getattr(self, "_filter_method_inputs", []):
+            try:
+                widget.configure(state=state)
+            except tk.TclError:
+                pass
+
+    def _format_result_row(self, result: Dict[str, Any]):
+        values = []
+        error_text = result.get("error")
+        for col in self._tree_columns:
+            if col == "file":
+                values.append(result.get("file", ""))
+            elif error_text:
+                values.append("ERROR")
+            else:
+                values.append(fmt_float(result.get(col), 6))
+        return values
+
+    def _graphable_results(self) -> List[Dict[str, Any]]:
+        ready = []
+        for res in self.results:
+            if not isinstance(res, dict):
+                continue
+            if res.get("error"):
+                continue
+            if res.get("series"):
+                ready.append(res)
+        return ready
+
+    def _close_graph_window(self):
+        win = self._graph_window
+        if win is not None and win.winfo_exists():
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+        self._graph_window = None
+        self._graph_canvas = None
+        self._graph_figure = None
+        self._graph_ax = None
+        self._graph_file_combo = None
+        self._graph_exclusion_tree = None
+        self._graph_prev_button = None
+        self._graph_next_button = None
+        self._graph_results_cache = []
+        self._graph_selection_var.set("")
+        self._graph_index = 0
+
+    def _refresh_graph_window(self):
+        if self._graph_window is None or not self._graph_window.winfo_exists():
+            return
+        self._graph_results_cache = self._graphable_results()
+        if not self._graph_results_cache:
+            self._graph_index = 0
+        else:
+            self._graph_index = max(0, min(self._graph_index, len(self._graph_results_cache) - 1))
+        self._update_graph_controls()
+        self._update_graph_content()
+
+    def _update_graph_controls(self):
+        names = [res.get("file", "") for res in self._graph_results_cache]
+        if self._graph_file_combo is not None:
+            try:
+                self._graph_file_combo["values"] = names
+            except tk.TclError:
+                pass
+            if names:
+                idx = max(0, min(self._graph_index, len(names) - 1))
+                try:
+                    self._graph_file_combo.current(idx)
+                except tk.TclError:
+                    pass
+                self._graph_selection_var.set(names[idx])
+            else:
+                self._graph_selection_var.set("")
+                try:
+                    self._graph_file_combo.set("")
+                except tk.TclError:
+                    pass
+        state_prev = "normal" if self._graph_index > 0 else "disabled"
+        state_next = "normal" if self._graph_results_cache and self._graph_index < len(self._graph_results_cache) - 1 else "disabled"
+        if self._graph_prev_button is not None:
+            try:
+                self._graph_prev_button.configure(state=state_prev)
+            except tk.TclError:
+                pass
+        if self._graph_next_button is not None:
+            try:
+                self._graph_next_button.configure(state=state_next)
+            except tk.TclError:
+                pass
+
+    def _get_loess_parameters(self) -> Tuple[float, int]:
+        try:
+            span = float(self.loess_span_var.get())
+        except Exception:
+            span = 0.3
+        if span <= 0:
+            span = 0.1
+        if span > 1:
+            span = 1.0
+        try:
+            degree = int(float(self.loess_degree_var.get()))
+        except Exception:
+            degree = 1
+        degree = 2 if degree >= 2 else 1
+        return span, degree
+
+    def _update_graph_content(self):
+        ax = self._graph_ax
+        canvas = self._graph_canvas
+        tree = self._graph_exclusion_tree
+        if ax is None or canvas is None:
+            return
+        ax.clear()
+        results = self._graph_results_cache
+        if not results:
+            ax.text(0.5, 0.5, "No computed results", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            canvas.draw_idle()
+            if tree is not None:
+                tree.delete(*tree.get_children())
+                tree.insert("", tk.END, values=("No excluded values", "", ""))
+                self._autofit_tree_columns(tree, min_width=80, padding=24, max_width=None)
+            return
+
+        ax.set_axis_on()
+        result = results[self._graph_index]
+        series = result.get("series", {})
+        times = series.get("time") or []
+        span, degree = self._get_loess_parameters()
+
+        excluded_rows = []
+        shown_excluded_label = False
+        for measure in MEASURE_ORDER:
+            color = PLOT_SERIES_COLORS.get(measure, "#444444")
+            measure_data = series.get(measure, {}) or {}
+            values = measure_data.get("values") or []
+            excluded_indices = set(measure_data.get("excluded_indices") or [])
+            n = min(len(values), len(times))
+            kept_x, kept_y = [], []
+            excluded_x, excluded_y = [], []
+            loess_x, loess_y = [], []
+            for idx in range(n):
+                val = values[idx]
+                t = times[idx]
+                if math.isnan(val):
+                    continue
+                loess_x.append(t)
+                loess_y.append(val)
+                if idx in excluded_indices:
+                    excluded_x.append(t)
+                    excluded_y.append(val)
+                    excluded_rows.append((measure, t, val))
+                else:
+                    kept_x.append(t)
+                    kept_y.append(val)
+            if kept_x:
+                ax.scatter(kept_x, kept_y, s=28, color=color, edgecolor="white", linewidths=0.3, label=f"{measure}")
+            if excluded_x:
+                label = "Excluded" if not shown_excluded_label else None
+                ax.scatter(excluded_x, excluded_y, s=32, color="#000000", marker="o", label=label)
+                shown_excluded_label = True
+            if len(loess_x) >= 2:
+                loess_vals = compute_loess_line(loess_x, loess_y, frac=span, degree=degree)
+                if loess_vals:
+                    sorted_points = sorted(zip(loess_x, loess_vals), key=lambda item: item[0])
+                    xs = [pt[0] for pt in sorted_points]
+                    ys = [pt[1] for pt in sorted_points]
+                    ax.plot(xs, ys, color=_lighten_color(color, 0.5), linewidth=2.0, label=f"{measure} LOESS")
+
+        ax.set_title(f"Blood pressure vs time – {result.get('file', '')}")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Blood pressure")
+        ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+        ax.legend(loc="best")
+        canvas.draw_idle()
+
+        if tree is not None:
+            tree.delete(*tree.get_children())
+            if not excluded_rows:
+                tree.insert("", tk.END, values=("None", "", ""))
+            else:
+                excluded_rows.sort(key=lambda item: item[1])
+                for measure, timestamp, value in excluded_rows:
+                    tree.insert(
+                        "",
+                        tk.END,
+                        values=(measure, format_time_stamp(timestamp), fmt_float(value, 6)),
+                    )
+            self._autofit_tree_columns(tree, min_width=80, padding=24, max_width=None)
+
+    def _change_graph_index(self, delta: int):
+        if not self._graph_results_cache:
+            return
+        new_idx = max(0, min(self._graph_index + delta, len(self._graph_results_cache) - 1))
+        if new_idx == self._graph_index:
+            return
+        self._graph_index = new_idx
+        self._update_graph_controls()
+        self._update_graph_content()
+
+    def _on_graph_combo_selected(self, *_args):
+        if self._graph_file_combo is None:
+            return
+        try:
+            idx = self._graph_file_combo.current()
+        except tk.TclError:
+            idx = -1
+        if idx is None or idx < 0:
+            return
+        if idx != self._graph_index:
+            self._graph_index = idx
+            self._update_graph_controls()
+            self._update_graph_content()
+
+    def view_graphs(self):
+        graphable = self._graphable_results()
+        if not graphable:
+            messagebox.showinfo("No graphs", "Compute results before viewing graphs.")
+            return
+        if self._graph_window is not None and self._graph_window.winfo_exists():
+            self._graph_results_cache = graphable
+            self._graph_index = max(0, min(self._graph_index, len(graphable) - 1))
+            self._update_graph_controls()
+            self._update_graph_content()
+            self._graph_window.lift()
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Blood pressure graphs")
+        win.transient(self)
+        win.resizable(True, True)
+        self._graph_window = win
+        win.protocol("WM_DELETE_WINDOW", self._close_graph_window)
+
+        container = ttk.Frame(win, padding=12)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        top_controls = ttk.Frame(container)
+        top_controls.pack(fill=tk.X)
+
+        combo = ttk.Combobox(
+            top_controls,
+            textvariable=self._graph_selection_var,
+            state="readonly",
+            width=40,
+        )
+        combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        combo.bind("<<ComboboxSelected>>", self._on_graph_combo_selected)
+
+        prev_btn = ttk.Button(top_controls, text="<", width=3, command=lambda: self._change_graph_index(-1))
+        prev_btn.pack(side=tk.LEFT, padx=(8, 0))
+        next_btn = ttk.Button(top_controls, text=">", width=3, command=lambda: self._change_graph_index(1))
+        next_btn.pack(side=tk.LEFT, padx=(4, 0))
+
+        main_pane = ttk.PanedWindow(container, orient=tk.HORIZONTAL)
+        main_pane.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
+
+        figure_frame = ttk.Frame(main_pane)
+        main_pane.add(figure_frame, weight=3)
+        side_frame = ttk.Frame(main_pane)
+        main_pane.add(side_frame, weight=1)
+
+        fig = Figure(figsize=(6, 4), dpi=100)
+        ax = fig.add_subplot(111)
+        canvas = FigureCanvasTkAgg(fig, master=figure_frame)
+        canvas_widget = canvas.get_tk_widget()
+        canvas_widget.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(side_frame, text="Excluded values", anchor="w").pack(fill=tk.X, pady=(0, 4))
+        tree = ttk.Treeview(side_frame, columns=("measure", "time", "value"), show="headings", height=16)
+        tree.heading("measure", text="Measure")
+        tree.heading("time", text="Time")
+        tree.heading("value", text="Value")
+        tree.column("measure", anchor=tk.W, width=90)
+        tree.column("time", anchor=tk.W, width=110)
+        tree.column("value", anchor=tk.E, width=90)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        y_scroll = ttk.Scrollbar(side_frame, orient=tk.VERTICAL, command=tree.yview)
+        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.configure(yscrollcommand=y_scroll.set)
+
+        self._graph_canvas = canvas
+        self._graph_figure = fig
+        self._graph_ax = ax
+        self._graph_file_combo = combo
+        self._graph_exclusion_tree = tree
+        self._graph_prev_button = prev_btn
+        self._graph_next_button = next_btn
+        self._graph_results_cache = graphable
+        self._graph_index = 0
+
+        self._update_graph_controls()
+        self._update_graph_content()
+
+
+    def _export_preferences(self) -> Dict[str, Any]:
+        return {
+            "start_mode": self.start_mode_var.get(),
+            "start_time": self.start_var.get(),
+            "start_epoch": self.start_epoch_var.get(),
+            "start_comment": self.start_comment_var.get(),
+            "start_offset": self.start_offset_var.get(),
+            "end_mode": self.end_mode_var.get(),
+            "end_time": self.end_var.get(),
+            "end_epoch": self.end_epoch_var.get(),
+            "end_comment": self.end_comment_var.get(),
+            "end_offset": self.end_offset_var.get(),
+            "filter_on": bool(self.filter_on.get()),
+            "filter_method": self.filter_method.get(),
+            "k_sd": self.k_sd_var.get(),
+            "window_s": self.window_s_var.get(),
+            "k_mad": self.k_mad_var.get(),
+            "delta_cutoff": self.delta_cutoff_var.get(),
+            "show_std": bool(self.output_std.get()),
+            "show_cov": bool(self.output_cov.get()),
+            "show_arv": bool(self.output_arv.get()),
+            "loess_span": self.loess_span_var.get(),
+            "loess_degree": self.loess_degree_var.get(),
+        }
+
+    def _restore_preferences(self, snapshot: Optional[Dict[str, Any]]):
+        if not snapshot:
+            return
+        self.start_mode_var.set(snapshot.get("start_mode", "Time"))
+        self.start_var.set(snapshot.get("start_time", ""))
+        self.start_epoch_var.set(snapshot.get("start_epoch", ""))
+        self.start_comment_var.set(snapshot.get("start_comment", ""))
+        self.start_offset_var.set(snapshot.get("start_offset", "0"))
+        self.end_mode_var.set(snapshot.get("end_mode", "Time"))
+        self.end_var.set(snapshot.get("end_time", ""))
+        self.end_epoch_var.set(snapshot.get("end_epoch", ""))
+        self.end_comment_var.set(snapshot.get("end_comment", ""))
+        self.end_offset_var.set(snapshot.get("end_offset", "0"))
+        self.filter_on.set(bool(snapshot.get("filter_on", False)))
+        saved_method = snapshot.get("filter_method", FILTER_METHODS["moving_average"]["label"])
+        self.filter_method.set(filter_label_from_value(saved_method))
+        self.k_sd_var.set(snapshot.get("k_sd", "3.0"))
+        self.window_s_var.set(snapshot.get("window_s", "15"))
+        self.k_mad_var.set(snapshot.get("k_mad", "4.0"))
+        delta_value = snapshot.get("delta_cutoff", "20")
+        if delta_value is None:
+            delta_text = "20"
+        elif delta_value == "":
+            delta_text = ""
+        else:
+            delta_text = str(delta_value)
+        self.delta_cutoff_var.set(delta_text)
+        self.output_std.set(bool(snapshot.get("show_std", True)))
+        self.output_cov.set(bool(snapshot.get("show_cov", True)))
+        self.output_arv.set(bool(snapshot.get("show_arv", True)))
+        self.loess_span_var.set(snapshot.get("loess_span", "0.3"))
+        self.loess_degree_var.set(str(snapshot.get("loess_degree", "1")))
+        self._update_window_mode_frames()
+        self._update_filter_setting_frames()
+        self._update_filter_controls_state()
+        self._apply_result_column_preferences()
+
+    def _parse_offset_seconds(self, value: str) -> float:
+        text = (value or "").strip()
+        if not text:
+            return 0.0
+        sign = 1.0
+        if text[0] in "+-":
+            if text[0] == "-":
+                sign = -1.0
+            text = text[1:].strip()
+        if not text:
+            return 0.0
+        if text.lower().endswith("s"):
+            text = text[:-1].strip()
+        if not text:
+            return 0.0
+        if ":" in text:
+            seconds = parse_time_any(text)
+        else:
+            seconds = float(text)
+        return sign * float(seconds)
+
+    def _parse_window_endpoint(
+        self,
+        label: str,
+        mode_var: tk.StringVar,
+        time_var: tk.StringVar,
+        epoch_var: tk.StringVar,
+        comment_var: tk.StringVar,
+        offset_var: tk.StringVar,
+    ) -> Dict[str, Any]:
+        mode = (mode_var.get() or "None").strip().lower()
+        if mode == "time":
+            raw = (time_var.get() or "").strip()
+            if not raw:
+                return {"mode": "time", "value": None}
+            try:
+                value = parse_time_any(raw)
+            except Exception as exc:
+                raise ValueError(f"{label} time: {exc}") from exc
+            return {"mode": "time", "value": value}
+        if mode == "epoch":
+            raw_epoch = (epoch_var.get() or "").strip()
+            if not raw_epoch:
+                return {"mode": "epoch", "value": None}
+            try:
+                epoch_val = int(raw_epoch)
+            except ValueError as exc:
+                raise ValueError(f"{label} epoch must be an integer.") from exc
+            if epoch_val < 1:
+                raise ValueError(f"{label} epoch must be 1 or greater.")
+            return {"mode": "epoch", "value": epoch_val}
+        if mode == "comment":
+            comment_text = (comment_var.get() or "").strip()
+            if not comment_text:
+                raise ValueError(f"{label} comment text is required to anchor the window.")
+            offset_raw = (offset_var.get() or "").strip()
+            try:
+                offset_val = self._parse_offset_seconds(offset_raw)
+            except Exception as exc:
+                raise ValueError(f"{label} comment offset is invalid: {exc}") from exc
+            return {"mode": "comment", "text": comment_text, "offset": offset_val}
+        return {"mode": "none"}
+
+    def _build_window_spec(self) -> Dict[str, Dict[str, Any]]:
+        start_spec = self._parse_window_endpoint(
+            "Start",
+            self.start_mode_var,
+            self.start_var,
+            self.start_epoch_var,
+            self.start_comment_var,
+            self.start_offset_var,
+        )
+        end_spec = self._parse_window_endpoint(
+            "End",
+            self.end_mode_var,
+            self.end_var,
+            self.end_epoch_var,
+            self.end_comment_var,
+            self.end_offset_var,
+        )
+        return {"start": start_spec, "end": end_spec}
+
+    def _save_preferences(self, window):
+        self._preferences_snapshot = None
+        self._close_preferences(window)
+
+    def _cancel_preferences(self, window):
+        if self._preferences_snapshot is not None:
+            self._restore_preferences(self._preferences_snapshot)
+        self._close_preferences(window)
     def open_layout_dialog(self):
         if self._layout_window is not None and self._layout_window.winfo_exists():
             self._layout_window.lift()
@@ -1034,6 +2298,7 @@ class ARVApp(tk.Tk):
             "sbp_column",
             "dbp_column",
             "map_column",
+            "comment_column",
         ]
         for name in field_names:
             self._layout_field_vars[name] = tk.StringVar()
@@ -1131,13 +2396,24 @@ class ARVApp(tk.Tk):
         )
         map_spin.grid(row=3, column=1, sticky="w", pady=(0, 6))
 
+        ttk.Label(mapping_frame, text="Comment column").grid(row=4, column=0, sticky="w", pady=(0, 6))
+        comment_spin = spinbox_cls(
+            mapping_frame,
+            from_=2,
+            to=9999,
+            width=10,
+            textvariable=self._layout_field_vars["comment_column"],
+            increment=1,
+        )
+        comment_spin.grid(row=4, column=1, sticky="w", pady=(0, 6))
+
         ttk.Label(
             mapping_frame,
             text="Columns are 1-based. Use the preview below to verify how delimiters split your file.",
             foreground="gray",
             wraplength=520,
             justify=tk.LEFT,
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         preview_frame = ttk.LabelFrame(container, text="Preview of data file")
         preview_frame.grid(row=2, column=0, sticky="nsew", pady=(16, 0))
@@ -1147,19 +2423,43 @@ class ARVApp(tk.Tk):
         preview_container = ttk.Frame(preview_frame)
         preview_container.grid(row=0, column=0, sticky="nsew")
         preview_container.rowconfigure(0, weight=1)
-        preview_container.columnconfigure(0, weight=1)
+        preview_container.columnconfigure(1, weight=1)
 
-        preview_tree = ttk.Treeview(preview_container, show="headings")
-        preview_tree.grid(row=0, column=0, sticky="nsew")
+        style = self.style
+        style.configure("Preview.RowNumbers.Treeview", background="#f3f4f6", fieldbackground="#f3f4f6")
+        style.configure("Preview.RowNumbers.Treeview.Heading", background="#e5e7eb", foreground="#111827")
 
-        preview_y_scroll = ttk.Scrollbar(preview_container, orient=tk.VERTICAL, command=preview_tree.yview)
-        preview_y_scroll.grid(row=0, column=1, sticky="ns")
+        row_tree = ttk.Treeview(
+            preview_container,
+            columns=("row",),
+            show="headings",
+            selectmode="none",
+            style="Preview.RowNumbers.Treeview",
+            height=18,
+        )
+        row_tree.heading("row", text="#")
+        row_tree.column("row", width=60, anchor=tk.E, stretch=False)
+        row_tree.grid(row=0, column=0, sticky="ns")
+        row_tree.tag_configure("header", background="#eef2ff")
+        row_tree.tag_configure("data_start", background="#e6ffef")
+
+        preview_tree = ttk.Treeview(preview_container, show="headings", height=18)
+        preview_tree.grid(row=0, column=1, sticky="nsew")
+
+        preview_y_scroll = ttk.Scrollbar(preview_container, orient=tk.VERTICAL, command=self._scroll_preview_y)
+        preview_y_scroll.grid(row=0, column=2, sticky="ns")
         preview_x_scroll = ttk.Scrollbar(preview_container, orient=tk.HORIZONTAL, command=preview_tree.xview)
-        preview_x_scroll.grid(row=1, column=0, sticky="ew")
-        preview_tree.configure(yscrollcommand=preview_y_scroll.set, xscrollcommand=preview_x_scroll.set)
+        preview_x_scroll.grid(row=1, column=1, sticky="ew")
+        preview_tree.configure(
+            yscrollcommand=lambda f, l: self._on_preview_y_scroll("data", f, l),
+            xscrollcommand=preview_x_scroll.set,
+        )
+        row_tree.configure(yscrollcommand=lambda f, l: self._on_preview_y_scroll("row", f, l))
         preview_tree.tag_configure("header", background="#eef2ff")
         preview_tree.tag_configure("data_start", background="#e6ffef")
         self._layout_preview_tree = preview_tree
+        self._layout_preview_row_tree = row_tree
+        self._preview_y_scrollbar = preview_y_scroll
 
         buttons = ttk.Frame(container)
         buttons.grid(row=3, column=0, sticky="e", pady=(16, 0))
@@ -1170,15 +2470,26 @@ class ARVApp(tk.Tk):
         self._update_layout_preview()
 
     def _close_preferences(self, window):
-        if window.winfo_exists():
+        try:
+            exists = window.winfo_exists()
+        except Exception:
+            exists = False
+        if exists:
             window.destroy()
         self._preferences_window = None
+        self._preferences_snapshot = None
+        self._start_mode_frames = {}
+        self._end_mode_frames = {}
+        self._refresh_graph_window()
 
     def _close_layout(self, window):
         if window.winfo_exists():
             window.destroy()
         self._layout_window = None
         self._layout_preview_tree = None
+        self._layout_preview_row_tree = None
+        self._preview_y_scrollbar = None
+        self._preview_scroll_syncing = False
         for var, trace in self._layout_field_traces:
             try:
                 var.trace_remove("write", trace)
@@ -1196,8 +2507,11 @@ class ARVApp(tk.Tk):
             return
 
         tree = self._layout_preview_tree
+        row_tree = self._layout_preview_row_tree
         tree.configure(columns=(), displaycolumns=())
         tree.delete(*tree.get_children())
+        if row_tree is not None:
+            row_tree.delete(*row_tree.get_children())
 
         if not self.filepaths:
             columns = ("message",)
@@ -1208,6 +2522,8 @@ class ARVApp(tk.Tk):
             if self._layout_file_label_var is not None:
                 self._layout_file_label_var.set("No file selected.")
             self._autofit_tree_columns(tree, min_width=200, padding=24, max_width=None)
+            if row_tree is not None:
+                self._autofit_tree_columns(row_tree, min_width=40, padding=18, max_width=80)
             return
 
         selection = self.files_list.curselection()
@@ -1237,6 +2553,8 @@ class ARVApp(tk.Tk):
                 values=(f"Could not load preview for {os.path.basename(path)}: {exc}",),
             )
             self._autofit_tree_columns(tree, min_width=200, padding=24, max_width=None)
+            if row_tree is not None:
+                self._autofit_tree_columns(row_tree, min_width=40, padding=18, max_width=80)
             return
 
         if not snippet:
@@ -1246,6 +2564,8 @@ class ARVApp(tk.Tk):
             tree.column("message", anchor=tk.W, stretch=True)
             tree.insert("", tk.END, values=(f"{os.path.basename(path)} is empty.",))
             self._autofit_tree_columns(tree, min_width=200, padding=24, max_width=None)
+            if row_tree is not None:
+                self._autofit_tree_columns(row_tree, min_width=40, padding=18, max_width=80)
             return
 
         try:
@@ -1256,7 +2576,7 @@ class ARVApp(tk.Tk):
                 if separator == " ":
                     cells = text.split()
                 else:
-                    cells = text.split(separator)
+                    cells = _split_preserving_trailing(text, separator)
                 parsed_rows.append((lineno, cells))
                 if len(cells) > max_cols:
                     max_cols = len(cells)
@@ -1271,28 +2591,36 @@ class ARVApp(tk.Tk):
                 values=(f"Could not parse preview for {os.path.basename(path)}: {exc}",),
             )
             self._autofit_tree_columns(tree, min_width=200, padding=24, max_width=None)
+            if row_tree is not None:
+                self._autofit_tree_columns(row_tree, min_width=40, padding=18, max_width=80)
             return
 
-        columns = ["row"] + [f"col_{i}" for i in range(1, max_cols + 1)]
+        if max_cols == 0:
+            max_cols = 1
+
+        columns = [f"col_{i}" for i in range(1, max_cols + 1)]
         tree.configure(columns=columns, displaycolumns=columns)
 
-        tree.heading("row", text="Row")
-        tree.column("row", anchor=tk.E, stretch=False)
         for idx in range(1, max_cols + 1):
             col_id = f"col_{idx}"
-            tree.heading(col_id, text=f"Col {idx}")
-            tree.column(col_id, anchor=tk.W, stretch=True)
+            tree.heading(col_id, text=str(idx))
+            tree.column(col_id, anchor=tk.W, stretch=False)
 
         for lineno, cells in parsed_rows:
-            values = [str(lineno)] + [cell for cell in cells] + [""] * (max_cols - len(cells))
-            tags = []
+            row_tags = []
             if header_lines and lineno <= header_lines:
-                tags.append("header")
+                row_tags.append("header")
             if first_data_row and lineno == first_data_row:
-                tags.append("data_start")
-            tree.insert("", tk.END, values=values, tags=tags)
+                row_tags.append("data_start")
+
+            padded_cells = [cell for cell in cells] + [""] * (max_cols - len(cells))
+            if row_tree is not None:
+                row_tree.insert("", tk.END, values=(str(lineno),), tags=row_tags)
+            tree.insert("", tk.END, values=padded_cells, tags=row_tags)
 
         self._autofit_tree_columns(tree, min_width=60, padding=24, max_width=None)
+        if row_tree is not None:
+            self._autofit_tree_columns(row_tree, min_width=40, padding=18, max_width=80)
 
     def open_about(self):
         win = tk.Toplevel(self)
@@ -1309,18 +2637,14 @@ class ARVApp(tk.Tk):
             return
 
         try:
-            start_s = parse_time_any(self.start_var.get())
-            end_s = parse_time_any(self.end_var.get())
-            if start_s is not None and end_s is not None and end_s <= start_s:
-                messagebox.showwarning("Time window", "End time must be greater than start time.")
-                return
-        except Exception as e:
-            messagebox.showerror("Invalid time", f"Could not parse time: {e}")
+            window_spec = self._build_window_spec()
+        except ValueError as exc:
+            messagebox.showerror("Time window", str(exc))
             return
 
         # parse filter params
         use_filter = bool(self.filter_on.get())
-        method = self.filter_method.get()
+        method = normalize_filter_method(self.filter_method.get())
         try:
             k_sd = float(self.k_sd_var.get())
         except Exception:
@@ -1333,6 +2657,10 @@ class ARVApp(tk.Tk):
             k_mad = float(self.k_mad_var.get())
         except Exception:
             k_mad = 4.0
+        try:
+            delta_cutoff = float(self.delta_cutoff_var.get())
+        except Exception:
+            delta_cutoff = 0.0
 
         # compute
         self.results = []
@@ -1340,49 +2668,32 @@ class ARVApp(tk.Tk):
         for i in self.tree.get_children():
             self.tree.delete(i)
 
+        self._apply_result_column_preferences()
+
         errors = 0
         for p in self.filepaths:
             try:
                 res = compute_all_for_file(
-                    p, start_s, end_s,
+                    p, window_spec,
                     use_filter=use_filter,
                     filter_method=method,
                     k_sd=k_sd,
                     window_s=window_s,
                     k_mad=k_mad,
+                    delta_cutoff=delta_cutoff,
                     layout_config=self._get_active_layout(),
                 )
+                res["error"] = ""
                 self.results.append(res)
-                self.tree.insert("", tk.END, values=(
-                    res["file"],
-                    fmt_float(res["interval_s"]),
-                    fmt_float(res["start_s"]),
-                    fmt_float(res["end_s"]),
-
-                    fmt_float(res["n_SBP_raw"], 6), fmt_float(res["n_SBP_kept"], 6),
-                    fmt_float(res["Mean_SBP"], 6), fmt_float(res["SD_SBP"], 6),
-                    fmt_float(res["CV_SBP_pct"], 6), fmt_float(res["ARV_SBP"], 6),
-
-                    fmt_float(res["n_DBP_raw"], 6), fmt_float(res["n_DBP_kept"], 6),
-                    fmt_float(res["Mean_DBP"], 6), fmt_float(res["SD_DBP"], 6),
-                    fmt_float(res["CV_DBP_pct"], 6), fmt_float(res["ARV_DBP"], 6),
-
-                    fmt_float(res["n_MAP_raw"], 6), fmt_float(res["n_MAP_kept"], 6),
-                    fmt_float(res["Mean_MAP"], 6), fmt_float(res["SD_MAP"], 6),
-                    fmt_float(res["CV_MAP_pct"], 6), fmt_float(res["ARV_MAP"], 6),
-                ))
+                self.tree.insert("", tk.END, values=self._format_result_row(res))
             except Exception as e:
                 errors += 1
-                self.tree.insert("", tk.END, values=(
-                    os.path.basename(p), "", "", "",
-                    "", "", "", "", "", "ERROR",
-                    "", "", "", "", "", "ERROR",
-                    "", "", "", "", "", "ERROR",
-                ))
-                self.results.append({
+                error_entry = {
                     "file": os.path.basename(p),
                     "error": str(e),
-                })
+                }
+                self.results.append(error_entry)
+                self.tree.insert("", tk.END, values=self._format_result_row(error_entry))
 
         self._autofit_tree_columns(self.tree, min_width=90, padding=28, max_width=None)
 
@@ -1390,6 +2701,7 @@ class ARVApp(tk.Tk):
             self.status.set(f"Done with {len(self.results)} result(s). {errors} file(s) had errors (see table).")
         else:
             self.status.set(f"Done. Computed metrics for {len(self.results)} file(s).")
+        self._refresh_graph_window()
 
     def save_csv(self):
         if not self.results:
@@ -1403,13 +2715,7 @@ class ARVApp(tk.Tk):
         if not path:
             return
 
-        headers = [
-            "file", "interval_s", "start_s", "end_s",
-            "n_SBP_raw", "n_SBP_kept", "Mean_SBP", "SD_SBP", "CV_SBP_pct", "ARV_SBP",
-            "n_DBP_raw", "n_DBP_kept", "Mean_DBP", "SD_DBP", "CV_DBP_pct", "ARV_DBP",
-            "n_MAP_raw", "n_MAP_kept", "Mean_MAP", "SD_MAP", "CV_MAP_pct", "ARV_MAP",
-            "error"
-        ]
+        headers = self._csv_headers()
 
         rows = []
         for r in self.results:

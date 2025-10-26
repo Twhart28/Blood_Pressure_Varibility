@@ -3,17 +3,6 @@
   "configs": [
     {
       "name": "Default",
-      "header_lines": 9,
-      "first_data_row": 10,
-      "separator": "\t",
-      "decimal": ".",
-      "time_column": 1,
-      "sbp_column": 2,
-      "dbp_column": 3,
-      "map_column": 4
-    },
-    {
-      "name": "LabChart Txt Files",
       "header_lines": 6,
       "first_data_row": 7,
       "separator": "\t",
@@ -21,7 +10,20 @@
       "time_column": 1,
       "sbp_column": 8,
       "dbp_column": 7,
-      "map_column": 11
+      "map_column": 11,
+      "comment_column": null
+    },
+    {
+      "name": "LabChart Txt Files",
+      "header_lines": 9,
+      "first_data_row": 10,
+      "separator": "\t",
+      "decimal": ".",
+      "time_column": 1,
+      "sbp_column": 8,
+      "dbp_column": 7,
+      "map_column": 11,
+      "comment_column": 17
     }
   ]
 }
