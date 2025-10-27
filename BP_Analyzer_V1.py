@@ -161,6 +161,208 @@ def prompt_for_delimiter(
     return interpret_delimiter(response)
 
 
+class DelimiterSelectionDialog:
+    """Tkinter dialog that lets users choose a delimiter interactively."""
+
+    _CUSTOM_SENTINEL = "__custom__"
+
+    def __init__(
+        self,
+        detected: str,
+        sample_line: str,
+        detected_from_sniffer: bool,
+        fallback: str = ",",
+    ) -> None:
+        self._default_delimiter = detected or fallback
+        self._sample_line = sample_line
+        self._detected_from_sniffer = detected_from_sniffer
+        self._result: Optional[str] = self._default_delimiter
+
+        self.root = tk.Tk()
+        self.root.title("Select Delimiter")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close_attempt)
+
+        self._selection = tk.StringVar(value=self._default_delimiter)
+        self._custom_value = tk.StringVar()
+        self._status_message = tk.StringVar(value="")
+        self._column_count_var = tk.StringVar(value="")
+
+        self._build_widgets()
+        self._update_preview()
+
+    # ------------------------------------------------------------------
+    def _build_widgets(self) -> None:
+        frame = tk.Frame(self.root, padx=10, pady=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        title = tk.Label(
+            frame,
+            text="Choose the delimiter that matches your file",
+            font=("TkDefaultFont", 11, "bold"),
+        )
+        title.pack(anchor=tk.W)
+
+        description = self._build_description()
+        if description:
+            tk.Label(frame, text=description, wraplength=420, justify=tk.LEFT).pack(
+                anchor=tk.W, pady=(4, 8)
+            )
+
+        if self._sample_line:
+            sample_frame = tk.LabelFrame(frame, text="Sample row from file")
+            sample_frame.pack(fill=tk.X, pady=(0, 10))
+            sample_text = tk.Text(sample_frame, height=3, wrap=tk.NONE)
+            sample_text.insert(tk.END, self._sample_line)
+            sample_text.configure(state=tk.DISABLED)
+            sample_text.pack(fill=tk.X)
+
+        options_frame = tk.Frame(frame)
+        options_frame.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(options_frame, text="Common delimiters:").pack(anchor=tk.W)
+
+        options_container = tk.Frame(options_frame)
+        options_container.pack(fill=tk.X, pady=(2, 6))
+
+        for delimiter in self._candidate_delimiters():
+            display = self._format_option_label(delimiter)
+            tk.Radiobutton(
+                options_container,
+                text=display,
+                value=delimiter,
+                variable=self._selection,
+                command=self._update_preview,
+                anchor=tk.W,
+                justify=tk.LEFT,
+                padx=5,
+            ).pack(fill=tk.X, anchor=tk.W)
+
+        custom_frame = tk.Frame(frame)
+        custom_frame.pack(fill=tk.X, pady=(6, 10))
+
+        tk.Radiobutton(
+            custom_frame,
+            text="Custom delimiter:",
+            value=self._CUSTOM_SENTINEL,
+            variable=self._selection,
+            command=self._update_preview,
+        ).pack(side=tk.LEFT)
+
+        entry = tk.Entry(custom_frame, textvariable=self._custom_value, width=12)
+        entry.pack(side=tk.LEFT, padx=(6, 0))
+        entry.bind("<FocusIn>", lambda _event: self._selection.set(self._CUSTOM_SENTINEL))
+        self._custom_value.trace_add("write", lambda *_args: self._update_preview())
+
+        preview_frame = tk.LabelFrame(frame, text="Preview")
+        preview_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        self._preview_text = tk.Text(preview_frame, height=6, wrap=tk.NONE)
+        self._preview_text.configure(state=tk.DISABLED)
+        self._preview_text.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(frame, textvariable=self._column_count_var).pack(anchor=tk.W)
+        status = tk.Label(frame, textvariable=self._status_message, fg="#b22222")
+        status.pack(fill=tk.X, pady=(4, 0))
+
+        buttons = tk.Frame(frame)
+        buttons.pack(fill=tk.X, pady=(10, 0))
+
+        tk.Button(buttons, text="Cancel", command=self._on_close_attempt).pack(side=tk.RIGHT)
+        tk.Button(buttons, text="Confirm", command=self._confirm).pack(
+            side=tk.RIGHT, padx=(0, 6)
+        )
+
+    # ------------------------------------------------------------------
+    def _build_description(self) -> str:
+        if self._detected_from_sniffer:
+            message = _format_delimiter_for_display(self._default_delimiter)
+            return f"Automatically detected delimiter: {message}."
+        if self._default_delimiter:
+            message = _format_delimiter_for_display(self._default_delimiter)
+            return (
+                "Unable to confidently detect the delimiter. "
+                f"Defaulting to {message}. Choose a different option if needed."
+            )
+        return ""
+
+    # ------------------------------------------------------------------
+    def _candidate_delimiters(self) -> List[str]:
+        candidates: List[str] = []
+        seen = set()
+        for delimiter in [self._default_delimiter] + COMMON_DELIMITERS:
+            if delimiter and delimiter not in seen:
+                seen.add(delimiter)
+                candidates.append(delimiter)
+        if not candidates:
+            candidates.append(",")
+        return candidates
+
+    # ------------------------------------------------------------------
+    def _format_option_label(self, delimiter: str) -> str:
+        label = _format_delimiter_for_display(delimiter)
+        if self._sample_line:
+            columns = len(self._sample_line.split(delimiter))
+            return f"{label} — {columns} column(s) in sample"
+        return label
+
+    # ------------------------------------------------------------------
+    def _resolve_selection(self) -> Optional[str]:
+        selected = self._selection.get()
+        if selected == self._CUSTOM_SENTINEL:
+            value = self._custom_value.get().strip()
+            if not value:
+                return None
+            return interpret_delimiter(value)
+        return selected
+
+    # ------------------------------------------------------------------
+    def _update_preview(self) -> None:
+        delimiter = self._resolve_selection()
+        if delimiter is None:
+            self._status_message.set("Enter a custom delimiter to preview the data.")
+            columns = []
+        else:
+            self._status_message.set("")
+            columns = (
+                self._sample_line.split(delimiter) if self._sample_line and delimiter else []
+            )
+
+        self._column_count_var.set(
+            f"Columns detected: {len(columns)}" if columns else "Columns detected: 0"
+        )
+
+        self._preview_text.configure(state=tk.NORMAL)
+        self._preview_text.delete("1.0", tk.END)
+        if columns:
+            for index, value in enumerate(columns, start=1):
+                self._preview_text.insert(tk.END, f"{index}. {value}\n")
+        else:
+            self._preview_text.insert(
+                tk.END,
+                "No preview available. Adjust the delimiter or ensure the sample row is not empty.",
+            )
+        self._preview_text.configure(state=tk.DISABLED)
+
+    # ------------------------------------------------------------------
+    def _confirm(self) -> None:
+        delimiter = self._resolve_selection()
+        if delimiter is None:
+            self._status_message.set("Provide a custom delimiter before confirming.")
+            return
+        self._result = delimiter
+        self.root.destroy()
+
+    # ------------------------------------------------------------------
+    def _on_close_attempt(self) -> None:
+        self._result = self._resolve_selection() or self._default_delimiter
+        self.root.destroy()
+
+    # ------------------------------------------------------------------
+    def show(self) -> str:
+        self.root.mainloop()
+        return self._result or self._default_delimiter
+
+
 def determine_delimiter(args: argparse.Namespace) -> str:
     """Resolve the delimiter from CLI arguments or interactive selection."""
 
@@ -170,7 +372,8 @@ def determine_delimiter(args: argparse.Namespace) -> str:
     detected, sample_line, detected_from_sniffer = detect_delimiter(
         args.file, args.encoding
     )
-    return prompt_for_delimiter(detected, sample_line, detected_from_sniffer)
+    dialog = DelimiterSelectionDialog(detected, sample_line, detected_from_sniffer)
+    return dialog.show()
 
 
 def read_header_row(config: ParserConfig) -> Optional[List[str]]:
