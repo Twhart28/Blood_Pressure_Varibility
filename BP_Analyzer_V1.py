@@ -66,7 +66,111 @@ def interpret_delimiter(raw: str) -> str:
     """Convert user provided delimiter strings such as "\\t" into literals."""
 
     escape_map = {"\\t": "\t", "\\n": "\n", "\\r": "\r"}
-    return escape_map.get(raw, raw)
+    alias_map = {
+        "tab": "\t",
+        "space": " ",
+        "comma": ",",
+        "semicolon": ";",
+        "pipe": "|",
+        "colon": ":",
+    }
+    if raw in escape_map:
+        return escape_map[raw]
+
+    normalized = raw.lower()
+    if normalized in alias_map:
+        return alias_map[normalized]
+
+    return raw
+
+
+COMMON_DELIMITERS = [",", "\t", ";", "|", ":", " "]
+
+
+def detect_delimiter(
+    file_path: str,
+    encoding: str,
+    sample_size: int = 4096,
+    fallback: str = ",",
+) -> tuple[str, str, bool]:
+    """Attempt to infer a delimiter from a text sample."""
+
+    sample_line = ""
+    detected = fallback
+    detected_from_sniffer = False
+
+    try:
+        with open(file_path, "r", encoding=encoding, newline="") as handle:
+            sample = handle.read(sample_size)
+            if not sample:
+                return detected, sample_line, detected_from_sniffer
+            if "\n" not in sample:
+                sample += handle.readline()
+            sample_line = sample.splitlines()[0] if sample else ""
+
+            sniffer = csv.Sniffer()
+            dialect = sniffer.sniff(sample, delimiters=COMMON_DELIMITERS)
+            detected = dialect.delimiter
+            detected_from_sniffer = True
+    except (csv.Error, OSError, UnicodeDecodeError):
+        pass
+
+    return detected, sample_line, detected_from_sniffer
+
+
+def _format_delimiter_for_display(delimiter: str) -> str:
+    """Return a human-readable label for a delimiter."""
+
+    labels = {
+        "\t": "\\t (tab)",
+        " ": "' ' (space)",
+        ",": "',' (comma)",
+        ";": "';' (semicolon)",
+        "|": "'|' (pipe)",
+        ":": "':' (colon)",
+    }
+    return labels.get(delimiter, repr(delimiter))
+
+
+def prompt_for_delimiter(
+    detected: str,
+    sample_line: str,
+    detected_from_sniffer: bool,
+) -> str:
+    """Ask the user to accept or override an inferred delimiter."""
+
+    print("\nDelimiter selection")
+    if sample_line:
+        print("Sample row:")
+        print(sample_line)
+
+    description = _format_delimiter_for_display(detected)
+    if detected_from_sniffer:
+        message = f"Detected delimiter appears to be {description}."
+    else:
+        message = f"Could not automatically determine delimiter; defaulting to {description}."
+
+    response = input(
+        message
+        + " Press Enter to accept or type a custom delimiter (use \\t for tab, 'space' for a space, etc.): "
+    ).strip()
+
+    if not response:
+        return detected
+
+    return interpret_delimiter(response)
+
+
+def determine_delimiter(args: argparse.Namespace) -> str:
+    """Resolve the delimiter from CLI arguments or interactive selection."""
+
+    if args.delimiter:
+        return interpret_delimiter(args.delimiter)
+
+    detected, sample_line, detected_from_sniffer = detect_delimiter(
+        args.file, args.encoding
+    )
+    return prompt_for_delimiter(detected, sample_line, detected_from_sniffer)
 
 
 def read_header_row(config: ParserConfig) -> Optional[List[str]]:
@@ -434,8 +538,8 @@ def parse_cli_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--delimiter",
-        help="Column delimiter (default: comma). Use \\t for tab.",
-        default=",",
+        help="Column delimiter. Leave unset to auto-detect with an interactive prompt. Use \\t for tab.",
+        default=None,
     )
     parser.add_argument(
         "--na",
@@ -467,8 +571,7 @@ def parse_cli_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_config_from_args(args: argparse.Namespace) -> ParserConfig:
-    delimiter = interpret_delimiter(args.delimiter)
+def build_config_from_args(args: argparse.Namespace, delimiter: str) -> ParserConfig:
     na_values = [token.strip() for token in args.na.split(",") if token.strip()]
 
     return ParserConfig(
@@ -500,7 +603,8 @@ def main() -> None:
             print("No file selected. Exiting.")
             return
         args.file = selected_file
-    config = build_config_from_args(args)
+    delimiter = determine_delimiter(args)
+    config = build_config_from_args(args, delimiter)
     run_interactive_session(config)
 
 
