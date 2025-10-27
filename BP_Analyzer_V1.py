@@ -23,7 +23,7 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 
 import tkinter as tk
 from tkinter import filedialog, ttk
@@ -194,6 +194,37 @@ def _format_delimiter_for_display(delimiter: str) -> str:
         ":": "':' (colon)",
     }
     return labels.get(delimiter, repr(delimiter))
+
+
+def _normalise_column_names(column_names: Sequence[Any]) -> List[str]:
+    """Return column names with blanks filled and duplicates disambiguated."""
+
+    seen: Dict[str, int] = {}
+    emitted: Dict[str, int] = {}
+    normalised: List[str] = []
+    for index, raw_name in enumerate(column_names, start=1):
+        base_name = ""
+        if raw_name is not None:
+            base_name = str(raw_name).strip()
+
+        if not base_name:
+            base_name = f"column_{index}"
+
+        occurrence = seen.get(base_name, 0)
+        seen[base_name] = occurrence + 1
+
+        candidate = base_name if occurrence == 0 else f"{base_name}_{occurrence + 1}"
+        # Guard against corner cases where base_name already included a suffix that causes
+        # collisions once we append our own. Keep incrementing until unique.
+        while emitted.get(candidate, 0):
+            occurrence += 1
+            seen[base_name] = occurrence + 1
+            candidate = f"{base_name}_{occurrence + 1}"
+
+        emitted[candidate] = 1
+        normalised.append(candidate)
+
+    return normalised
 
 
 def prompt_for_delimiter(
@@ -562,16 +593,19 @@ def stream_dataframe_chunks(
     }
     if skip_initial_space:
         read_kwargs["skipinitialspace"] = True
+    normalised_for_reading: Optional[List[str]] = None
     if column_names:
-        read_kwargs["names"] = column_names
+        normalised_for_reading = _normalise_column_names(column_names)
+        read_kwargs["names"] = normalised_for_reading
 
     chunk_iterator = pd.read_csv(config.file_path, **read_kwargs)
 
-    inferred_names: Optional[List[str]] = column_names
+    assigned_names: Optional[List[str]] = normalised_for_reading
     for chunk in chunk_iterator:
-        if inferred_names is None:
-            inferred_names = [f"column_{idx + 1}" for idx in range(len(chunk.columns))]
-        chunk.columns = inferred_names
+        if assigned_names is None or len(assigned_names) != len(chunk.columns):
+            raw_names = chunk.columns.tolist()
+            assigned_names = _normalise_column_names(raw_names)
+        chunk.columns = assigned_names
         yield chunk
 
     if bad_line_stats["count"]:
