@@ -1625,7 +1625,7 @@ def detect_systolic_peaks(
             else:
                 idx += 1
 
-    rolling_window_seconds = 4.0
+    rolling_window_seconds = 0.2
     default_window = max(3, int(round(rolling_window_seconds * fs)))
     if default_window % 2 == 0:
         default_window += 1
