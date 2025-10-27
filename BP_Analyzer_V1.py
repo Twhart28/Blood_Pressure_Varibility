@@ -87,6 +87,43 @@ def interpret_delimiter(raw: str) -> str:
 COMMON_DELIMITERS = [",", "\t", ";", "|", ":", " "]
 
 
+def _tokenise_sample_line(line: str, delimiter: str) -> List[str]:
+    """Split a sample line using the candidate delimiter."""
+
+    if not line:
+        return []
+
+    if delimiter == " ":
+        stripped = line.strip()
+        if not stripped:
+            return []
+        return [token for token in stripped.split() if token]
+
+    try:
+        return next(csv.reader([line], delimiter=delimiter))
+    except csv.Error:
+        return line.split(delimiter)
+
+
+def _has_consistent_split(lines: List[str], delimiter: str) -> bool:
+    """Return True when all lines produce the same non-trivial column count."""
+
+    lengths: List[int] = []
+    saw_multiple_columns = False
+    for line in lines:
+        tokens = _tokenise_sample_line(line, delimiter)
+        if not tokens:
+            continue
+        lengths.append(len(tokens))
+        if len(tokens) > 1:
+            saw_multiple_columns = True
+
+    if not lengths or not saw_multiple_columns:
+        return False
+
+    return len(set(lengths)) == 1
+
+
 def detect_delimiter(
     file_path: str,
     encoding: str,
@@ -99,6 +136,8 @@ def detect_delimiter(
     detected = fallback
     detected_from_sniffer = False
 
+    candidate_lines: List[str] = []
+
     try:
         with open(file_path, "r", encoding=encoding, newline="") as handle:
             sample = handle.read(sample_size)
@@ -106,14 +145,39 @@ def detect_delimiter(
                 return detected, sample_line, detected_from_sniffer
             if "\n" not in sample:
                 sample += handle.readline()
-            sample_line = sample.splitlines()[0] if sample else ""
+
+            raw_lines = sample.splitlines()
+            while len(raw_lines) < 5:
+                extra_line = handle.readline()
+                if not extra_line:
+                    break
+                raw_lines.append(extra_line.rstrip("\r\n"))
+
+            candidate_lines = [line for line in raw_lines if line.strip()]
+            sample_line = candidate_lines[0] if candidate_lines else ""
 
             sniffer = csv.Sniffer()
             dialect = sniffer.sniff(sample, delimiters=COMMON_DELIMITERS)
-            detected = dialect.delimiter
-            detected_from_sniffer = True
+            if _has_consistent_split(candidate_lines, dialect.delimiter):
+                detected = dialect.delimiter
+                detected_from_sniffer = True
+            else:
+                # Let the heuristics below choose a more reliable delimiter.
+                detected_from_sniffer = False
     except (csv.Error, OSError, UnicodeDecodeError):
         pass
+
+    if not candidate_lines:
+        return detected, sample_line, detected_from_sniffer
+
+    sniffer_candidate = detected if detected_from_sniffer else None
+
+    if not detected_from_sniffer or detected == fallback:
+        for delimiter in [detected] + COMMON_DELIMITERS:
+            if delimiter and _has_consistent_split(candidate_lines, delimiter):
+                detected = delimiter
+                detected_from_sniffer = detected_from_sniffer and delimiter == sniffer_candidate
+                break
 
     return detected, sample_line, detected_from_sniffer
 
