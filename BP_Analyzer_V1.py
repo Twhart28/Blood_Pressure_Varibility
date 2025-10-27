@@ -534,6 +534,16 @@ def stream_dataframe_chunks(
     """Yield chunks of the dataset as pandas DataFrames."""
 
     skiprows = compute_skiprows(config)
+    bad_line_stats = {"count": 0, "examples": []}
+
+    def _handle_bad_line(bad_line: List[str]) -> Optional[List[str]]:
+        """Skip malformed rows while keeping track of a few examples."""
+
+        bad_line_stats["count"] += 1
+        if len(bad_line_stats["examples"]) < 3:
+            bad_line_stats["examples"].append(bad_line)
+        return None
+
     read_kwargs = {
         "sep": config.delimiter,
         "na_values": config.na_values,
@@ -542,6 +552,7 @@ def stream_dataframe_chunks(
         "header": None,
         "encoding": config.encoding,
         "engine": "python",
+        "on_bad_lines": _handle_bad_line,
     }
     if column_names:
         read_kwargs["names"] = column_names
@@ -554,6 +565,16 @@ def stream_dataframe_chunks(
             inferred_names = [f"column_{idx + 1}" for idx in range(len(chunk.columns))]
         chunk.columns = inferred_names
         yield chunk
+
+    if bad_line_stats["count"]:
+        example_lines = [
+            " | ".join(line) for line in bad_line_stats["examples"] if line
+        ]
+        preview = "; ".join(example_lines)
+        message = f"[Warning] Skipped {bad_line_stats['count']} malformed line(s)."
+        if preview:
+            message += f" Examples: {preview}"
+        print(message)
 
 
 def display_preview(chunk: pd.DataFrame, max_rows: int = 10) -> None:
