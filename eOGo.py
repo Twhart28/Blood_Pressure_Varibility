@@ -1516,7 +1516,6 @@ def detect_systolic_peaks(
     plateau_eps = max(0.02, 0.3 * velocity_scale)
     plateau_samples = max(1, int(round(0.5 * fs)))
     calibration_segments: List[Tuple[int, int]] = []
-    calibration_mask = np.zeros(signal.size, dtype=bool)
     if plateau_samples > 1:
         mask = np.abs(velocity) <= plateau_eps
         idx = 0
@@ -1527,7 +1526,6 @@ def detect_systolic_peaks(
                     idx += 1
                 if idx - start >= plateau_samples:
                     calibration_segments.append((start, idx))
-                    calibration_mask[start:idx] = True
             else:
                 idx += 1
 
@@ -1536,11 +1534,8 @@ def detect_systolic_peaks(
     if default_window % 2 == 0:
         default_window += 1
 
-    velocity_for_stats = positive_velocity.copy()
-    if calibration_mask.any():
-        velocity_for_stats[calibration_mask] = np.nan
-
-    local_medians, local_mads = _rolling_median_and_mad(velocity_for_stats, default_window)
+    local_medians = np.full(signal.size, np.nan, dtype=float)
+    local_mads = np.full(signal.size, np.nan, dtype=float)
 
     segment_boundaries: List[Tuple[int, int]] = []
     cursor = 0
@@ -1553,11 +1548,9 @@ def detect_systolic_peaks(
 
     for seg_start, seg_end in segment_boundaries:
         seg_len = seg_end - seg_start
-        if seg_len < 3 or seg_len >= default_window:
+        if seg_len < 3:
             continue
-        if not np.any(np.isnan(local_medians[seg_start:seg_end])):
-            continue
-        window = seg_len if seg_len % 2 == 1 else seg_len - 1
+        window = min(default_window, seg_len if seg_len % 2 == 1 else seg_len - 1)
         if window < 3:
             continue
         seg_med, seg_mad = _rolling_median_and_mad(positive_velocity[seg_start:seg_end], window)
