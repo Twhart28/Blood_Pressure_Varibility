@@ -512,8 +512,12 @@ def read_header_row(config: ParserConfig) -> Optional[List[str]]:
     if config.header_row is None:
         return None
 
+    skip_initial_space = config.delimiter == " "
+
     with open(config.file_path, "r", encoding=config.encoding, newline="") as handle:
-        reader = csv.reader(handle, delimiter=config.delimiter)
+        reader = csv.reader(
+            handle, delimiter=config.delimiter, skipinitialspace=skip_initial_space
+        )
         for index, row in enumerate(reader, start=1):
             if index == config.header_row:
                 return [value.strip() for value in row]
@@ -544,6 +548,8 @@ def stream_dataframe_chunks(
             bad_line_stats["examples"].append(bad_line)
         return None
 
+    skip_initial_space = config.delimiter == " "
+
     read_kwargs = {
         "sep": config.delimiter,
         "na_values": config.na_values,
@@ -554,6 +560,8 @@ def stream_dataframe_chunks(
         "engine": "python",
         "on_bad_lines": _handle_bad_line,
     }
+    if skip_initial_space:
+        read_kwargs["skipinitialspace"] = True
     if column_names:
         read_kwargs["names"] = column_names
 
