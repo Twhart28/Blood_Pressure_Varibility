@@ -127,54 +127,181 @@ def display_preview(chunk: pd.DataFrame, max_rows: int = 10) -> None:
     print(preview.to_string(index=False))
 
 
-def prompt_column_mapping(column_names: List[str]) -> Dict[str, str]:
-    """Interactively ask the user to map columns to the expected schema."""
+class ColumnMappingDialog:
+    """Tkinter dialog for mapping source columns to target fields."""
 
-    print("\nAvailable columns:")
-    for idx, name in enumerate(column_names, start=1):
-        print(f"  {idx}. {name}")
+    REQUIRED_TARGETS = ["Time", "Blood Pressure"]
+    OPTIONAL_TARGETS = ["Comments", "ECG"]
 
-    required_fields = ["Time", "Blood Pressure"]
-    optional_fields = ["Comments", "ECG"]
-    mapping: Dict[str, Optional[str]] = {}
+    def __init__(self, column_names: List[str]):
+        self.column_names = column_names
+        self._mapping: Dict[str, Optional[str]] = {
+            target: None for target in self.REQUIRED_TARGETS + self.OPTIONAL_TARGETS
+        }
+        self._result: Optional[Dict[str, str]] = None
 
-    def ask_for_field(field_name: str, required: bool) -> Optional[str]:
-        prompt = (
-            f"Enter the column name or number to use for '{field_name}'"
-            f" ({'required' if required else 'optional'})."
+        self.root = tk.Tk()
+        self.root.title("Map Columns to Targets")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close_attempt)
+
+        self._warning_var = tk.StringVar(value="")
+        self._target_order = self.REQUIRED_TARGETS + self.OPTIONAL_TARGETS
+
+        self._build_widgets()
+
+    def _build_widgets(self) -> None:
+        """Create and layout widgets for the dialog."""
+
+        frame = tk.Frame(self.root, padx=10, pady=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        lists_frame = tk.Frame(frame)
+        lists_frame.pack(fill=tk.BOTH, expand=True)
+
+        source_frame = tk.Frame(lists_frame)
+        source_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+
+        tk.Label(source_frame, text="Available Source Columns").pack(anchor=tk.W)
+        self.source_listbox = tk.Listbox(
+            source_frame,
+            exportselection=False,
+            height=12,
         )
-        while True:
-            user_input = input(f"{prompt} [press Enter to skip]: ").strip()
-            if not user_input and not required:
-                return None
-            if not user_input and required:
-                print("This field is required. Please choose a column.")
-                continue
-            if user_input.isdigit():
-                index = int(user_input) - 1
-                if 0 <= index < len(column_names):
-                    return column_names[index]
-                print("Invalid column number; please try again.")
-                continue
-            if user_input in column_names:
-                return user_input
-            print("Unrecognized column; please enter a valid column name or number.")
+        self.source_listbox.pack(fill=tk.BOTH, expand=True)
+        for name in self.column_names:
+            self.source_listbox.insert(tk.END, name)
 
-    for field in required_fields:
-        column = ask_for_field(field, required=True)
-        mapping[field] = column
+        controls_frame = tk.Frame(lists_frame)
+        controls_frame.pack(side=tk.LEFT, fill=tk.Y)
 
-    for field in optional_fields:
-        column = ask_for_field(field, required=False)
-        if column:
-            mapping[field] = column
+        tk.Button(
+            controls_frame,
+            text="Assign →",
+            command=self._assign_selected,
+            width=12,
+        ).pack(pady=(30, 5))
+        tk.Button(
+            controls_frame,
+            text="Clear Assignment",
+            command=self._clear_selected,
+            width=12,
+        ).pack()
 
-    # Sanity check for duplicate assignments.
-    chosen_columns = [col for col in mapping.values() if col]
-    if len(chosen_columns) != len(set(chosen_columns)):
-        raise ValueError("Each source column can only be assigned once.")
+        targets_frame = tk.Frame(lists_frame)
+        targets_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0))
 
-    return {k: v for k, v in mapping.items() if v}
+        tk.Label(targets_frame, text="Target Assignments").pack(anchor=tk.W)
+        self.target_listbox = tk.Listbox(
+            targets_frame,
+            exportselection=False,
+            height=12,
+        )
+        self.target_listbox.pack(fill=tk.BOTH, expand=True)
+
+        self._update_target_listbox()
+
+        warning_label = tk.Label(
+            frame,
+            textvariable=self._warning_var,
+            fg="#b22222",
+            wraplength=360,
+            justify=tk.LEFT,
+        )
+        warning_label.pack(fill=tk.X, pady=(10, 0))
+
+        buttons_frame = tk.Frame(frame)
+        buttons_frame.pack(fill=tk.X, pady=(10, 0))
+
+        tk.Button(buttons_frame, text="Confirm", command=self._confirm).pack(
+            side=tk.RIGHT
+        )
+
+    def _update_target_listbox(self) -> None:
+        """Refresh the entries in the target listbox."""
+
+        self.target_listbox.delete(0, tk.END)
+        for target in self._target_order:
+            assignment = self._mapping.get(target)
+            display_value = assignment if assignment else "—"
+            label = f"{target}: {display_value}"
+            self.target_listbox.insert(tk.END, label)
+
+        for index, target in enumerate(self._target_order):
+            if target in self.REQUIRED_TARGETS:
+                self.target_listbox.itemconfig(
+                    index,
+                    fg="#1f4b99",
+                    selectforeground="#ffffff",
+                    selectbackground="#1f4b99",
+                    font=("TkDefaultFont", 10, "bold"),
+                )
+
+    def _assign_selected(self) -> None:
+        source_selection = self.source_listbox.curselection()
+        target_selection = self.target_listbox.curselection()
+
+        if not source_selection or not target_selection:
+            self._warning_var.set("Select both a source column and a target slot to assign.")
+            return
+
+        source_column = self.column_names[source_selection[0]]
+        target_field = self._target_order[target_selection[0]]
+
+        if source_column in self._mapping.values() and self._mapping.get(target_field) != source_column:
+            self._warning_var.set(
+                f"'{source_column}' is already assigned. Clear the existing assignment before reusing it."
+            )
+            return
+
+        self._mapping[target_field] = source_column
+        self._warning_var.set("")
+        self._update_target_listbox()
+
+    def _clear_selected(self) -> None:
+        target_selection = self.target_listbox.curselection()
+        if not target_selection:
+            self._warning_var.set("Select a target slot to clear its assignment.")
+            return
+
+        target_field = self._target_order[target_selection[0]]
+        self._mapping[target_field] = None
+        self._warning_var.set("")
+        self._update_target_listbox()
+
+    def _confirm(self) -> None:
+        missing = [
+            target
+            for target in self.REQUIRED_TARGETS
+            if not self._mapping.get(target)
+        ]
+        if missing:
+            self._warning_var.set(
+                "Required targets missing assignments: " + ", ".join(missing)
+            )
+            return
+
+        self._result = {k: v for k, v in self._mapping.items() if v}
+        self.root.destroy()
+
+    def _on_close_attempt(self) -> None:
+        missing = [
+            target
+            for target in self.REQUIRED_TARGETS
+            if not self._mapping.get(target)
+        ]
+        if missing:
+            self._warning_var.set(
+                "Assign all required targets (Time, Blood Pressure) before closing."
+            )
+            return
+        self._result = {k: v for k, v in self._mapping.items() if v}
+        self.root.destroy()
+
+    def show(self) -> Dict[str, str]:
+        """Run the dialog and return the selected mapping."""
+
+        self.root.mainloop()
+        return self._result or {}
 
 
 def prompt_output_paths(default_path: str) -> tuple[str, str]:
@@ -284,7 +411,9 @@ def run_interactive_session(config: ParserConfig) -> None:
     column_names = list(first_chunk.columns)
 
     display_preview(first_chunk)
-    mapping = prompt_column_mapping(column_names)
+
+    dialog = ColumnMappingDialog(column_names)
+    mapping = dialog.show()
     parquet_path, manifest_path = prompt_output_paths(config.file_path)
 
     # Persist data to Parquet.
