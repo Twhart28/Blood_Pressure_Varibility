@@ -138,6 +138,7 @@ class ImportDialogResult:
     pressure_column_index: int
     comment_column: Optional[str] = None
     comment_column_index: Optional[int] = None
+    analysis_downsample: int = 1
 
 
 def _parse_list_field(raw_value: str) -> List[str]:
@@ -682,6 +683,17 @@ def launch_import_configuration_dialog(
         ("Colon (:)", ":"),
     ]
 
+    downsample_options: List[Tuple[str, int]] = [
+        ("Full resolution (1×)", 1),
+        ("Every 2nd sample (2×)", 2),
+        ("Every 4th sample (4×)", 4),
+        ("Every 5th sample (5×)", 5),
+        ("Every 10th sample (10×)", 10),
+        ("Every 20th sample (20×)", 20),
+        ("Every 50th sample (50×)", 50),
+        ("Every 100th sample (100×)", 100),
+    ]
+
     def _label_for_separator(value: Optional[str]) -> str:
         for label, candidate in delimiter_options:
             if value == candidate:
@@ -690,6 +702,18 @@ def launch_import_configuration_dialog(
 
     def _resolve_separator_from_label(label: str) -> Optional[str]:
         for option_label, value in delimiter_options:
+            if option_label == label:
+                return value
+        return None
+
+    def _label_for_downsample(value: int) -> str:
+        for label, candidate in downsample_options:
+            if value == candidate:
+                return label
+        return downsample_options[0][0]
+
+    def _resolve_downsample_from_label(label: str) -> Optional[int]:
+        for option_label, value in downsample_options:
             if option_label == label:
                 return value
         return None
@@ -841,6 +865,19 @@ def launch_import_configuration_dialog(
         state="disabled",
     )
     comment_entry.grid(row=2, column=3, sticky="w", padx=(8, 24), pady=(12, 0))
+
+    ttk.Label(controls_frame, text="Analysis downsampling:").grid(
+        row=3, column=0, sticky="w", pady=(12, 0)
+    )
+    analysis_downsample_var = tk.StringVar(value=_label_for_downsample(1))
+    analysis_downsample_combo = ttk.Combobox(
+        controls_frame,
+        state="readonly",
+        values=[label for label, _ in downsample_options],
+        textvariable=analysis_downsample_var,
+        width=28,
+    )
+    analysis_downsample_combo.grid(row=3, column=1, sticky="w", padx=(8, 24), pady=(12, 0))
 
     initial_comment_index: Optional[int] = None
     for idx, name in enumerate(preview.column_names, start=1):
@@ -1139,6 +1176,12 @@ def launch_import_configuration_dialog(
         if column_count <= 0:
             column_count = max(time_index, pressure_index)
 
+        downsample_label = analysis_downsample_var.get()
+        downsample_value = _resolve_downsample_from_label(downsample_label)
+        if downsample_value is None or downsample_value <= 0:
+            error_var.set("Select a valid analysis downsampling factor.")
+            return
+
         column_names = _derive_column_names(
             header_tokens,
             column_count,
@@ -1198,6 +1241,7 @@ def launch_import_configuration_dialog(
         else:
             result["comment_index"] = None
             result["comment_name"] = None
+        result["analysis_downsample"] = downsample_value
         result["separator"] = current_preview_state.get("separator")
         result["preview"] = updated_preview
         result["header_row"] = header_index
@@ -1236,6 +1280,7 @@ def launch_import_configuration_dialog(
         "first_data_row",
         "time_index",
         "pressure_index",
+        "analysis_downsample",
     }
     if required_keys.issubset(result.keys()):
         return ImportDialogResult(
@@ -1257,6 +1302,7 @@ def launch_import_configuration_dialog(
                 if isinstance(result.get("comment_index"), int)
                 else None
             ),
+            analysis_downsample=int(result["analysis_downsample"]),
         )
 
     return None
@@ -2529,6 +2575,7 @@ def main(argv: Sequence[str]) -> int:
     selected_pressure_column: Optional[str] = None
     dialog_shown = False
     dialog_result: Optional[ImportDialogResult] = None
+    analysis_downsample = 1
 
     if tk is not None:
         try:
@@ -2548,6 +2595,7 @@ def main(argv: Sequence[str]) -> int:
             separator_override = dialog_result.separator
             selected_time_column = dialog_result.time_column
             selected_pressure_column = dialog_result.pressure_column
+            analysis_downsample = max(1, int(dialog_result.analysis_downsample))
 
     print(f"Loaded file preview: {file_path}")
     print(f"\nColumn preview (first {preview.preview_rows} rows loaded for preview):")
@@ -2607,6 +2655,24 @@ def main(argv: Sequence[str]) -> int:
 
     if time is None or not np.any(np.isfinite(time)):
         time = np.arange(len(frame), dtype=np.float32) * np.float32(interval)
+
+    if analysis_downsample > 1:
+        downsampled_time = time[::analysis_downsample]
+        downsampled_pressure = pressure[::analysis_downsample]
+        if downsampled_time.size == 0 or downsampled_pressure.size == 0:
+            print(
+                "Warning: analysis downsampling factor removed all samples; using full resolution."
+            )
+            analysis_downsample = 1
+        else:
+            time = downsampled_time
+            pressure = downsampled_pressure
+            interval *= analysis_downsample
+            fs = 1.0 / interval if interval > 0 else fs / analysis_downsample
+            print(
+                "Applying analysis downsampling: "
+                f"using every {analysis_downsample}th sample (effective fs {fs:.3f} Hz)."
+            )
 
     config = ArtifactConfig(
         systolic_mad_multiplier=args.systolic_mad_multiplier,
