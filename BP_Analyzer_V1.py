@@ -223,7 +223,10 @@ class ColumnMappingDialog:
         for target in self._target_order:
             assignment = self._mapping.get(target)
             display_value = assignment if assignment else "—"
-            label = f"{target}: {display_value}"
+            if target in self.REQUIRED_TARGETS:
+                label = f"{target} (required): {display_value}"
+            else:
+                label = f"{target}: {display_value}"
             self.target_listbox.insert(tk.END, label)
 
         for index, target in enumerate(self._target_order):
@@ -233,7 +236,6 @@ class ColumnMappingDialog:
                     fg="#1f4b99",
                     selectforeground="#ffffff",
                     selectbackground="#1f4b99",
-                    font=("TkDefaultFont", 10, "bold"),
                 )
 
     def _assign_selected(self) -> None:
