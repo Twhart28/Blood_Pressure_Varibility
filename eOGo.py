@@ -16,9 +16,7 @@ landmarks.  It also prints summary statistics for the detected beats and
 flags potential artefacts using simple heuristics.
 
 Command-line flags allow overriding the column separator used when
-reading whitespace-heavy exports (``--separator``) and limiting the
-number of raw samples rendered in the interactive plot
-(``--plot-max-points``) to speed up large-file analysis.
+reading whitespace-heavy exports (``--separator``).
 """
 
 from __future__ import annotations
@@ -883,7 +881,7 @@ def launch_import_configuration_dialog(
     ttk.Label(controls_frame, text="Plot downsampling:").grid(
         row=3, column=2, sticky="w", pady=(12, 0)
     )
-    plot_downsample_var = tk.StringVar(value=_label_for_downsample(1))
+    plot_downsample_var = tk.StringVar(value=_label_for_downsample(10))
     plot_downsample_combo = ttk.Combobox(
         controls_frame,
         state="readonly",
@@ -2214,7 +2212,6 @@ def plot_waveform(
     *,
     show: bool = True,
     save_path: Optional[Path] = None,
-    max_points: Optional[int] = 50000,
     downsample_stride: int = 1,
 ) -> None:
     """Plot the waveform with annotated beat landmarks."""
@@ -2238,17 +2235,6 @@ def plot_waveform(
     else:
         plot_time = time_values
         plot_pressure = pressure_values
-
-    if max_points is not None and max_points > 0 and plot_time.size > max_points:
-        stride = int(math.ceil(plot_time.size / float(max_points)))
-        stride = max(1, stride)
-        downsampled_time = plot_time[::stride]
-        downsampled_pressure = plot_pressure[::stride]
-        if downsampled_time.size == 0 or downsampled_time[-1] != plot_time[-1]:
-            downsampled_time = np.append(downsampled_time, plot_time[-1])
-            downsampled_pressure = np.append(downsampled_pressure, plot_pressure[-1])
-        plot_time = downsampled_time
-        plot_pressure = downsampled_pressure
 
     plt.plot(plot_time, plot_pressure, label="reBAP", color="tab:blue")
 
@@ -2539,12 +2525,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--separator",
         help="Override the column separator if auto-detection fails (e.g., ',' or \\t).",
     )
-    parser.add_argument(
-        "--plot-max-points",
-        type=int,
-        default=50000,
-        help="Maximum waveform samples to render (set to 0 to disable downsampling).",
-    )
     parser.add_argument("--out", type=Path, help="Optional path to export the beat summary CSV.")
     parser.add_argument("--savefig", type=Path, help="Save the plot to this path instead of/as well as showing it.")
     parser.add_argument("--no-plot", action="store_true", help="Skip interactive plot display.")
@@ -2557,9 +2537,6 @@ def main(argv: Sequence[str]) -> int:
 
     if args.min_rr >= args.max_rr:
         parser.error("--min-rr must be less than --max-rr")
-
-    if args.plot_max_points is not None and args.plot_max_points < 0:
-        parser.error("--plot-max-points must be zero or a positive integer")
 
     separator_override: Optional[str] = None
     if args.separator:
@@ -2610,7 +2587,7 @@ def main(argv: Sequence[str]) -> int:
     dialog_shown = False
     dialog_result: Optional[ImportDialogResult] = None
     analysis_downsample = 1
-    plot_downsample = 1
+    plot_downsample = 10
 
     if tk is not None:
         try:
@@ -2825,7 +2802,6 @@ def main(argv: Sequence[str]) -> int:
             beats,
             show=show_plot,
             save_path=args.savefig,
-            max_points=None if args.plot_max_points == 0 else args.plot_max_points,
             downsample_stride=plot_downsample,
         )
 
