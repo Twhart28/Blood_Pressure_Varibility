@@ -139,6 +139,7 @@ class ImportDialogResult:
     comment_column: Optional[str] = None
     comment_column_index: Optional[int] = None
     analysis_downsample: int = 1
+    plot_downsample: int = 1
 
 
 def _parse_list_field(raw_value: str) -> List[str]:
@@ -879,6 +880,19 @@ def launch_import_configuration_dialog(
     )
     analysis_downsample_combo.grid(row=3, column=1, sticky="w", padx=(8, 24), pady=(12, 0))
 
+    ttk.Label(controls_frame, text="Plot downsampling:").grid(
+        row=3, column=2, sticky="w", pady=(12, 0)
+    )
+    plot_downsample_var = tk.StringVar(value=_label_for_downsample(1))
+    plot_downsample_combo = ttk.Combobox(
+        controls_frame,
+        state="readonly",
+        values=[label for label, _ in downsample_options],
+        textvariable=plot_downsample_var,
+        width=28,
+    )
+    plot_downsample_combo.grid(row=3, column=3, sticky="w", padx=(8, 24), pady=(12, 0))
+
     initial_comment_index: Optional[int] = None
     for idx, name in enumerate(preview.column_names, start=1):
         if str(name).strip().lower() == "comment":
@@ -1182,6 +1196,12 @@ def launch_import_configuration_dialog(
             error_var.set("Select a valid analysis downsampling factor.")
             return
 
+        plot_downsample_label = plot_downsample_var.get()
+        plot_downsample_value = _resolve_downsample_from_label(plot_downsample_label)
+        if plot_downsample_value is None or plot_downsample_value <= 0:
+            error_var.set("Select a valid plot downsampling factor.")
+            return
+
         column_names = _derive_column_names(
             header_tokens,
             column_count,
@@ -1242,6 +1262,7 @@ def launch_import_configuration_dialog(
             result["comment_index"] = None
             result["comment_name"] = None
         result["analysis_downsample"] = downsample_value
+        result["plot_downsample"] = plot_downsample_value
         result["separator"] = current_preview_state.get("separator")
         result["preview"] = updated_preview
         result["header_row"] = header_index
@@ -1281,6 +1302,7 @@ def launch_import_configuration_dialog(
         "time_index",
         "pressure_index",
         "analysis_downsample",
+        "plot_downsample",
     }
     if required_keys.issubset(result.keys()):
         return ImportDialogResult(
@@ -1303,6 +1325,7 @@ def launch_import_configuration_dialog(
                 else None
             ),
             analysis_downsample=int(result["analysis_downsample"]),
+            plot_downsample=int(result["plot_downsample"]),
         )
 
     return None
@@ -2192,6 +2215,7 @@ def plot_waveform(
     show: bool = True,
     save_path: Optional[Path] = None,
     max_points: Optional[int] = 50000,
+    downsample_stride: int = 1,
 ) -> None:
     """Plot the waveform with annotated beat landmarks."""
 
@@ -2202,19 +2226,29 @@ def plot_waveform(
     time_values = np.asarray(time, dtype=float)
     pressure_values = np.asarray(pressure, dtype=float)
 
-    if max_points is not None and max_points > 0 and time_values.size > max_points:
-        stride = int(math.ceil(time_values.size / float(max_points)))
-        stride = max(1, stride)
-        downsampled_time = time_values[::stride]
-        downsampled_pressure = pressure_values[::stride]
-        if downsampled_time.size == 0 or downsampled_time[-1] != time_values[-1]:
-            downsampled_time = np.append(downsampled_time, time_values[-1])
-            downsampled_pressure = np.append(downsampled_pressure, pressure_values[-1])
-        plot_time = downsampled_time
-        plot_pressure = downsampled_pressure
+    if downsample_stride is None or downsample_stride <= 0:
+        downsample_stride = 1
+
+    if downsample_stride > 1:
+        plot_time = time_values[::downsample_stride]
+        plot_pressure = pressure_values[::downsample_stride]
+        if plot_time.size == 0 or plot_time[-1] != time_values[-1]:
+            plot_time = np.append(plot_time, time_values[-1])
+            plot_pressure = np.append(plot_pressure, pressure_values[-1])
     else:
         plot_time = time_values
         plot_pressure = pressure_values
+
+    if max_points is not None and max_points > 0 and plot_time.size > max_points:
+        stride = int(math.ceil(plot_time.size / float(max_points)))
+        stride = max(1, stride)
+        downsampled_time = plot_time[::stride]
+        downsampled_pressure = plot_pressure[::stride]
+        if downsampled_time.size == 0 or downsampled_time[-1] != plot_time[-1]:
+            downsampled_time = np.append(downsampled_time, plot_time[-1])
+            downsampled_pressure = np.append(downsampled_pressure, plot_pressure[-1])
+        plot_time = downsampled_time
+        plot_pressure = downsampled_pressure
 
     plt.plot(plot_time, plot_pressure, label="reBAP", color="tab:blue")
 
@@ -2576,6 +2610,7 @@ def main(argv: Sequence[str]) -> int:
     dialog_shown = False
     dialog_result: Optional[ImportDialogResult] = None
     analysis_downsample = 1
+    plot_downsample = 1
 
     if tk is not None:
         try:
@@ -2596,6 +2631,7 @@ def main(argv: Sequence[str]) -> int:
             selected_time_column = dialog_result.time_column
             selected_pressure_column = dialog_result.pressure_column
             analysis_downsample = max(1, int(dialog_result.analysis_downsample))
+            plot_downsample = max(1, int(dialog_result.plot_downsample))
 
     print(f"Loaded file preview: {file_path}")
     print(f"\nColumn preview (first {preview.preview_rows} rows loaded for preview):")
@@ -2790,6 +2826,7 @@ def main(argv: Sequence[str]) -> int:
             show=show_plot,
             save_path=args.savefig,
             max_points=None if args.plot_max_points == 0 else args.plot_max_points,
+            downsample_stride=plot_downsample,
         )
 
     return 0
