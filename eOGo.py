@@ -107,6 +107,14 @@ class ArtifactConfig:
     min_prominence: float = 8.0
     prominence_noise_factor: float = 0.18
     max_missing_gap: float = 10.0
+    enable_range_checks: bool = True
+    enable_pulse_pressure_check: bool = True
+    enable_pressure_deviation_check: bool = True
+    enable_rr_bounds_check: bool = True
+    enable_rr_deviation_check: bool = True
+    enable_prominence_check: bool = True
+    enable_gap_checks: bool = True
+    enable_post_calibration_check: bool = True
 
 
 @dataclass
@@ -138,6 +146,14 @@ class ImportDialogResult:
     comment_column_index: Optional[int] = None
     analysis_downsample: int = 1
     plot_downsample: int = 1
+    enable_range_checks: bool = True
+    enable_pulse_pressure_check: bool = True
+    enable_pressure_deviation_check: bool = True
+    enable_rr_bounds_check: bool = True
+    enable_rr_deviation_check: bool = True
+    enable_prominence_check: bool = True
+    enable_gap_checks: bool = True
+    enable_post_calibration_check: bool = True
 
 
 def _parse_list_field(raw_value: str) -> List[str]:
@@ -891,6 +907,63 @@ def launch_import_configuration_dialog(
     )
     plot_downsample_combo.grid(row=3, column=3, sticky="w", padx=(8, 24), pady=(12, 0))
 
+    artifact_frame = ttk.LabelFrame(controls_frame, text="Artifact detection")
+    artifact_frame.grid(row=4, column=0, columnspan=6, sticky="ew", pady=(16, 0))
+    for col in range(3):
+        artifact_frame.columnconfigure(col, weight=1)
+
+    artifact_toggle_vars = {
+        "range": tk.BooleanVar(value=True),
+        "pulse_pressure": tk.BooleanVar(value=True),
+        "pressure_deviation": tk.BooleanVar(value=True),
+        "rr_bounds": tk.BooleanVar(value=True),
+        "rr_deviation": tk.BooleanVar(value=True),
+        "prominence": tk.BooleanVar(value=True),
+        "long_gaps": tk.BooleanVar(value=True),
+        "post_calibration": tk.BooleanVar(value=True),
+    }
+
+    ttk.Checkbutton(
+        artifact_frame,
+        text="Implausible range checks",
+        variable=artifact_toggle_vars["range"],
+    ).grid(row=0, column=0, sticky="w", padx=(4, 8), pady=(4, 0))
+    ttk.Checkbutton(
+        artifact_frame,
+        text="Minimum pulse pressure",
+        variable=artifact_toggle_vars["pulse_pressure"],
+    ).grid(row=0, column=1, sticky="w", padx=(4, 8), pady=(4, 0))
+    ttk.Checkbutton(
+        artifact_frame,
+        text="Pressure deviation (MAD)",
+        variable=artifact_toggle_vars["pressure_deviation"],
+    ).grid(row=0, column=2, sticky="w", padx=(4, 8), pady=(4, 0))
+    ttk.Checkbutton(
+        artifact_frame,
+        text="RR absolute bounds",
+        variable=artifact_toggle_vars["rr_bounds"],
+    ).grid(row=1, column=0, sticky="w", padx=(4, 8), pady=(4, 0))
+    ttk.Checkbutton(
+        artifact_frame,
+        text="RR deviation (MAD)",
+        variable=artifact_toggle_vars["rr_deviation"],
+    ).grid(row=1, column=1, sticky="w", padx=(4, 8), pady=(4, 0))
+    ttk.Checkbutton(
+        artifact_frame,
+        text="Minimum prominence",
+        variable=artifact_toggle_vars["prominence"],
+    ).grid(row=1, column=2, sticky="w", padx=(4, 8), pady=(4, 0))
+    ttk.Checkbutton(
+        artifact_frame,
+        text="Long gap interpolation",
+        variable=artifact_toggle_vars["long_gaps"],
+    ).grid(row=2, column=0, sticky="w", padx=(4, 8), pady=(4, 4))
+    ttk.Checkbutton(
+        artifact_frame,
+        text="Post calibration reset",
+        variable=artifact_toggle_vars["post_calibration"],
+    ).grid(row=2, column=1, sticky="w", padx=(4, 8), pady=(4, 4))
+
     initial_comment_index: Optional[int] = None
     for idx, name in enumerate(preview.column_names, start=1):
         if str(name).strip().lower() == "comment":
@@ -1265,6 +1338,14 @@ def launch_import_configuration_dialog(
         result["preview"] = updated_preview
         result["header_row"] = header_index
         result["first_data_row"] = data_index
+        result["enable_range_checks"] = bool(artifact_toggle_vars["range"].get())
+        result["enable_pulse_pressure_check"] = bool(artifact_toggle_vars["pulse_pressure"].get())
+        result["enable_pressure_deviation_check"] = bool(artifact_toggle_vars["pressure_deviation"].get())
+        result["enable_rr_bounds_check"] = bool(artifact_toggle_vars["rr_bounds"].get())
+        result["enable_rr_deviation_check"] = bool(artifact_toggle_vars["rr_deviation"].get())
+        result["enable_prominence_check"] = bool(artifact_toggle_vars["prominence"].get())
+        result["enable_gap_checks"] = bool(artifact_toggle_vars["long_gaps"].get())
+        result["enable_post_calibration_check"] = bool(artifact_toggle_vars["post_calibration"].get())
         error_var.set("")
         root.quit()
 
@@ -1324,6 +1405,14 @@ def launch_import_configuration_dialog(
             ),
             analysis_downsample=int(result["analysis_downsample"]),
             plot_downsample=int(result["plot_downsample"]),
+            enable_range_checks=bool(result.get("enable_range_checks", True)),
+            enable_pulse_pressure_check=bool(result.get("enable_pulse_pressure_check", True)),
+            enable_pressure_deviation_check=bool(result.get("enable_pressure_deviation_check", True)),
+            enable_rr_bounds_check=bool(result.get("enable_rr_bounds_check", True)),
+            enable_rr_deviation_check=bool(result.get("enable_rr_deviation_check", True)),
+            enable_prominence_check=bool(result.get("enable_prominence_check", True)),
+            enable_gap_checks=bool(result.get("enable_gap_checks", True)),
+            enable_post_calibration_check=bool(result.get("enable_post_calibration_check", True)),
         )
 
     return None
@@ -1935,7 +2024,10 @@ def derive_beats(
 
     pressure_filled = pressure.copy()
     missing_mask = ~finite_mask
-    invalid_spans = _find_long_gaps(time, missing_mask, config.max_missing_gap)
+    if config.enable_gap_checks:
+        invalid_spans = _find_long_gaps(time, missing_mask, config.max_missing_gap)
+    else:
+        invalid_spans = []
     if not np.all(finite_mask):
         pressure_filled[~finite_mask] = np.interp(
             np.flatnonzero(~finite_mask),
@@ -1966,11 +2058,12 @@ def derive_beats(
 
     reset_boundaries = [end for _, end in calibration_segments]
     post_gap_targets: set[int] = set()
-    for _, end in calibration_segments:
-        for candidate in systolic_indices:
-            if candidate >= end:
-                post_gap_targets.add(candidate)
-                break
+    if config.enable_post_calibration_check:
+        for _, end in calibration_segments:
+            for candidate in systolic_indices:
+                if candidate >= end:
+                    post_gap_targets.add(candidate)
+                    break
 
     for idx, sys_idx in enumerate(systolic_indices):
         prev_sys = systolic_indices[idx - 1] if idx > 0 else None
@@ -2040,7 +2133,7 @@ def derive_beats(
             if start_time <= systolic_time <= end_time:
                 reasons.append("long gap interpolation")
                 break
-        if sys_idx in post_gap_targets:
+        if config.enable_post_calibration_check and sys_idx in post_gap_targets:
             reasons.append("post calibration gap")
 
         beats.append(
@@ -2160,44 +2253,74 @@ def apply_artifact_rules(beats: List[Beat], *, config: ArtifactConfig) -> None:
         severe_reasons: List[str] = []
         soft_reasons: List[str] = []
 
-        if not math.isfinite(beat.systolic_pressure) or not math.isfinite(beat.diastolic_pressure):
-            severe_reasons.append("non-finite pressure")
-        if beat.systolic_pressure < 40 or beat.systolic_pressure > 260:
-            severe_reasons.append("implausible systolic")
-        if beat.diastolic_pressure < 20 or beat.diastolic_pressure > 160:
-            severe_reasons.append("implausible diastolic")
-        if beat.systolic_pressure - beat.diastolic_pressure < config.pulse_pressure_min:
+        if config.enable_range_checks:
+            if not math.isfinite(beat.systolic_pressure) or not math.isfinite(beat.diastolic_pressure):
+                severe_reasons.append("non-finite pressure")
+            if beat.systolic_pressure < 40 or beat.systolic_pressure > 260:
+                severe_reasons.append("implausible systolic")
+            if beat.diastolic_pressure < 20 or beat.diastolic_pressure > 160:
+                severe_reasons.append("implausible diastolic")
+        if config.enable_pulse_pressure_check and (
+            beat.systolic_pressure - beat.diastolic_pressure < config.pulse_pressure_min
+        ):
             severe_reasons.append("low pulse pressure")
 
-        sys_ref = sys_roll_med[idx] if math.isfinite(sys_roll_med[idx]) else sys_med
-        sys_scale = sys_roll_mad[idx] if math.isfinite(sys_roll_mad[idx]) else sys_mad
-        if math.isfinite(sys_ref) and math.isfinite(beat.systolic_pressure) and math.isfinite(sys_scale):
-            limit = max(config.systolic_abs_floor, config.systolic_mad_multiplier * max(sys_scale, 1.0))
-            if abs(beat.systolic_pressure - sys_ref) > limit:
-                soft_reasons.append("systolic deviation")
+        if config.enable_pressure_deviation_check:
+            sys_ref = sys_roll_med[idx] if math.isfinite(sys_roll_med[idx]) else sys_med
+            sys_scale = sys_roll_mad[idx] if math.isfinite(sys_roll_mad[idx]) else sys_mad
+            if (
+                math.isfinite(sys_ref)
+                and math.isfinite(beat.systolic_pressure)
+                and math.isfinite(sys_scale)
+            ):
+                limit = max(
+                    config.systolic_abs_floor,
+                    config.systolic_mad_multiplier * max(sys_scale, 1.0),
+                )
+                if abs(beat.systolic_pressure - sys_ref) > limit:
+                    soft_reasons.append("systolic deviation")
 
-        dia_ref = dia_roll_med[idx] if math.isfinite(dia_roll_med[idx]) else dia_med
-        dia_scale = dia_roll_mad[idx] if math.isfinite(dia_roll_mad[idx]) else dia_mad
-        if math.isfinite(dia_ref) and math.isfinite(beat.diastolic_pressure) and math.isfinite(dia_scale):
-            limit = max(config.diastolic_abs_floor, config.diastolic_mad_multiplier * max(dia_scale, 1.0))
-            if abs(beat.diastolic_pressure - dia_ref) > limit:
-                soft_reasons.append("diastolic deviation")
+            dia_ref = dia_roll_med[idx] if math.isfinite(dia_roll_med[idx]) else dia_med
+            dia_scale = dia_roll_mad[idx] if math.isfinite(dia_roll_mad[idx]) else dia_mad
+            if (
+                math.isfinite(dia_ref)
+                and math.isfinite(beat.diastolic_pressure)
+                and math.isfinite(dia_scale)
+            ):
+                limit = max(
+                    config.diastolic_abs_floor,
+                    config.diastolic_mad_multiplier * max(dia_scale, 1.0),
+                )
+                if abs(beat.diastolic_pressure - dia_ref) > limit:
+                    soft_reasons.append("diastolic deviation")
 
         if beat.rr_interval is not None and math.isfinite(beat.rr_interval):
-            if beat.rr_interval < min_rr * 0.7 or beat.rr_interval > max_rr * 1.3:
+            if config.enable_rr_bounds_check and (
+                beat.rr_interval < min_rr * 0.7 or beat.rr_interval > max_rr * 1.3
+            ):
                 severe_reasons.append("rr outside bounds")
-            rr_ref = rr_roll_med[idx] if math.isfinite(rr_roll_med[idx]) else rr_med
-            rr_scale = rr_roll_mad[idx] if math.isfinite(rr_roll_mad[idx]) else rr_mad
-            if math.isfinite(rr_ref) and math.isfinite(rr_scale):
-                limit = max(0.1, config.rr_mad_multiplier * max(rr_scale, 0.05))
-                if abs(beat.rr_interval - rr_ref) > limit:
-                    soft_reasons.append("rr deviation")
+            if config.enable_rr_deviation_check:
+                rr_ref = rr_roll_med[idx] if math.isfinite(rr_roll_med[idx]) else rr_med
+                rr_scale = rr_roll_mad[idx] if math.isfinite(rr_roll_mad[idx]) else rr_mad
+                if math.isfinite(rr_ref) and math.isfinite(rr_scale):
+                    limit = max(0.1, config.rr_mad_multiplier * max(rr_scale, 0.05))
+                    if abs(beat.rr_interval - rr_ref) > limit:
+                        soft_reasons.append("rr deviation")
 
-        if beat.systolic_prominence < config.min_prominence:
+        if config.enable_prominence_check and beat.systolic_prominence < config.min_prominence:
             soft_reasons.append("low prominence")
 
-        combined_reasons = list(beat.artifact_reasons)
-        if any(reason == "long gap interpolation" for reason in beat.artifact_reasons):
+        combined_reasons = [
+            reason
+            for reason in beat.artifact_reasons
+            if (
+                (reason != "long gap interpolation" or config.enable_gap_checks)
+                and (reason != "post calibration gap" or config.enable_post_calibration_check)
+            )
+        ]
+        if config.enable_gap_checks and any(
+            reason == "long gap interpolation" for reason in combined_reasons
+        ):
             severe_reasons.append("long gap interpolation")
         combined_reasons.extend(severe_reasons)
         combined_reasons.extend(soft_reasons)
@@ -2588,6 +2711,16 @@ def main(argv: Sequence[str]) -> int:
     dialog_result: Optional[ImportDialogResult] = None
     analysis_downsample = 1
     plot_downsample = 10
+    artifact_options = {
+        "enable_range_checks": True,
+        "enable_pulse_pressure_check": True,
+        "enable_pressure_deviation_check": True,
+        "enable_rr_bounds_check": True,
+        "enable_rr_deviation_check": True,
+        "enable_prominence_check": True,
+        "enable_gap_checks": True,
+        "enable_post_calibration_check": True,
+    }
 
     if tk is not None:
         try:
@@ -2609,6 +2742,18 @@ def main(argv: Sequence[str]) -> int:
             selected_pressure_column = dialog_result.pressure_column
             analysis_downsample = max(1, int(dialog_result.analysis_downsample))
             plot_downsample = max(1, int(dialog_result.plot_downsample))
+            artifact_options.update(
+                {
+                    "enable_range_checks": dialog_result.enable_range_checks,
+                    "enable_pulse_pressure_check": dialog_result.enable_pulse_pressure_check,
+                    "enable_pressure_deviation_check": dialog_result.enable_pressure_deviation_check,
+                    "enable_rr_bounds_check": dialog_result.enable_rr_bounds_check,
+                    "enable_rr_deviation_check": dialog_result.enable_rr_deviation_check,
+                    "enable_prominence_check": dialog_result.enable_prominence_check,
+                    "enable_gap_checks": dialog_result.enable_gap_checks,
+                    "enable_post_calibration_check": dialog_result.enable_post_calibration_check,
+                }
+            )
 
     print(f"Loaded file preview: {file_path}")
     print(f"\nColumn preview (first {preview.preview_rows} rows loaded for preview):")
@@ -2698,6 +2843,7 @@ def main(argv: Sequence[str]) -> int:
         min_prominence=args.min_prominence,
         prominence_noise_factor=args.prominence_factor,
         max_missing_gap=args.max_gap,
+        **artifact_options,
     )
 
     try:
