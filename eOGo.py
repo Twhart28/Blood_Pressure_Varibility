@@ -1668,22 +1668,7 @@ def detect_systolic_peaks(
     if global_threshold <= 0:
         global_threshold = baseline * 1.5 if baseline > 0 else 0.5
 
-    velocity_scale = float(np.nanmedian(np.abs(velocity))) if velocity.size else 0.0
-    plateau_eps = max(0.02, 0.3 * velocity_scale)
-    plateau_samples = max(1, int(round(0.5 * fs)))
-    calibration_segments: List[Tuple[int, int]] = []
-    if plateau_samples > 1:
-        mask = np.abs(velocity) <= plateau_eps
-        idx = 0
-        while idx < mask.size:
-            if mask[idx]:
-                start = idx
-                while idx < mask.size and mask[idx]:
-                    idx += 1
-                if idx - start >= plateau_samples:
-                    calibration_segments.append((start, idx))
-            else:
-                idx += 1
+    calibration_segments = _detect_calibration_segments(velocity, fs)
 
     rolling_window_seconds = 4.0
     default_window = max(3, int(round(rolling_window_seconds * fs)))
@@ -1693,14 +1678,7 @@ def detect_systolic_peaks(
     local_medians = np.full(signal.size, np.nan, dtype=float)
     local_mads = np.full(signal.size, np.nan, dtype=float)
 
-    segment_boundaries: List[Tuple[int, int]] = []
-    cursor = 0
-    for start, end in calibration_segments:
-        if start > cursor:
-            segment_boundaries.append((cursor, start))
-        cursor = max(cursor, end)
-    if cursor < signal.size:
-        segment_boundaries.append((cursor, signal.size))
+    segment_boundaries = _split_by_calibration(signal.size, calibration_segments)
 
     for seg_start, seg_end in segment_boundaries:
         seg_len = seg_end - seg_start
@@ -1897,32 +1875,18 @@ def detect_systolic_peaks(
         suppress_until = (notch_idx if notch_idx >= 0 else peak_idx) + notch_guard
 
     if peaks:
-        peak_diffs = np.diff(peaks) / fs if len(peaks) > 1 else np.array([], dtype=float)
-        global_interval = float(np.median(peak_diffs)) if peak_diffs.size else math.nan
-        cleaned_peaks: List[int] = [peaks[0]]
-        cleaned_prom: List[float] = [prominences[0]]
-        cleaned_notches: List[int] = [notches[0]]
-        interval_history: List[float] = []
-        for idx in range(1, len(peaks)):
-            interval = float((peaks[idx] - cleaned_peaks[-1]) / fs)
-            if interval_history:
-                local_median = float(np.median(interval_history[-3:]))
-            else:
-                local_median = global_interval if not math.isnan(global_interval) else interval
-            short_interval = local_median > 0 and interval < 0.4 * local_median
-            weak_prominence = prominences[idx] <= 0.6 * cleaned_prom[-1]
-            if short_interval or weak_prominence:
-                continue
-            cleaned_peaks.append(peaks[idx])
-            cleaned_prom.append(prominences[idx])
-            cleaned_notches.append(notches[idx])
-            interval_history.append(interval)
+        peaks_arr, prominences_arr, notches_arr = _dedupe_peaks_by_refractory(
+            peaks,
+            prominences,
+            notches,
+            fs=fs,
+        )
+    else:
+        peaks_arr = np.array([], dtype=int)
+        prominences_arr = np.array([], dtype=float)
+        notches_arr = np.array([], dtype=int)
 
-        peaks = cleaned_peaks
-        prominences = cleaned_prom
-        notches = cleaned_notches
-
-    if len(peaks) < 3:
+    if peaks_arr.size < 3:
         fallback_peaks, fallback_prom = find_prominent_peaks(
             signal,
             fs=fs,
@@ -1935,11 +1899,107 @@ def detect_systolic_peaks(
             return fallback_peaks, fallback_prom, fallback_notches, calibration_segments
 
     return (
-        np.asarray(peaks, dtype=int),
-        np.asarray(prominences, dtype=float),
-        np.asarray(notches, dtype=int),
+        peaks_arr,
+        prominences_arr,
+        notches_arr,
         calibration_segments,
     )
+
+
+def _detect_calibration_segments(
+    velocity: np.ndarray, fs: float
+) -> List[Tuple[int, int]]:
+    """Identify quasi-flat velocity spans that likely correspond to calibration."""
+
+    if velocity.size == 0:
+        return []
+
+    velocity_scale = float(np.nanmedian(np.abs(velocity))) if velocity.size else 0.0
+    plateau_eps = max(0.02, 0.3 * velocity_scale)
+    plateau_samples = max(1, int(round(0.5 * fs)))
+    if plateau_samples <= 1:
+        return []
+
+    mask = np.abs(velocity) <= plateau_eps
+    segments: List[Tuple[int, int]] = []
+    idx = 0
+    while idx < mask.size:
+        if mask[idx]:
+            start = idx
+            while idx < mask.size and mask[idx]:
+                idx += 1
+            if idx - start >= plateau_samples:
+                segments.append((start, idx))
+        else:
+            idx += 1
+    return segments
+
+
+def _split_by_calibration(
+    total_length: int, calibration_segments: Sequence[Tuple[int, int]]
+) -> List[Tuple[int, int]]:
+    """Return non-calibration slices given calibration spans."""
+
+    if total_length <= 0:
+        return []
+
+    if not calibration_segments:
+        return [(0, total_length)]
+
+    segment_boundaries: List[Tuple[int, int]] = []
+    cursor = 0
+    for start, end in sorted(calibration_segments):
+        if start > cursor:
+            segment_boundaries.append((cursor, min(start, total_length)))
+        cursor = max(cursor, min(end, total_length))
+        if cursor >= total_length:
+            break
+    if cursor < total_length:
+        segment_boundaries.append((cursor, total_length))
+    return [seg for seg in segment_boundaries if seg[1] - seg[0] > 0]
+
+
+def _dedupe_peaks_by_refractory(
+    peaks: Sequence[int],
+    prominences: Sequence[float],
+    notches: Sequence[int],
+    *,
+    fs: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Remove peaks that violate refractory spacing or are weak duplicates."""
+
+    if not peaks:
+        empty_int = np.array([], dtype=int)
+        empty_float = np.array([], dtype=float)
+        return empty_int, empty_float, empty_int.copy()
+
+    peaks_arr = np.asarray(peaks, dtype=int)
+    prom_arr = np.asarray(prominences, dtype=float)
+    notch_arr = np.asarray(notches, dtype=int)
+
+    if peaks_arr.size <= 1:
+        return peaks_arr, prom_arr, notch_arr
+
+    intervals = np.diff(peaks_arr) / fs
+    global_interval = float(np.median(intervals)) if intervals.size else math.nan
+
+    kept_indices: List[int] = [0]
+    interval_history: List[float] = []
+    for idx in range(1, peaks_arr.size):
+        last_idx = kept_indices[-1]
+        interval = float((peaks_arr[idx] - peaks_arr[last_idx]) / fs)
+        if interval_history:
+            local_median = float(np.median(interval_history[-3:]))
+        else:
+            local_median = global_interval if not math.isnan(global_interval) else interval
+        short_interval = local_median > 0 and interval < 0.4 * local_median
+        weak_prominence = prom_arr[idx] <= 0.6 * prom_arr[last_idx]
+        if short_interval or weak_prominence:
+            continue
+        kept_indices.append(idx)
+        interval_history.append(interval)
+
+    return peaks_arr[kept_indices], prom_arr[kept_indices], notch_arr[kept_indices]
 
 
 def find_prominent_peaks(
