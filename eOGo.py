@@ -246,7 +246,8 @@ class ArtifactConfig:
     rr_mad_multiplier: float = 3.5
     systolic_abs_floor: float = 15.0
     diastolic_abs_floor: float = 12.0
-    pulse_pressure_min: float = 10.0
+    pulse_pressure_absolute_floor: float = 10.0
+    pulse_pressure_adaptive_factor: float = 0.18
     rr_bounds: Tuple[float, float] = (0.3, 2.0)
     min_prominence: float = 8.0
     prominence_noise_factor: float = 0.18
@@ -2457,6 +2458,50 @@ def _rolling_median_and_mad(values: np.ndarray, window: int) -> Tuple[np.ndarray
     return medians, mads
 
 
+def _hampel_filter(
+    values: np.ndarray,
+    *,
+    window: int = 9,
+    threshold: float = 3.5,
+) -> np.ndarray:
+    """Apply a Hampel filter to suppress transient outliers in a 1-D series."""
+
+    if window % 2 == 0:
+        raise ValueError("window must be odd to compute centred statistics")
+
+    source = np.asarray(values, dtype=float)
+    filtered = source.copy()
+    if filtered.size == 0:
+        return filtered
+
+    medians, mads = _rolling_median_and_mad(source, window=window)
+    global_median, global_mad = _robust_central_tendency(source)
+
+    fallback_median = global_median if math.isfinite(global_median) else math.nan
+    fallback_mad = global_mad if math.isfinite(global_mad) and global_mad >= 1e-6 else None
+
+    for idx, value in enumerate(source):
+        if not math.isfinite(value):
+            continue
+
+        local_median = medians[idx]
+        if not math.isfinite(local_median):
+            local_median = fallback_median
+        if not math.isfinite(local_median):
+            continue
+
+        scale = mads[idx]
+        if not math.isfinite(scale) or scale < 1e-6:
+            scale = fallback_mad
+        if scale is None or not math.isfinite(scale) or scale < 1e-6:
+            continue
+
+        if abs(value - local_median) > threshold * scale:
+            filtered[idx] = local_median
+
+    return filtered
+
+
 def _robust_central_tendency(values: np.ndarray) -> Tuple[float, float]:
     """Compute median and MAD with sensible fallbacks for empty arrays."""
 
@@ -2483,13 +2528,18 @@ def apply_artifact_rules(beats: List[Beat], *, config: ArtifactConfig) -> None:
         b.rr_interval if b.rr_interval is not None else math.nan for b in beats
     ])
 
-    sys_med, sys_mad = _robust_central_tendency(systolic_values)
-    dia_med, dia_mad = _robust_central_tendency(diastolic_values)
-    rr_med, rr_mad = _robust_central_tendency(rr_values)
+    hampel_window = 9
+    systolic_baseline = _hampel_filter(systolic_values, window=hampel_window)
+    diastolic_baseline = _hampel_filter(diastolic_values, window=hampel_window)
+    rr_baseline = _hampel_filter(rr_values, window=hampel_window)
 
-    sys_roll_med, sys_roll_mad = _rolling_median_and_mad(systolic_values, window=9)
-    dia_roll_med, dia_roll_mad = _rolling_median_and_mad(diastolic_values, window=9)
-    rr_roll_med, rr_roll_mad = _rolling_median_and_mad(rr_values, window=9)
+    sys_med, sys_mad = _robust_central_tendency(systolic_baseline)
+    dia_med, dia_mad = _robust_central_tendency(diastolic_baseline)
+    rr_med, rr_mad = _robust_central_tendency(rr_baseline)
+
+    sys_roll_med, sys_roll_mad = _rolling_median_and_mad(systolic_baseline, window=hampel_window)
+    dia_roll_med, dia_roll_mad = _rolling_median_and_mad(diastolic_baseline, window=hampel_window)
+    rr_roll_med, rr_roll_mad = _rolling_median_and_mad(rr_baseline, window=hampel_window)
 
     min_rr, max_rr = config.rr_bounds
 
@@ -2504,10 +2554,23 @@ def apply_artifact_rules(beats: List[Beat], *, config: ArtifactConfig) -> None:
                 severe_reasons.append("implausible systolic")
             if beat.diastolic_pressure < 20 or beat.diastolic_pressure > 160:
                 severe_reasons.append("implausible diastolic")
-        if config.enable_pulse_pressure_check and (
-            beat.systolic_pressure - beat.diastolic_pressure < config.pulse_pressure_min
+        if (
+            config.enable_pulse_pressure_check
+            and math.isfinite(beat.systolic_pressure)
+            and math.isfinite(beat.diastolic_pressure)
         ):
-            severe_reasons.append("low pulse pressure")
+            local_sbp = sys_roll_med[idx] if math.isfinite(sys_roll_med[idx]) else sys_med
+            if not math.isfinite(local_sbp):
+                local_sbp = sys_med
+            threshold = config.pulse_pressure_absolute_floor
+            if math.isfinite(local_sbp) and config.pulse_pressure_adaptive_factor > 0:
+                adaptive_floor = config.pulse_pressure_adaptive_factor * max(local_sbp, 0.0)
+                if math.isfinite(adaptive_floor):
+                    threshold = max(threshold, adaptive_floor)
+            if beat.systolic_pressure - beat.diastolic_pressure < threshold:
+                severe_reasons.append(
+                    f"low pulse pressure (threshold {threshold:.1f} mmHg)"
+                )
 
         if config.enable_pressure_deviation_check:
             sys_ref = sys_roll_med[idx] if math.isfinite(sys_roll_med[idx]) else sys_med
@@ -2860,7 +2923,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=3.5,
         help="MAD multiplier for RR-interval outlier detection.",
     )
-    parser.add_argument("--pulse-pressure-min", type=float, default=10.0, help="Minimum pulse pressure (mmHg).")
+    parser.add_argument(
+        "--pulse-pressure-min",
+        type=float,
+        default=10.0,
+        help="Absolute minimum pulse pressure (mmHg) before adaptive scaling.",
+    )
+    parser.add_argument(
+        "--pulse-pressure-adaptive-factor",
+        type=float,
+        default=0.18,
+        help="Multiplier applied to the local SBP median for the adaptive pulse pressure floor.",
+    )
     parser.add_argument(
         "--systolic-abs-floor",
         type=float,
@@ -3089,7 +3163,8 @@ def main(argv: Sequence[str]) -> int:
         rr_mad_multiplier=args.rr_mad_multiplier,
         systolic_abs_floor=args.systolic_abs_floor,
         diastolic_abs_floor=args.diastolic_abs_floor,
-        pulse_pressure_min=args.pulse_pressure_min,
+        pulse_pressure_absolute_floor=args.pulse_pressure_min,
+        pulse_pressure_adaptive_factor=args.pulse_pressure_adaptive_factor,
         rr_bounds=(args.min_rr, args.max_rr),
         min_prominence=args.min_prominence,
         prominence_noise_factor=args.prominence_factor,
