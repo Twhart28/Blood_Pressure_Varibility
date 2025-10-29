@@ -2056,7 +2056,6 @@ def derive_beats(
     beats: List[Beat] = []
     prev_dia_sample: Optional[int] = None
 
-    reset_boundaries = [end for _, end in calibration_segments]
     post_gap_targets: set[int] = set()
     if config.enable_post_calibration_check:
         for _, end in calibration_segments:
@@ -2066,29 +2065,36 @@ def derive_beats(
                     break
 
     for idx, sys_idx in enumerate(systolic_indices):
-        prev_sys = systolic_indices[idx - 1] if idx > 0 else None
         next_sys = systolic_indices[idx + 1] if idx + 1 < len(systolic_indices) else None
 
         notch_idx = notch_indices[idx] if idx < len(notch_indices) else -1
 
-        if prev_sys is not None:
-            search_start = prev_sys + max(1, int(round(0.05 * fs)))
-        else:
-            search_start = max(0, sys_idx - int(round(max_rr * fs)))
+        forward_offset = max(1, int(round(0.02 * fs)))
+        search_start = sys_idx + forward_offset
+        if search_start <= sys_idx:
+            search_start = sys_idx + 1
+        if search_start >= smoothed.size:
+            continue
 
-        last_reset = max(
-            (boundary for boundary in reset_boundaries if boundary <= sys_idx),
-            default=-1,
-        )
-        if last_reset >= 0:
-            search_start = max(search_start, int(last_reset))
-
-        search_end = sys_idx
         if next_sys is not None:
-            search_end = min(search_end, next_sys - max(1, int(round(0.15 * fs))))
+            search_end = next_sys
+        else:
+            search_end = smoothed.size
 
-        search_start = max(0, min(search_start, sys_idx))
-        search_end = max(search_start + 1, min(sys_idx + 1, search_end + 1))
+        next_calibration_start = min(
+            (start for start, _ in calibration_segments if start > sys_idx),
+            default=None,
+        )
+        if next_calibration_start is not None:
+            search_end = min(search_end, int(next_calibration_start))
+
+        search_end = min(search_end, smoothed.size)
+        if search_end <= search_start:
+            fallback_end = sys_idx + max(2, int(round(max_rr * fs)))
+            search_end = max(search_start + 1, min(fallback_end, smoothed.size))
+
+        if search_end <= search_start:
+            continue
 
         segment = smoothed[search_start:search_end]
         if segment.size == 0:
@@ -2105,12 +2111,9 @@ def derive_beats(
         notch_time = float(time[notch_idx]) if 0 <= notch_idx < len(time) else math.nan
         map_time = float((systolic_time + diastolic_time) / 2.0)
         area_map = math.nan
-        integration_end = dia_idx
-        if 0 <= notch_idx <= dia_idx:
-            integration_end = notch_idx
-        if prev_dia_sample is not None and prev_dia_sample < integration_end:
+        if prev_dia_sample is not None and prev_dia_sample < dia_idx:
             start_idx = prev_dia_sample
-            end_idx = integration_end + 1
+            end_idx = dia_idx + 1
             if end_idx - start_idx > 2:
                 segment_time = time[start_idx:end_idx]
                 segment_pressure = pressure_filled[start_idx:end_idx]
