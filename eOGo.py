@@ -65,6 +65,11 @@ try:  # pragma: no cover - optional acceleration for rolling statistics
 except Exception:  # pragma: no cover - fallback when unavailable
     sliding_window_view = None  # type: ignore[assignment]
 
+try:  # pragma: no cover - optional JIT acceleration
+    from numba import njit
+except Exception:  # pragma: no cover - optional dependency
+    njit = None  # type: ignore[assignment]
+
 try:
     import pandas as pd
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
@@ -74,6 +79,145 @@ try:  # pragma: no cover - optional dependency for zero-phase filtering/PSD
     from scipy import signal as sp_signal
 except ModuleNotFoundError:  # pragma: no cover - optional dependency
     sp_signal = None
+
+
+NUMBA_AVAILABLE = njit is not None
+USE_NUMBA = NUMBA_AVAILABLE
+
+
+def configure_numba(enabled: bool) -> None:
+    """Enable/disable Numba-backed kernels based on availability and user choice."""
+
+    global USE_NUMBA
+    USE_NUMBA = bool(enabled and NUMBA_AVAILABLE)
+
+
+if NUMBA_AVAILABLE:
+
+    @njit(cache=True)  # type: ignore[misc]
+    def _rolling_median_and_mad_numba_core(
+        values: np.ndarray, window: int, min_periods: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        n = values.size
+        medians = np.empty(n, dtype=np.float64)
+        mads = np.empty(n, dtype=np.float64)
+        for idx in range(n):
+            medians[idx] = np.nan
+            mads[idx] = np.nan
+
+        half = window // 2
+        buffer_vals = np.empty(window, dtype=np.float64)
+        deviations = np.empty(window, dtype=np.float64)
+
+        for center in range(n):
+            start = center - half
+            end = center + half + 1
+            count = 0
+
+            for offset in range(start, end):
+                if 0 <= offset < n:
+                    val = values[offset]
+                    if np.isfinite(val):
+                        buffer_vals[count] = val
+                        count += 1
+
+            if count < min_periods:
+                continue
+
+            sorted_vals = np.sort(buffer_vals[:count])
+            if count % 2 == 1:
+                median = sorted_vals[count // 2]
+            else:
+                median = 0.5 * (sorted_vals[count // 2 - 1] + sorted_vals[count // 2])
+            medians[center] = median
+
+            for idx in range(count):
+                deviations[idx] = abs(buffer_vals[idx] - median)
+
+            sorted_dev = np.sort(deviations[:count])
+            if count % 2 == 1:
+                mad = sorted_dev[count // 2]
+            else:
+                mad = 0.5 * (sorted_dev[count // 2 - 1] + sorted_dev[count // 2])
+
+            if np.isfinite(mad):
+                mad *= 1.4826
+            else:
+                mad = np.nan
+
+            if not np.isfinite(mad) or mad < 1e-3:
+                mean = 0.0
+                for idx in range(count):
+                    mean += buffer_vals[idx]
+                mean /= count
+
+                var = 0.0
+                for idx in range(count):
+                    diff = buffer_vals[idx] - mean
+                    var += diff * diff
+                var /= count
+
+                if var > 0.0:
+                    mad = math.sqrt(var)
+                else:
+                    mad = 0.0
+
+            mads[center] = mad
+
+        return medians, mads
+
+
+    @njit(cache=True)  # type: ignore[misc]
+    def _prominence_numba_core(
+        signal: np.ndarray, peaks: np.ndarray, max_distance: int
+    ) -> np.ndarray:
+        result = np.empty(peaks.size, dtype=np.float64)
+        for idx in range(peaks.size):
+            result[idx] = np.nan
+
+        n = signal.size
+        for idx in range(peaks.size):
+            peak_idx = int(peaks[idx])
+            if peak_idx < 0 or peak_idx >= n:
+                continue
+            peak_val = signal[peak_idx]
+            if not np.isfinite(peak_val):
+                continue
+
+            left_start = peak_idx - max_distance
+            if left_start < 0:
+                left_start = 0
+            right_end = peak_idx + max_distance
+            if right_end > n:
+                right_end = n
+
+            left_min = np.inf
+            left_found = False
+            for pos in range(left_start, peak_idx + 1):
+                val = signal[pos]
+                if np.isfinite(val):
+                    left_found = True
+                    if val < left_min:
+                        left_min = val
+
+            right_min = np.inf
+            right_found = False
+            for pos in range(peak_idx, right_end):
+                val = signal[pos]
+                if np.isfinite(val):
+                    right_found = True
+                    if val < right_min:
+                        right_min = val
+
+            if left_found and right_found:
+                baseline = left_min if left_min >= right_min else right_min
+                result[idx] = peak_val - baseline
+
+        return result
+
+else:  # pragma: no cover - Numba unavailable
+    _rolling_median_and_mad_numba_core = None  # type: ignore[assignment]
+    _prominence_numba_core = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -1787,19 +1931,6 @@ def detect_systolic_peaks(
     order = np.argsort(candidate_peaks, kind="mergesort")
     candidate_peaks = candidate_peaks[order]
 
-    def _estimate_prominence(peak_idx: int) -> Optional[float]:
-        left = signal[max(0, peak_idx - max_distance) : peak_idx + 1]
-        right = signal[peak_idx : min(signal.size, peak_idx + max_distance)]
-
-        left = left[np.isfinite(left)]
-        right = right[np.isfinite(right)]
-        if left.size == 0 or right.size == 0:
-            return None
-
-        left_min = float(np.min(left))
-        right_min = float(np.min(right))
-        return float(signal[peak_idx] - max(left_min, right_min))
-
     def _estimate_notch(peak_idx: int) -> int:
         notch_idx = -1
         notch_start = peak_idx + 1
@@ -1841,9 +1972,17 @@ def detect_systolic_peaks(
     notches: List[int] = []
     suppress_until = -1
 
-    for peak_idx in candidate_peaks:
-        prominence = _estimate_prominence(peak_idx)
-        if prominence is None or prominence < min_prominence:
+    candidate_prominences = _compute_candidate_prominences(
+        signal, candidate_peaks, max_distance
+    )
+
+    for candidate_idx, peak_idx in enumerate(candidate_peaks):
+        prominence = (
+            float(candidate_prominences[candidate_idx])
+            if candidate_prominences.size > candidate_idx
+            else math.nan
+        )
+        if not math.isfinite(prominence) or prominence < min_prominence:
             continue
         if not _has_sustained_downstroke(peak_idx):
             continue
@@ -1957,6 +2096,44 @@ def _split_by_calibration(
     if cursor < total_length:
         segment_boundaries.append((cursor, total_length))
     return [seg for seg in segment_boundaries if seg[1] - seg[0] > 0]
+
+
+def _compute_candidate_prominences(
+    signal: np.ndarray, candidate_peaks: np.ndarray, max_distance: int
+) -> np.ndarray:
+    """Compute prominence estimates for peaks, using Numba when available."""
+
+    peaks = np.asarray(candidate_peaks, dtype=np.int64)
+    if peaks.size == 0:
+        return np.array([], dtype=float)
+
+    signal = np.asarray(signal, dtype=float)
+
+    if USE_NUMBA and _prominence_numba_core is not None:
+        return _prominence_numba_core(signal, peaks, int(max_distance))
+
+    prominences = np.full(peaks.shape, np.nan, dtype=float)
+    n = signal.size
+    for idx, peak_idx in enumerate(peaks):
+        if peak_idx < 0 or peak_idx >= n:
+            continue
+        peak_val = signal[peak_idx]
+        if not math.isfinite(peak_val):
+            continue
+
+        left = signal[max(0, peak_idx - max_distance) : peak_idx + 1]
+        right = signal[peak_idx : min(n, peak_idx + max_distance)]
+
+        left = left[np.isfinite(left)]
+        right = right[np.isfinite(right)]
+        if left.size == 0 or right.size == 0:
+            continue
+
+        left_min = float(np.min(left))
+        right_min = float(np.min(right))
+        prominences[idx] = float(peak_val - max(left_min, right_min))
+
+    return prominences
 
 
 def _dedupe_peaks_by_refractory(
@@ -2232,6 +2409,10 @@ def _rolling_median_and_mad(values: np.ndarray, window: int) -> Tuple[np.ndarray
     mads = np.full(values.shape, np.nan, dtype=float)
 
     if values.size == 0:
+        return medians, mads
+
+    if USE_NUMBA and _rolling_median_and_mad_numba_core is not None:
+        medians, mads = _rolling_median_and_mad_numba_core(values, window, 3)
         return medians, mads
 
     if sliding_window_view is not None:
@@ -2714,12 +2895,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", type=Path, help="Optional path to export the beat summary CSV.")
     parser.add_argument("--savefig", type=Path, help="Save the plot to this path instead of/as well as showing it.")
     parser.add_argument("--no-plot", action="store_true", help="Skip interactive plot display.")
+    parser.add_argument(
+        "--disable-numba",
+        action="store_true",
+        help="Disable Numba JIT acceleration even if it is installed.",
+    )
     return parser
 
 
 def main(argv: Sequence[str]) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv[1:])
+
+    configure_numba(not getattr(args, "disable_numba", False))
 
     if args.min_rr >= args.max_rr:
         parser.error("--min-rr must be less than --max-rr")
