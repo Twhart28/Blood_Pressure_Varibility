@@ -1766,6 +1766,7 @@ def detect_systolic_peaks(
     max_rr: float,
     prominence_floor: float,
     prominence_noise_factor: float,
+    use_rolling_statistics: bool,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Tuple[int, int]]]:
     """Detect systolic peaks using adaptive upstroke and prominence checks.
 
@@ -1777,6 +1778,8 @@ def detect_systolic_peaks(
     generated in a vectorised fashion (using :func:`scipy.signal.find_peaks`
     when available) to reduce Python-level looping while preserving the legacy
     gating heuristics.
+    When ``use_rolling_statistics`` is ``False`` the rolling median/MAD gating
+    is skipped and the detector relies solely on the SciPy peak finder.
     """
 
     if signal.size == 0:
@@ -1814,41 +1817,45 @@ def detect_systolic_peaks(
 
     calibration_segments = _detect_calibration_segments(velocity, fs)
 
-    rolling_window_seconds = 4.0
-    default_window = max(3, int(round(rolling_window_seconds * fs)))
-    if default_window % 2 == 0:
-        default_window += 1
-
-    local_medians = np.full(signal.size, np.nan, dtype=float)
-    local_mads = np.full(signal.size, np.nan, dtype=float)
-
-    segment_boundaries = _split_by_calibration(signal.size, calibration_segments)
-
-    for seg_start, seg_end in segment_boundaries:
-        seg_len = seg_end - seg_start
-        if seg_len < 3:
-            continue
-        window = min(default_window, seg_len if seg_len % 2 == 1 else seg_len - 1)
-        if window < 3:
-            continue
-        seg_med, seg_mad = _rolling_median_and_mad(positive_velocity[seg_start:seg_end], window)
-        local_medians[seg_start:seg_end] = seg_med
-        local_mads[seg_start:seg_end] = seg_mad
-
     thresholds = np.full(signal.size, global_threshold, dtype=float)
-    valid_local = np.isfinite(local_medians)
-    adjusted_mads = np.where(
-        valid_local & np.isfinite(local_mads) & (local_mads > 1e-6),
-        local_mads,
-        mad,
-    )
-    local_thresholds = local_medians + 2.5 * adjusted_mads
-    local_thresholds = np.where(
-        local_thresholds <= 0,
-        np.where(local_medians > 0, local_medians * 1.5, global_threshold),
-        local_thresholds,
-    )
-    np.copyto(thresholds, local_thresholds, where=valid_local)
+
+    if use_rolling_statistics:
+        rolling_window_seconds = 4.0
+        default_window = max(3, int(round(rolling_window_seconds * fs)))
+        if default_window % 2 == 0:
+            default_window += 1
+
+        local_medians = np.full(signal.size, np.nan, dtype=float)
+        local_mads = np.full(signal.size, np.nan, dtype=float)
+
+        segment_boundaries = _split_by_calibration(signal.size, calibration_segments)
+
+        for seg_start, seg_end in segment_boundaries:
+            seg_len = seg_end - seg_start
+            if seg_len < 3:
+                continue
+            window = min(default_window, seg_len if seg_len % 2 == 1 else seg_len - 1)
+            if window < 3:
+                continue
+            seg_med, seg_mad = _rolling_median_and_mad(
+                positive_velocity[seg_start:seg_end], window
+            )
+            local_medians[seg_start:seg_end] = seg_med
+            local_mads[seg_start:seg_end] = seg_mad
+
+        valid_local = np.isfinite(local_medians)
+        adjusted_mads = np.where(
+            valid_local & np.isfinite(local_mads) & (local_mads > 1e-6),
+            local_mads,
+            mad,
+        )
+        local_thresholds = local_medians + 2.5 * adjusted_mads
+        local_thresholds = np.where(
+            local_thresholds <= 0,
+            np.where(local_medians > 0, local_medians * 1.5, global_threshold),
+            local_thresholds,
+        )
+        np.copyto(thresholds, local_thresholds, where=valid_local)
 
     thresholds = np.clip(thresholds, 0.05, None)
 
@@ -2249,6 +2256,7 @@ def derive_beats(
     fs: float,
     *,
     config: ArtifactConfig,
+    use_rolling_statistics: bool = True,
 ) -> List[Beat]:
     """Derive systolic/diastolic/MAP landmarks from a continuous waveform."""
 
@@ -2288,6 +2296,7 @@ def derive_beats(
         max_rr=max_rr,
         prominence_floor=config.min_prominence,
         prominence_noise_factor=config.prominence_noise_factor,
+        use_rolling_statistics=use_rolling_statistics,
     )
 
     beats: List[Beat] = []
@@ -2843,6 +2852,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Multiplier for adaptive prominence threshold based on noise.",
     )
     parser.add_argument(
+        "--beat-detector",
+        choices=("scipy", "hybrid"),
+        default="hybrid",
+        help="Select 'scipy' for plain SciPy peak detection or 'hybrid' to include rolling median/MAD heuristics.",
+    )
+    parser.add_argument(
         "--systolic-mad-multiplier",
         type=float,
         default=4.5,
@@ -3097,8 +3112,16 @@ def main(argv: Sequence[str]) -> int:
         **artifact_options,
     )
 
+    use_rolling_statistics = args.beat_detector != "scipy"
+
     try:
-        beats = derive_beats(time, pressure, fs=fs, config=config)
+        beats = derive_beats(
+            time,
+            pressure,
+            fs=fs,
+            config=config,
+            use_rolling_statistics=use_rolling_statistics,
+        )
     except Exception as exc:  # pragma: no cover - interactive feedback
         print(f"Beat detection failed: {exc}")
         return 1
