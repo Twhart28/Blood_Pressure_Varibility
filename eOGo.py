@@ -1790,6 +1790,54 @@ def detect_systolic_peaks(
             [],
         )
 
+    min_distance = max(1, int(round(min_rr * fs)))
+    max_distance = max(min_distance + 1, int(round(max_rr * fs)))
+    max_search_window = min(0.45, 0.6 * max(min_rr, 0.2))
+    search_horizon = max(min_distance, int(round(max_search_window * fs)))
+
+    amplitude_span = float(np.percentile(signal, 95) - np.percentile(signal, 5))
+    if signal.size > 1:
+        noise_proxy = float(np.median(np.abs(np.diff(signal))))
+    else:
+        noise_proxy = 0.0
+    adaptive_floor = max(amplitude_span * prominence_noise_factor, noise_proxy * 5.0)
+    min_prominence = max(prominence_floor, adaptive_floor)
+
+    if not use_rolling_statistics:
+        if sp_signal is not None:
+            peaks, properties = sp_signal.find_peaks(
+                signal,
+                distance=min_distance,
+                prominence=min_prominence,
+            )
+            peaks = np.asarray(peaks, dtype=int)
+            prominences = properties.get("prominences")
+            if prominences is None and peaks.size:
+                prominences = sp_signal.peak_prominences(signal, peaks)[0]
+            elif prominences is None:
+                prominences = np.array([], dtype=float)
+            else:
+                prominences = np.asarray(prominences, dtype=float)
+        else:
+            peaks, prominences = find_prominent_peaks(
+                signal,
+                fs=fs,
+                min_rr=min_rr,
+                max_rr=max_rr,
+                min_prominence=min_prominence,
+            )
+
+        if peaks.size == 0:
+            return (
+                np.array([], dtype=int),
+                np.array([], dtype=float),
+                np.array([], dtype=int),
+                [],
+            )
+
+        notches = np.full_like(peaks, -1, dtype=int)
+        return peaks.astype(int), prominences.astype(float), notches, []
+
     detrended = detrend_signal(signal, fs, window_seconds=0.6)
     velocity = np.gradient(detrended)
     velocity = smooth_signal(velocity, window_seconds=0.03, fs=fs)
@@ -1865,19 +1913,6 @@ def detect_systolic_peaks(
         candidate_onsets = crossings + 1
     else:
         candidate_onsets = np.arange(signal.size)
-
-    min_distance = max(1, int(round(min_rr * fs)))
-    max_distance = max(min_distance + 1, int(round(max_rr * fs)))
-    max_search_window = min(0.45, 0.6 * max(min_rr, 0.2))
-    search_horizon = max(min_distance, int(round(max_search_window * fs)))
-
-    amplitude_span = float(np.percentile(signal, 95) - np.percentile(signal, 5))
-    if signal.size > 1:
-        noise_proxy = float(np.median(np.abs(np.diff(signal))))
-    else:
-        noise_proxy = 0.0
-    adaptive_floor = max(amplitude_span * prominence_noise_factor, noise_proxy * 5.0)
-    min_prominence = max(prominence_floor, adaptive_floor)
 
     downstroke_grace = max(1, int(round(0.02 * fs)))
     sustained_negative = max(1, int(round(0.02 * fs)))
@@ -2284,6 +2319,17 @@ def derive_beats(
 
     filtered = zero_phase_filter(pressure_filled, fs=fs)
     smoothed = smooth_signal(filtered, window_seconds=0.03, fs=fs)
+
+    rolling_required = use_rolling_statistics and (
+        config.enable_prominence_check
+        or config.enable_pressure_deviation_check
+        or config.enable_rr_deviation_check
+    )
+    prominence_floor = (
+        config.min_prominence
+        if config.enable_prominence_check
+        else max(0.5, config.min_prominence * 0.1)
+    )
     (
         systolic_indices,
         prominences,
@@ -2294,9 +2340,9 @@ def derive_beats(
         fs=fs,
         min_rr=min_rr,
         max_rr=max_rr,
-        prominence_floor=config.min_prominence,
+        prominence_floor=prominence_floor,
         prominence_noise_factor=config.prominence_noise_factor,
-        use_rolling_statistics=use_rolling_statistics,
+        use_rolling_statistics=rolling_required,
     )
 
     beats: List[Beat] = []
@@ -2486,19 +2532,53 @@ def apply_artifact_rules(beats: List[Beat], *, config: ArtifactConfig) -> None:
     if not beats:
         return
 
+    active_checks = (
+        config.enable_range_checks
+        or config.enable_pulse_pressure_check
+        or config.enable_pressure_deviation_check
+        or config.enable_rr_bounds_check
+        or config.enable_rr_deviation_check
+        or config.enable_prominence_check
+        or config.enable_gap_checks
+        or config.enable_post_calibration_check
+    )
+
+    if not active_checks:
+        for beat in beats:
+            beat.is_artifact = False
+            beat.artifact_reasons = []
+        return
+
     systolic_values = np.array([b.systolic_pressure for b in beats], dtype=float)
     diastolic_values = np.array([b.diastolic_pressure for b in beats], dtype=float)
-    rr_values = np.array([
-        b.rr_interval if b.rr_interval is not None else math.nan for b in beats
-    ])
 
-    sys_med, sys_mad = _robust_central_tendency(systolic_values)
-    dia_med, dia_mad = _robust_central_tendency(diastolic_values)
-    rr_med, rr_mad = _robust_central_tendency(rr_values)
+    if config.enable_pressure_deviation_check:
+        sys_med, sys_mad = _robust_central_tendency(systolic_values)
+        dia_med, dia_mad = _robust_central_tendency(diastolic_values)
+        sys_roll_med, sys_roll_mad = _rolling_median_and_mad(systolic_values, window=9)
+        dia_roll_med, dia_roll_mad = _rolling_median_and_mad(diastolic_values, window=9)
+    else:
+        sys_med = dia_med = math.nan
+        sys_mad = dia_mad = math.nan
+        sys_roll_med = np.full(len(beats), math.nan, dtype=float)
+        sys_roll_mad = np.full(len(beats), math.nan, dtype=float)
+        dia_roll_med = np.full(len(beats), math.nan, dtype=float)
+        dia_roll_mad = np.full(len(beats), math.nan, dtype=float)
 
-    sys_roll_med, sys_roll_mad = _rolling_median_and_mad(systolic_values, window=9)
-    dia_roll_med, dia_roll_mad = _rolling_median_and_mad(diastolic_values, window=9)
-    rr_roll_med, rr_roll_mad = _rolling_median_and_mad(rr_values, window=9)
+    if config.enable_rr_bounds_check or config.enable_rr_deviation_check:
+        rr_values = np.array([
+            b.rr_interval if b.rr_interval is not None else math.nan for b in beats
+        ])
+    else:
+        rr_values = np.array([], dtype=float)
+
+    if config.enable_rr_deviation_check:
+        rr_med, rr_mad = _robust_central_tendency(rr_values)
+        rr_roll_med, rr_roll_mad = _rolling_median_and_mad(rr_values, window=9)
+    else:
+        rr_med = rr_mad = math.nan
+        rr_roll_med = np.full(len(beats), math.nan, dtype=float)
+        rr_roll_mad = np.full(len(beats), math.nan, dtype=float)
 
     min_rr, max_rr = config.rr_bounds
 
