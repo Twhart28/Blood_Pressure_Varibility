@@ -251,6 +251,10 @@ class ArtifactConfig:
     min_prominence: float = 8.0
     prominence_noise_factor: float = 0.18
     max_missing_gap: float = 10.0
+    scipy_mad_multiplier: float = 3.0
+    abs_sys_difference_artifact: float = 10.0
+    abs_dia_difference_artifact: float = 10.0
+    max_rr_artifact: float = 0.5
     enable_range_checks: bool = True
     enable_pulse_pressure_check: bool = True
     enable_pressure_deviation_check: bool = True
@@ -2450,6 +2454,8 @@ def derive_beats(
         prev_dia_sample = dia_idx
 
     apply_artifact_rules(beats, config=config)
+    if not use_rolling_statistics and not _artifact_checks_enabled(config):
+        _apply_scipy_artifact_fallback(beats, config=config)
     return beats
 
 
@@ -2526,13 +2532,10 @@ def _robust_central_tendency(values: np.ndarray) -> Tuple[float, float]:
     return median, mad
 
 
-def apply_artifact_rules(beats: List[Beat], *, config: ArtifactConfig) -> None:
-    """Flag beats that violate simple physiological heuristics."""
+def _artifact_checks_enabled(config: ArtifactConfig) -> bool:
+    """Return ``True`` when any legacy artifact toggles are enabled."""
 
-    if not beats:
-        return
-
-    active_checks = (
+    return (
         config.enable_range_checks
         or config.enable_pulse_pressure_check
         or config.enable_pressure_deviation_check
@@ -2543,7 +2546,14 @@ def apply_artifact_rules(beats: List[Beat], *, config: ArtifactConfig) -> None:
         or config.enable_post_calibration_check
     )
 
-    if not active_checks:
+
+def apply_artifact_rules(beats: List[Beat], *, config: ArtifactConfig) -> None:
+    """Flag beats that violate simple physiological heuristics."""
+
+    if not beats:
+        return
+
+    if not _artifact_checks_enabled(config):
         for beat in beats:
             beat.is_artifact = False
             beat.artifact_reasons = []
@@ -2659,6 +2669,119 @@ def apply_artifact_rules(beats: List[Beat], *, config: ArtifactConfig) -> None:
         combined_reasons.extend(soft_reasons)
         beat.is_artifact = bool(severe_reasons or len(soft_reasons) >= 2)
         beat.artifact_reasons = combined_reasons if beat.is_artifact else []
+
+
+def _apply_scipy_artifact_fallback(beats: List[Beat], *, config: ArtifactConfig) -> None:
+    """Apply SciPy-only artifact logic when legacy toggles are disabled."""
+
+    if not beats:
+        return
+
+    systolic = np.asarray([beat.systolic_pressure for beat in beats], dtype=float)
+    diastolic = np.asarray([beat.diastolic_pressure for beat in beats], dtype=float)
+    mean_arterial = np.asarray([beat.map_pressure for beat in beats], dtype=float)
+    rr_intervals = np.asarray(
+        [beat.rr_interval if beat.rr_interval is not None else math.nan for beat in beats],
+        dtype=float,
+    )
+
+    sys_median, sys_mad = _robust_central_tendency(systolic)
+    dia_median, dia_mad = _robust_central_tendency(diastolic)
+    rr_median, rr_mad = _robust_central_tendency(rr_intervals)
+    map_median, map_mad = _robust_central_tendency(mean_arterial)
+
+    mad_multiplier = max(config.scipy_mad_multiplier, 0.0)
+
+    for idx, beat in enumerate(beats):
+        triggered: List[str] = []
+
+        if (
+            idx > 0
+            and math.isfinite(sys_median)
+            and math.isfinite(sys_mad)
+            and math.isfinite(systolic[idx])
+            and math.isfinite(systolic[idx - 1])
+        ):
+            deviation = abs(systolic[idx] - sys_median)
+            diff_prev = abs(systolic[idx] - systolic[idx - 1])
+            if (
+                deviation > mad_multiplier * sys_mad
+                and diff_prev > config.abs_sys_difference_artifact
+            ):
+                triggered.append("systolic deviation")
+
+        if (
+            idx >= 2
+            and math.isfinite(dia_median)
+            and math.isfinite(dia_mad)
+            and math.isfinite(diastolic[idx - 1])
+            and math.isfinite(diastolic[idx - 2])
+        ):
+            prev_dev = abs(diastolic[idx - 1] - dia_median)
+            prev_diff = abs(diastolic[idx - 1] - diastolic[idx - 2])
+            if (
+                prev_dev > mad_multiplier * dia_mad
+                and prev_diff > config.abs_dia_difference_artifact
+            ):
+                triggered.append("preceding diastolic deviation")
+
+        if (
+            idx > 0
+            and math.isfinite(rr_median)
+            and math.isfinite(rr_mad)
+            and math.isfinite(rr_intervals[idx])
+        ):
+            rr_dev = abs(rr_intervals[idx] - rr_median)
+            if (
+                rr_dev > mad_multiplier * rr_mad
+                and rr_intervals[idx] < config.max_rr_artifact
+            ):
+                triggered.append("short RR interval")
+
+        criteria_count = len(triggered)
+        if criteria_count >= 2:
+            beat.is_artifact = True
+            action = "exclusion" if criteria_count == 3 else "flag"
+            beat.artifact_reasons.append(
+                "SciPy artifact {} ({} criteria: {})".format(
+                    action,
+                    f"{criteria_count}/3",
+                    ", ".join(triggered),
+                )
+            )
+
+        point_flags: List[str] = []
+        if (
+            math.isfinite(sys_median)
+            and math.isfinite(sys_mad)
+            and math.isfinite(systolic[idx])
+            and abs(systolic[idx] - sys_median) > mad_multiplier * sys_mad
+        ):
+            point_flags.append("systolic")
+        if (
+            math.isfinite(dia_median)
+            and math.isfinite(dia_mad)
+            and math.isfinite(diastolic[idx])
+            and abs(diastolic[idx] - dia_median) > mad_multiplier * dia_mad
+        ):
+            point_flags.append("diastolic")
+        if (
+            math.isfinite(map_median)
+            and math.isfinite(map_mad)
+            and math.isfinite(mean_arterial[idx])
+            and abs(mean_arterial[idx] - map_median) > mad_multiplier * map_mad
+        ):
+            point_flags.append("MAP")
+
+        if point_flags:
+            beat.is_artifact = True
+            beat.artifact_reasons.append(
+                "SciPy MAD flag for {}".format(", ".join(point_flags))
+            )
+
+    for beat in beats:
+        if beat.artifact_reasons:
+            beat.artifact_reasons = sorted(set(beat.artifact_reasons))
 
 
 def plot_waveform(
@@ -2975,6 +3098,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Maximum tolerated gap (s) before interpolated beats are flagged.",
     )
     parser.add_argument(
+        "--scipy-mad-multiplier",
+        type=float,
+        default=3.0,
+        help="MAD multiplier used by the SciPy fallback artifact logic.",
+    )
+    parser.add_argument(
+        "--scipy-abs-sys-diff",
+        type=float,
+        default=10.0,
+        help="Absolute systolic difference (mmHg) threshold for SciPy artifact exclusion.",
+    )
+    parser.add_argument(
+        "--scipy-abs-dia-diff",
+        type=float,
+        default=10.0,
+        help="Absolute diastolic difference (mmHg) threshold for SciPy artifact exclusion.",
+    )
+    parser.add_argument(
+        "--scipy-max-rr",
+        type=float,
+        default=0.5,
+        help="Maximum RR interval (s) considered in SciPy artifact exclusion.",
+    )
+    parser.add_argument(
         "--pnn-threshold",
         type=float,
         default=50.0,
@@ -3189,6 +3336,10 @@ def main(argv: Sequence[str]) -> int:
         min_prominence=args.min_prominence,
         prominence_noise_factor=args.prominence_factor,
         max_missing_gap=args.max_gap,
+        scipy_mad_multiplier=args.scipy_mad_multiplier,
+        abs_sys_difference_artifact=args.scipy_abs_sys_diff,
+        abs_dia_difference_artifact=args.scipy_abs_dia_diff,
+        max_rr_artifact=args.scipy_max_rr,
         **artifact_options,
     )
 
