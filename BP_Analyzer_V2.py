@@ -33,171 +33,191 @@ from typing import Dict, List, Optional, Sequence, Tuple
 try:
     import tkinter as tk
     from tkinter import filedialog, ttk
-except Exception as exc:  # pragma: no cover - tkinter is now required
-    raise SystemExit("tkinter is required to run this script.") from exc
+except Exception:  # pragma: no cover - tkinter may be unavailable in some envs.
+    tk = None
+    filedialog = None
+    ttk = None
 
 try:
     import matplotlib
-    preferred_backend = "TkAgg"
+    if tk is not None:
+        preferred_backend = "TkAgg"
+    else:
+        preferred_backend = "Agg"
     current_backend = matplotlib.get_backend().lower()
     if current_backend != preferred_backend.lower():
-        matplotlib.use(preferred_backend, force=True)
+        try:
+            matplotlib.use(preferred_backend, force=True)
+        except Exception:
+            if current_backend.startswith("qt"):
+                matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
-except Exception as exc:  # pragma: no cover - matplotlib backend configuration must succeed
-    raise SystemExit("matplotlib with the TkAgg backend is required.") from exc
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    plt = None
 
 try:
     import numpy as np
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
     raise SystemExit("numpy is required to run this script. Please install it and retry.") from exc
 
-try:  # pragma: no cover - JIT acceleration is required
+try:  # pragma: no cover - optional acceleration for rolling statistics
+    from numpy.lib.stride_tricks import sliding_window_view
+except Exception:  # pragma: no cover - fallback when unavailable
+    sliding_window_view = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional JIT acceleration
     from numba import njit
-except Exception as exc:  # pragma: no cover - dependency guard
-    raise SystemExit("Numba is required to run BP_Analyzer_V2.") from exc
+except Exception:  # pragma: no cover - optional dependency
+    njit = None  # type: ignore[assignment]
 
 try:
     import pandas as pd
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
     raise SystemExit("pandas is required to run this script. Please install it and retry.") from exc
 
-try:  # pragma: no cover - signal processing dependency is required
+try:  # pragma: no cover - optional dependency for zero-phase filtering/PSD
     from scipy import signal as sp_signal
-except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
-    raise SystemExit("scipy is required to run BP_Analyzer_V2.") from exc
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    sp_signal = None
 
 
-NUMBA_AVAILABLE = True
-USE_NUMBA = True
+NUMBA_AVAILABLE = njit is not None
+USE_NUMBA = NUMBA_AVAILABLE
 
 
 def configure_numba(enabled: bool) -> None:
-    """Numba acceleration is mandatory for BP_Analyzer_V2."""
+    """Enable/disable Numba-backed kernels based on availability and user choice."""
 
-    if not enabled:
-        raise RuntimeError("Numba acceleration is required for BP_Analyzer_V2.")
+    global USE_NUMBA
+    USE_NUMBA = bool(enabled and NUMBA_AVAILABLE)
 
 
-@njit(cache=True)  # type: ignore[misc]
-def _rolling_median_and_mad_numba_core(
-    values: np.ndarray, window: int, min_periods: int
-) -> Tuple[np.ndarray, np.ndarray]:
-    n = values.size
-    medians = np.empty(n, dtype=np.float64)
-    mads = np.empty(n, dtype=np.float64)
-    for idx in range(n):
-        medians[idx] = np.nan
-        mads[idx] = np.nan
+if NUMBA_AVAILABLE:
 
-    half = window // 2
-    buffer_vals = np.empty(window, dtype=np.float64)
-    deviations = np.empty(window, dtype=np.float64)
+    @njit(cache=True)  # type: ignore[misc]
+    def _rolling_median_and_mad_numba_core(
+        values: np.ndarray, window: int, min_periods: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        n = values.size
+        medians = np.empty(n, dtype=np.float64)
+        mads = np.empty(n, dtype=np.float64)
+        for idx in range(n):
+            medians[idx] = np.nan
+            mads[idx] = np.nan
 
-    for center in range(n):
-        start = center - half
-        end = center + half + 1
-        count = 0
+        half = window // 2
+        buffer_vals = np.empty(window, dtype=np.float64)
+        deviations = np.empty(window, dtype=np.float64)
 
-        for offset in range(start, end):
-            if 0 <= offset < n:
-                val = values[offset]
-                if np.isfinite(val):
-                    buffer_vals[count] = val
-                    count += 1
+        for center in range(n):
+            start = center - half
+            end = center + half + 1
+            count = 0
 
-        if count < min_periods:
-            continue
+            for offset in range(start, end):
+                if 0 <= offset < n:
+                    val = values[offset]
+                    if np.isfinite(val):
+                        buffer_vals[count] = val
+                        count += 1
 
-        sorted_vals = np.sort(buffer_vals[:count])
-        if count % 2 == 1:
-            median = sorted_vals[count // 2]
-        else:
-            median = 0.5 * (sorted_vals[count // 2 - 1] + sorted_vals[count // 2])
-        medians[center] = median
+            if count < min_periods:
+                continue
 
-        for idx in range(count):
-            deviations[idx] = abs(buffer_vals[idx] - median)
-
-        sorted_dev = np.sort(deviations[:count])
-        if count % 2 == 1:
-            mad = sorted_dev[count // 2]
-        else:
-            mad = 0.5 * (sorted_dev[count // 2 - 1] + sorted_dev[count // 2])
-
-        if np.isfinite(mad):
-            mad *= 1.4826
-        else:
-            mad = np.nan
-
-        if not np.isfinite(mad) or mad < 1e-3:
-            mean = 0.0
-            for idx in range(count):
-                mean += buffer_vals[idx]
-            mean /= count
-
-            var = 0.0
-            for idx in range(count):
-                diff = buffer_vals[idx] - mean
-                var += diff * diff
-            var /= count
-
-            if var > 0.0:
-                mad = math.sqrt(var)
+            sorted_vals = np.sort(buffer_vals[:count])
+            if count % 2 == 1:
+                median = sorted_vals[count // 2]
             else:
-                mad = 0.0
+                median = 0.5 * (sorted_vals[count // 2 - 1] + sorted_vals[count // 2])
+            medians[center] = median
 
-        mads[center] = mad
+            for idx in range(count):
+                deviations[idx] = abs(buffer_vals[idx] - median)
 
-    return medians, mads
+            sorted_dev = np.sort(deviations[:count])
+            if count % 2 == 1:
+                mad = sorted_dev[count // 2]
+            else:
+                mad = 0.5 * (sorted_dev[count // 2 - 1] + sorted_dev[count // 2])
+
+            if np.isfinite(mad):
+                mad *= 1.4826
+            else:
+                mad = np.nan
+
+            if not np.isfinite(mad) or mad < 1e-3:
+                mean = 0.0
+                for idx in range(count):
+                    mean += buffer_vals[idx]
+                mean /= count
+
+                var = 0.0
+                for idx in range(count):
+                    diff = buffer_vals[idx] - mean
+                    var += diff * diff
+                var /= count
+
+                if var > 0.0:
+                    mad = math.sqrt(var)
+                else:
+                    mad = 0.0
+
+            mads[center] = mad
+
+        return medians, mads
 
 
-@njit(cache=True)  # type: ignore[misc]
-def _prominence_numba_core(
-    signal: np.ndarray, peaks: np.ndarray, max_distance: int
-) -> np.ndarray:
-    result = np.empty(peaks.size, dtype=np.float64)
-    for idx in range(peaks.size):
-        result[idx] = np.nan
+    @njit(cache=True)  # type: ignore[misc]
+    def _prominence_numba_core(
+        signal: np.ndarray, peaks: np.ndarray, max_distance: int
+    ) -> np.ndarray:
+        result = np.empty(peaks.size, dtype=np.float64)
+        for idx in range(peaks.size):
+            result[idx] = np.nan
 
-    n = signal.size
-    for idx in range(peaks.size):
-        peak_idx = int(peaks[idx])
-        if peak_idx < 0 or peak_idx >= n:
-            continue
-        peak_val = signal[peak_idx]
-        if not np.isfinite(peak_val):
-            continue
+        n = signal.size
+        for idx in range(peaks.size):
+            peak_idx = int(peaks[idx])
+            if peak_idx < 0 or peak_idx >= n:
+                continue
+            peak_val = signal[peak_idx]
+            if not np.isfinite(peak_val):
+                continue
 
-        left_start = peak_idx - max_distance
-        if left_start < 0:
-            left_start = 0
-        right_end = peak_idx + max_distance
-        if right_end > n:
-            right_end = n
+            left_start = peak_idx - max_distance
+            if left_start < 0:
+                left_start = 0
+            right_end = peak_idx + max_distance
+            if right_end > n:
+                right_end = n
 
-        left_min = np.inf
-        left_found = False
-        for pos in range(left_start, peak_idx + 1):
-            val = signal[pos]
-            if np.isfinite(val):
-                left_found = True
-                if val < left_min:
-                    left_min = val
+            left_min = np.inf
+            left_found = False
+            for pos in range(left_start, peak_idx + 1):
+                val = signal[pos]
+                if np.isfinite(val):
+                    left_found = True
+                    if val < left_min:
+                        left_min = val
 
-        right_min = np.inf
-        right_found = False
-        for pos in range(peak_idx, right_end):
-            val = signal[pos]
-            if np.isfinite(val):
-                right_found = True
-                if val < right_min:
-                    right_min = val
+            right_min = np.inf
+            right_found = False
+            for pos in range(peak_idx, right_end):
+                val = signal[pos]
+                if np.isfinite(val):
+                    right_found = True
+                    if val < right_min:
+                        right_min = val
 
-        if left_found and right_found:
-            baseline = left_min if left_min >= right_min else right_min
-            result[idx] = peak_val - baseline
+            if left_found and right_found:
+                baseline = left_min if left_min >= right_min else right_min
+                result[idx] = peak_val - baseline
 
-    return result
+        return result
+
+else:  # pragma: no cover - Numba unavailable
+    _rolling_median_and_mad_numba_core = None  # type: ignore[assignment]
+    _prominence_numba_core = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -226,12 +246,15 @@ class ArtifactConfig:
     rr_mad_multiplier: float = 3.5
     systolic_abs_floor: float = 15.0
     diastolic_abs_floor: float = 12.0
-    pulse_pressure_absolute_floor: float = 10.0
-    pulse_pressure_adaptive_factor: float = 0.18
+    pulse_pressure_min: float = 10.0
     rr_bounds: Tuple[float, float] = (0.3, 2.0)
     min_prominence: float = 8.0
     prominence_noise_factor: float = 0.18
     max_missing_gap: float = 10.0
+    scipy_mad_multiplier: float = 3.0
+    abs_sys_difference_artifact: float = 10.0
+    abs_dia_difference_artifact: float = 10.0
+    max_rr_artifact: float = 0.5
     enable_range_checks: bool = True
     enable_pulse_pressure_check: bool = True
     enable_pressure_deviation_check: bool = True
@@ -240,7 +263,6 @@ class ArtifactConfig:
     enable_prominence_check: bool = True
     enable_gap_checks: bool = True
     enable_post_calibration_check: bool = True
-    enable_artifact_rules: bool = True
 
 
 @dataclass
@@ -569,8 +591,11 @@ def _build_preview_dataframe(
     )
 
     if separator:
-        engine = "c" if len(separator) == 1 else "python"
-        return pd.read_csv(sep=separator, engine=engine, **read_kwargs)
+        try:
+            engine = "c" if len(separator) == 1 else "python"
+            return pd.read_csv(sep=separator, engine=engine, **read_kwargs)
+        except Exception:
+            return pd.read_csv(delim_whitespace=True, engine="python", **read_kwargs)
 
     return pd.read_csv(delim_whitespace=True, engine="python", **read_kwargs)
 
@@ -586,6 +611,9 @@ def _render_preview_to_text_widget(
     max_rows: int = 200,
 ) -> None:
     """Render a preview table into a Tkinter text widget with highlights."""
+
+    if tk is None:
+        return
 
     widget.configure(state="normal")
     widget.delete("1.0", tk.END)
@@ -653,18 +681,19 @@ def _render_preview_to_text_widget(
     widget.tag_raise("header")
 
 
-def _default_column_selection(column_names: Sequence[str], requested: Optional[str]) -> str:
-    """Return a required column name without falling back to heuristics."""
+def _default_column_selection(column_names: Sequence[str], requested: Optional[str], *, fallback: Optional[str] = None) -> str:
+    """Return a sensible default column name."""
 
-    if requested is not None:
-        if requested not in column_names:
-            raise ValueError(f"Requested column '{requested}' not found.")
+    if requested and requested in column_names:
         return requested
 
-    if not column_names:
-        raise ValueError("No columns available for selection.")
+    if fallback and fallback in column_names:
+        return fallback
 
-    return column_names[0]
+    if column_names:
+        return column_names[0]
+
+    raise ValueError("No columns available for selection.")
 
 
 def _select_columns_via_cli(
@@ -719,6 +748,9 @@ def _select_columns_via_tk(
 ) -> Tuple[str, str]:
     """Display a Tkinter dialog for column selection."""
 
+    if tk is None:
+        return default_time, default_pressure
+
     root = tk.Tk()
     root.title("Select waveform columns")
     root.geometry("360x180")
@@ -756,7 +788,7 @@ def _select_columns_via_tk(
     if "time" in selection and "pressure" in selection:
         return selection["time"], selection["pressure"]
 
-    raise RuntimeError("Column selection dialog was dismissed without confirmation.")
+    return default_time, default_pressure
 
 
 def select_time_pressure_columns(
@@ -769,20 +801,24 @@ def select_time_pressure_columns(
     """Resolve the time and pressure columns, prompting the user when possible."""
 
     column_names = preview.column_names
-    time_default = _default_column_selection(column_names, requested_time)
+    time_default = _default_column_selection(column_names, requested_time, fallback="Time")
 
     remaining = [name for name in column_names if name != time_default]
     pressure_default = _default_column_selection(
         remaining if remaining else column_names,
         requested_pressure if requested_pressure != time_default else None,
+        fallback="reBAP",
     )
 
-    if allow_gui:
-        return _select_columns_via_tk(
-            column_names,
-            default_time=time_default,
-            default_pressure=pressure_default,
-        )
+    if allow_gui and tk is not None:
+        try:
+            return _select_columns_via_tk(
+                column_names,
+                default_time=time_default,
+                default_pressure=pressure_default,
+            )
+        except Exception:
+            pass
 
     return _select_columns_via_cli(column_names, default_time=time_default, default_pressure=pressure_default)
 
@@ -796,6 +832,9 @@ def launch_import_configuration_dialog(
     separator_override: Optional[str] = None,
 ) -> Optional[ImportDialogResult]:
     """Display a dialog allowing the user to adjust delimiter and column selections."""
+
+    if tk is None or ttk is None:
+        return None
 
     delimiter_options: List[Tuple[str, Optional[str]]] = [
         ("Auto-detect", None),
@@ -993,7 +1032,7 @@ def launch_import_configuration_dialog(
     ttk.Label(controls_frame, text="Analysis downsampling:").grid(
         row=3, column=0, sticky="w", pady=(12, 0)
     )
-    analysis_downsample_var = tk.StringVar(value=_label_for_downsample(4))
+    analysis_downsample_var = tk.StringVar(value=_label_for_downsample(1))
     analysis_downsample_combo = ttk.Combobox(
         controls_frame,
         state="readonly",
@@ -1657,22 +1696,30 @@ def zero_phase_filter(
     highcut: float = 20.0,
     order: int = 4,
 ) -> np.ndarray:
-    """Apply a zero-phase bandpass filter using SciPy."""
+    """Apply a zero-phase bandpass filter when SciPy is available.
 
-    if fs <= 0:
-        raise ValueError("Sampling frequency must be positive for filtering.")
+    Falls back to returning the input data when filtering fails or SciPy is
+    unavailable. The cutoff range is clipped to the [0, Nyquist) interval to
+    avoid numerical errors on very low/high sampling rates.
+    """
+
+    if sp_signal is None or fs <= 0:
+        return signal
 
     nyquist = 0.5 * fs
     if nyquist <= 0:
-        raise ValueError("Nyquist frequency must be positive for filtering.")
+        return signal
 
     low = max(0.01, lowcut) / nyquist
     high = min(highcut, nyquist * 0.99) / nyquist
     if not (0 < low < high < 1):
-        raise ValueError("Invalid bandpass specification for zero_phase_filter.")
+        return signal
 
-    b, a = sp_signal.butter(order, [low, high], btype="bandpass")
-    return sp_signal.filtfilt(b, a, signal.astype(float, copy=False))
+    try:
+        b, a = sp_signal.butter(order, [low, high], btype="bandpass")
+        return sp_signal.filtfilt(b, a, signal.astype(float, copy=False))
+    except Exception:
+        return signal
 
 
 def detrend_signal(signal: np.ndarray, fs: float, window_seconds: float = 0.6) -> np.ndarray:
@@ -1723,7 +1770,7 @@ def detect_systolic_peaks(
     max_rr: float,
     prominence_floor: float,
     prominence_noise_factor: float,
-    analysis_downsample: int = 1,
+    use_rolling_statistics: bool,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Tuple[int, int]]]:
     """Detect systolic peaks using adaptive upstroke and prominence checks.
 
@@ -1735,6 +1782,8 @@ def detect_systolic_peaks(
     generated in a vectorised fashion (using :func:`scipy.signal.find_peaks`
     when available) to reduce Python-level looping while preserving the legacy
     gating heuristics.
+    When ``use_rolling_statistics`` is ``False`` the rolling median/MAD gating
+    is skipped and the detector relies solely on the SciPy peak finder.
     """
 
     if signal.size == 0:
@@ -1745,41 +1794,57 @@ def detect_systolic_peaks(
             [],
         )
 
-    full_signal = np.asarray(signal, dtype=float)
-    stride = int(analysis_downsample) if analysis_downsample and analysis_downsample > 0 else 1
-    if stride > 1:
-        analysis_signal = full_signal[::stride]
+    min_distance = max(1, int(round(min_rr * fs)))
+    max_distance = max(min_distance + 1, int(round(max_rr * fs)))
+    max_search_window = min(0.45, 0.6 * max(min_rr, 0.2))
+    search_horizon = max(min_distance, int(round(max_search_window * fs)))
+
+    amplitude_span = float(np.percentile(signal, 95) - np.percentile(signal, 5))
+    if signal.size > 1:
+        noise_proxy = float(np.median(np.abs(np.diff(signal))))
     else:
-        analysis_signal = full_signal
+        noise_proxy = 0.0
+    adaptive_floor = max(amplitude_span * prominence_noise_factor, noise_proxy * 5.0)
+    min_prominence = max(prominence_floor, adaptive_floor)
 
-    if analysis_signal.size == 0:
-        return (
-            np.array([], dtype=int),
-            np.array([], dtype=float),
-            np.array([], dtype=int),
-            [],
-        )
+    if not use_rolling_statistics:
+        if sp_signal is not None:
+            peaks, properties = sp_signal.find_peaks(
+                signal,
+                distance=min_distance,
+                prominence=min_prominence,
+            )
+            peaks = np.asarray(peaks, dtype=int)
+            prominences = properties.get("prominences")
+            if prominences is None and peaks.size:
+                prominences = sp_signal.peak_prominences(signal, peaks)[0]
+            elif prominences is None:
+                prominences = np.array([], dtype=float)
+            else:
+                prominences = np.asarray(prominences, dtype=float)
+        else:
+            peaks, prominences = find_prominent_peaks(
+                signal,
+                fs=fs,
+                min_rr=min_rr,
+                max_rr=max_rr,
+                min_prominence=min_prominence,
+            )
 
-    analysis_fs = fs / stride if fs > 0 else fs
-    if analysis_fs <= 0:
-        analysis_fs = fs if fs > 0 else 1.0
+        if peaks.size == 0:
+            return (
+                np.array([], dtype=int),
+                np.array([], dtype=float),
+                np.array([], dtype=int),
+                [],
+            )
 
-    finite_signal = analysis_signal[np.isfinite(analysis_signal)]
-    if finite_signal.size == 0:
-        return (
-            np.array([], dtype=int),
-            np.array([], dtype=float),
-            np.array([], dtype=int),
-            [],
-        )
+        notches = np.full_like(peaks, -1, dtype=int)
+        return peaks.astype(int), prominences.astype(float), notches, []
 
-    if stride >= 4:
-        detrended = analysis_signal
-    else:
-        detrended = detrend_signal(analysis_signal, analysis_fs, window_seconds=0.6)
-
+    detrended = detrend_signal(signal, fs, window_seconds=0.6)
     velocity = np.gradient(detrended)
-    velocity = smooth_signal(velocity, window_seconds=0.03, fs=analysis_fs)
+    velocity = smooth_signal(velocity, window_seconds=0.03, fs=fs)
     positive_velocity = np.clip(velocity, a_min=0.0, a_max=None)
 
     if not np.any(positive_velocity > 0):
@@ -1802,43 +1867,47 @@ def detect_systolic_peaks(
     if global_threshold <= 0:
         global_threshold = baseline * 1.5 if baseline > 0 else 0.5
 
-    calibration_segments = _detect_calibration_segments(velocity, analysis_fs)
+    calibration_segments = _detect_calibration_segments(velocity, fs)
 
-    rolling_window_seconds = 4.0
-    default_window = max(3, int(round(rolling_window_seconds * analysis_fs)))
-    if default_window % 2 == 0:
-        default_window += 1
+    thresholds = np.full(signal.size, global_threshold, dtype=float)
 
-    local_medians = np.full(analysis_signal.size, np.nan, dtype=float)
-    local_mads = np.full(analysis_signal.size, np.nan, dtype=float)
+    if use_rolling_statistics:
+        rolling_window_seconds = 4.0
+        default_window = max(3, int(round(rolling_window_seconds * fs)))
+        if default_window % 2 == 0:
+            default_window += 1
 
-    segment_boundaries = _split_by_calibration(analysis_signal.size, calibration_segments)
+        local_medians = np.full(signal.size, np.nan, dtype=float)
+        local_mads = np.full(signal.size, np.nan, dtype=float)
 
-    for seg_start, seg_end in segment_boundaries:
-        seg_len = seg_end - seg_start
-        if seg_len < 3:
-            continue
-        window = min(default_window, seg_len if seg_len % 2 == 1 else seg_len - 1)
-        if window < 3:
-            continue
-        seg_med, seg_mad = _rolling_median_and_mad(positive_velocity[seg_start:seg_end], window)
-        local_medians[seg_start:seg_end] = seg_med
-        local_mads[seg_start:seg_end] = seg_mad
+        segment_boundaries = _split_by_calibration(signal.size, calibration_segments)
 
-    thresholds = np.full(analysis_signal.size, global_threshold, dtype=float)
-    valid_local = np.isfinite(local_medians)
-    adjusted_mads = np.where(
-        valid_local & np.isfinite(local_mads) & (local_mads > 1e-6),
-        local_mads,
-        mad,
-    )
-    local_thresholds = local_medians + 2.5 * adjusted_mads
-    local_thresholds = np.where(
-        local_thresholds <= 0,
-        np.where(local_medians > 0, local_medians * 1.5, global_threshold),
-        local_thresholds,
-    )
-    np.copyto(thresholds, local_thresholds, where=valid_local)
+        for seg_start, seg_end in segment_boundaries:
+            seg_len = seg_end - seg_start
+            if seg_len < 3:
+                continue
+            window = min(default_window, seg_len if seg_len % 2 == 1 else seg_len - 1)
+            if window < 3:
+                continue
+            seg_med, seg_mad = _rolling_median_and_mad(
+                positive_velocity[seg_start:seg_end], window
+            )
+            local_medians[seg_start:seg_end] = seg_med
+            local_mads[seg_start:seg_end] = seg_mad
+
+        valid_local = np.isfinite(local_medians)
+        adjusted_mads = np.where(
+            valid_local & np.isfinite(local_mads) & (local_mads > 1e-6),
+            local_mads,
+            mad,
+        )
+        local_thresholds = local_medians + 2.5 * adjusted_mads
+        local_thresholds = np.where(
+            local_thresholds <= 0,
+            np.where(local_medians > 0, local_medians * 1.5, global_threshold),
+            local_thresholds,
+        )
+        np.copyto(thresholds, local_thresholds, where=valid_local)
 
     thresholds = np.clip(thresholds, 0.05, None)
 
@@ -1847,60 +1916,27 @@ def detect_systolic_peaks(
     if crossings.size:
         candidate_onsets = crossings + 1
     else:
-        candidate_onsets = np.arange(analysis_signal.size)
+        candidate_onsets = np.arange(signal.size)
 
-    min_distance = max(1, int(round(min_rr * analysis_fs)))
-    max_distance = max(min_distance + 1, int(round(max_rr * analysis_fs)))
-    min_distance_full = (
-        max(1, int(round(min_rr * fs)))
-        if fs > 0
-        else max(1, min_distance * stride)
-    )
-    max_distance_full = (
-        max(min_distance_full + 1, int(round(max_rr * fs)))
-        if fs > 0
-        else max_distance * max(stride, 1)
-    )
-    max_search_window = min(0.45, 0.6 * max(min_rr, 0.2))
-    search_horizon = max(min_distance, int(round(max_search_window * analysis_fs)))
+    downstroke_grace = max(1, int(round(0.02 * fs)))
+    sustained_negative = max(1, int(round(0.02 * fs)))
+    notch_guard = max(1, int(round(0.05 * fs)))
 
-    amplitude_span = float(
-        np.nanpercentile(analysis_signal, 95) - np.nanpercentile(analysis_signal, 5)
-    )
-    if finite_signal.size > 1:
-        finite_diffs = np.diff(finite_signal)
-        noise_proxy = float(np.median(np.abs(finite_diffs)))
-    else:
-        noise_proxy = 0.0
-    adaptive_floor = max(amplitude_span * prominence_noise_factor, noise_proxy * 5.0)
-    min_prominence = max(prominence_floor, adaptive_floor)
-
-    downstroke_grace = max(1, int(round(0.02 * analysis_fs)))
-    sustained_negative = max(1, int(round(0.02 * analysis_fs)))
-    notch_guard = max(1, int(round(0.05 * analysis_fs)))
-
-    candidate_peaks, _ = sp_signal.find_peaks(
-        analysis_signal,
-        distance=min_distance,
-        prominence=min_prominence,
-    )
-    candidate_peaks = np.asarray(candidate_peaks, dtype=int)
-    if candidate_peaks.size:
-        prominence_window = max(1, int(round(analysis_fs * 0.4)))
-        if prominence_window >= analysis_signal.size:
-            wlen: Optional[int] = None
-        else:
-            if prominence_window % 2 == 0:
-                prominence_window += 1
-            wlen = prominence_window
-        proms, _, _ = sp_signal.peak_prominences(
-            analysis_signal,
-            candidate_peaks,
-            wlen=wlen,
+    if sp_signal is not None:
+        candidate_peaks, _ = sp_signal.find_peaks(
+            signal,
+            distance=min_distance,
+            prominence=min_prominence,
         )
-        candidate_prominences = np.asarray(proms, dtype=float)
+        candidate_peaks = np.asarray(candidate_peaks, dtype=int)
     else:
-        candidate_prominences = np.array([], dtype=float)
+        candidate_peaks, _ = find_prominent_peaks(
+            signal,
+            fs=fs,
+            min_rr=min_rr,
+            max_rr=max_rr,
+            min_prominence=min_prominence,
+        )
 
     if candidate_peaks.size == 0:
         return (
@@ -1944,7 +1980,7 @@ def detect_systolic_peaks(
     def _estimate_notch(peak_idx: int) -> int:
         notch_idx = -1
         notch_start = peak_idx + 1
-        notch_end = min(analysis_signal.size, peak_idx + int(round(0.45 * analysis_fs)))
+        notch_end = min(signal.size, peak_idx + int(round(0.45 * fs)))
         if notch_end > notch_start + 1:
             velocity_slice = velocity[notch_start:notch_end]
             zero_crossings = np.flatnonzero(
@@ -1952,11 +1988,11 @@ def detect_systolic_peaks(
             )
             if zero_crossings.size:
                 zero_idx = notch_start + zero_crossings[0] + 1
-                window_radius = max(1, int(round(0.02 * analysis_fs)))
+                window_radius = max(1, int(round(0.02 * fs)))
                 local_start = max(notch_start, zero_idx - window_radius)
-                local_end = min(analysis_signal.size, zero_idx + window_radius)
+                local_end = min(signal.size, zero_idx + window_radius)
                 if local_end > local_start:
-                    local_segment = analysis_signal[local_start:local_end]
+                    local_segment = signal[local_start:local_end]
                     if np.any(np.isfinite(local_segment)):
                         notch_rel = int(np.nanargmin(local_segment))
                         notch_idx = local_start + notch_rel
@@ -1982,6 +2018,10 @@ def detect_systolic_peaks(
     notches: List[int] = []
     suppress_until = -1
 
+    candidate_prominences = _compute_candidate_prominences(
+        signal, candidate_peaks, max_distance
+    )
+
     for candidate_idx, peak_idx in enumerate(candidate_peaks):
         prominence = (
             float(candidate_prominences[candidate_idx])
@@ -1994,7 +2034,7 @@ def detect_systolic_peaks(
             continue
 
         if peaks and peak_idx - peaks[-1] < min_distance:
-            if analysis_signal[peak_idx] > analysis_signal[peaks[-1]]:
+            if signal[peak_idx] > signal[peaks[-1]]:
                 peaks[-1] = peak_idx
                 prominences[-1] = prominence
                 notches[-1] = _estimate_notch(peak_idx)
@@ -2004,7 +2044,7 @@ def detect_systolic_peaks(
             continue
 
         if peak_idx <= suppress_until:
-            if peaks and analysis_signal[peak_idx] > analysis_signal[peaks[-1]]:
+            if peaks and signal[peak_idx] > signal[peaks[-1]]:
                 peaks[-1] = peak_idx
                 prominences[-1] = prominence
                 notches[-1] = _estimate_notch(peak_idx)
@@ -2024,105 +2064,30 @@ def detect_systolic_peaks(
             peaks,
             prominences,
             notches,
-            fs=analysis_fs,
+            fs=fs,
         )
     else:
         peaks_arr = np.array([], dtype=int)
         prominences_arr = np.array([], dtype=float)
         notches_arr = np.array([], dtype=int)
 
-    if stride > 1 and peaks_arr.size:
-        refined_peaks: List[int] = []
-        for peak_idx in peaks_arr:
-            approx_full_idx = int(peak_idx * stride)
-            window_radius = (
-                max(1, int(round(fs * 0.1)))
-                if fs > 0
-                else max(stride, 5)
-            )
-            start = max(0, approx_full_idx - window_radius)
-            end = min(full_signal.size, approx_full_idx + window_radius + 1)
-            if end <= start:
-                refined_peaks.append(min(max(approx_full_idx, 0), full_signal.size - 1))
-                continue
-            window = full_signal[start:end]
-            finite_mask = np.isfinite(window)
-            if not np.any(finite_mask):
-                refined_peaks.append(min(max(approx_full_idx, 0), full_signal.size - 1))
-                continue
-            finite_window = np.where(finite_mask, window, -np.inf)
-            rel_idx = int(np.argmax(finite_window))
-            refined_peaks.append(start + rel_idx)
-        peaks_arr = np.asarray(refined_peaks, dtype=int)
-
-    peaks_full = peaks_arr
-
-    full_velocity = np.gradient(full_signal)
-
-    def _estimate_notch_full(peak_idx: int) -> int:
-        notch_idx = -1
-        notch_start = peak_idx + 1
-        notch_end = min(full_signal.size, peak_idx + int(round(0.45 * fs)))
-        if notch_end > notch_start + 1:
-            velocity_slice = full_velocity[notch_start:notch_end]
-            zero_crossings = np.flatnonzero(
-                (velocity_slice[:-1] < 0) & (velocity_slice[1:] >= 0)
-            )
-            if zero_crossings.size:
-                zero_idx = notch_start + zero_crossings[0] + 1
-                window_radius = max(1, int(round(0.02 * fs)))
-                local_start = max(notch_start, zero_idx - window_radius)
-                local_end = min(full_signal.size, zero_idx + window_radius)
-                if local_end > local_start:
-                    local_segment = full_signal[local_start:local_end]
-                    if np.any(np.isfinite(local_segment)):
-                        finite_segment = np.where(
-                            np.isfinite(local_segment), local_segment, np.inf
-                        )
-                        notch_rel = int(np.argmin(finite_segment))
-                        notch_idx = local_start + notch_rel
-        return notch_idx
-
-    if peaks_full.size:
-        refined_notches = np.array([
-            _estimate_notch_full(int(idx)) for idx in peaks_full
-        ], dtype=int)
-    else:
-        refined_notches = np.array([], dtype=int)
-
-    if sp_signal is not None and peaks_full.size:
-        prominence_window = max(1, int(round(fs * 0.4)))
-        if prominence_window >= full_signal.size:
-            wlen_final: Optional[int] = None
-        else:
-            if prominence_window % 2 == 0:
-                prominence_window += 1
-            wlen_final = prominence_window
-        final_prominences, _, _ = sp_signal.peak_prominences(
-            full_signal,
-            peaks_full,
-            wlen=wlen_final,
+    if peaks_arr.size < 3:
+        fallback_peaks, fallback_prom = find_prominent_peaks(
+            signal,
+            fs=fs,
+            min_rr=min_rr,
+            max_rr=max_rr,
+            min_prominence=min_prominence,
         )
-        prominences_full = np.asarray(final_prominences, dtype=float)
-    else:
-        prominences_full = _compute_candidate_prominences(
-            full_signal, peaks_full, max_distance_full
-        )
-
-    calibration_segments_full: List[Tuple[int, int]] = []
-    for start, end in calibration_segments:
-        full_start = int(start * stride)
-        full_end = int(end * stride)
-        full_start = max(0, min(full_start, full_signal.size))
-        full_end = max(full_start, min(full_end, full_signal.size))
-        if full_end > full_start:
-            calibration_segments_full.append((full_start, full_end))
+        if fallback_peaks.size:
+            fallback_notches = np.full_like(fallback_peaks, -1, dtype=int)
+            return fallback_peaks, fallback_prom, fallback_notches, calibration_segments
 
     return (
-        peaks_full,
-        prominences_full,
-        refined_notches,
-        calibration_segments_full,
+        peaks_arr,
+        prominences_arr,
+        notches_arr,
+        calibration_segments,
     )
 
 
@@ -2330,9 +2295,15 @@ def derive_beats(
     fs: float,
     *,
     config: ArtifactConfig,
-    analysis_downsample: int = 1,
+    use_rolling_statistics: bool = True,
+    apply_scipy_artifact_logic: bool = False,
 ) -> List[Beat]:
-    """Derive systolic/diastolic/MAP landmarks from a continuous waveform."""
+    """Derive systolic/diastolic/MAP landmarks from a continuous waveform.
+
+    When ``apply_scipy_artifact_logic`` is ``True`` the SciPy-specific
+    artefact heuristics are executed after the legacy checks regardless of the
+    legacy toggle configuration.
+    """
 
     if len(time) != len(pressure):
         raise ValueError("Time and pressure arrays must have the same length.")
@@ -2343,9 +2314,10 @@ def derive_beats(
 
     pressure_filled = pressure.copy()
     missing_mask = ~finite_mask
-    invalid_spans: List[Tuple[float, float]] = []
-    if config.enable_artifact_rules and config.enable_gap_checks:
+    if config.enable_gap_checks:
         invalid_spans = _find_long_gaps(time, missing_mask, config.max_missing_gap)
+    else:
+        invalid_spans = []
     if not np.all(finite_mask):
         pressure_filled[~finite_mask] = np.interp(
             np.flatnonzero(~finite_mask),
@@ -2357,8 +2329,17 @@ def derive_beats(
 
     filtered = zero_phase_filter(pressure_filled, fs=fs)
     smoothed = smooth_signal(filtered, window_seconds=0.03, fs=fs)
-    stride = max(1, int(analysis_downsample))
 
+    rolling_required = use_rolling_statistics and (
+        config.enable_prominence_check
+        or config.enable_pressure_deviation_check
+        or config.enable_rr_deviation_check
+    )
+    prominence_floor = (
+        config.min_prominence
+        if config.enable_prominence_check
+        else max(0.5, config.min_prominence * 0.1)
+    )
     (
         systolic_indices,
         prominences,
@@ -2369,16 +2350,16 @@ def derive_beats(
         fs=fs,
         min_rr=min_rr,
         max_rr=max_rr,
-        prominence_floor=config.min_prominence,
+        prominence_floor=prominence_floor,
         prominence_noise_factor=config.prominence_noise_factor,
-        analysis_downsample=stride,
+        use_rolling_statistics=rolling_required,
     )
 
     beats: List[Beat] = []
     prev_dia_sample: Optional[int] = None
 
     post_gap_targets: set[int] = set()
-    if config.enable_artifact_rules and config.enable_post_calibration_check:
+    if config.enable_post_calibration_check:
         for _, end in calibration_segments:
             for candidate in systolic_indices:
                 if candidate >= end:
@@ -2411,7 +2392,11 @@ def derive_beats(
 
         search_end = min(search_end, smoothed.size)
         if search_end <= search_start:
-            raise RuntimeError("Unable to determine diastolic search window without fallbacks.")
+            fallback_end = sys_idx + max(2, int(round(max_rr * fs)))
+            search_end = max(search_start + 1, min(fallback_end, smoothed.size))
+
+        if search_end <= search_start:
+            continue
 
         segment = smoothed[search_start:search_end]
         if segment.size == 0:
@@ -2449,13 +2434,12 @@ def derive_beats(
             rr_interval = float(systolic_time - time[systolic_indices[idx - 1]])
 
         reasons: List[str] = []
-        if config.enable_artifact_rules:
-            for start_time, end_time in invalid_spans:
-                if start_time <= systolic_time <= end_time:
-                    reasons.append("long gap interpolation")
-                    break
-            if config.enable_post_calibration_check and sys_idx in post_gap_targets:
-                reasons.append("post calibration gap")
+        for start_time, end_time in invalid_spans:
+            if start_time <= systolic_time <= end_time:
+                reasons.append("long gap interpolation")
+                break
+        if config.enable_post_calibration_check and sys_idx in post_gap_targets:
+            reasons.append("post calibration gap")
 
         beats.append(
             Beat(
@@ -2475,8 +2459,9 @@ def derive_beats(
 
         prev_dia_sample = dia_idx
 
-    if config.enable_artifact_rules:
-        apply_artifact_rules(beats, config=config)
+    apply_artifact_rules(beats, config=config)
+    if apply_scipy_artifact_logic:
+        _apply_scipy_artifact_fallback(beats, config=config)
     return beats
 
 
@@ -2493,55 +2478,58 @@ def _rolling_median_and_mad(values: np.ndarray, window: int) -> Tuple[np.ndarray
     if values.size == 0:
         return medians, mads
 
-    medians_numba, mads_numba = _rolling_median_and_mad_numba_core(
-        values.astype(np.float64, copy=False), int(window), 3
-    )
-    return medians_numba.astype(float, copy=False), mads_numba.astype(float, copy=False)
+    if USE_NUMBA and _rolling_median_and_mad_numba_core is not None:
+        medians, mads = _rolling_median_and_mad_numba_core(values, window, 3)
+        return medians, mads
 
+    if sliding_window_view is not None:
+        half_window = window // 2
+        padded = np.pad(values, (half_window, half_window), mode="constant", constant_values=np.nan)
+        windows = sliding_window_view(padded, window_shape=window)
+        finite_counts = np.sum(np.isfinite(windows), axis=1)
+        valid_mask = finite_counts >= 3
 
-def _hampel_filter(
-    values: np.ndarray,
-    *,
-    window: int = 9,
-    threshold: float = 3.5,
-) -> np.ndarray:
-    """Apply a Hampel filter to suppress transient outliers in a 1-D series."""
+        if not np.any(valid_mask):
+            return medians, mads
 
-    if window % 2 == 0:
-        raise ValueError("window must be odd to compute centred statistics")
+        valid_windows = windows[valid_mask]
+        medians_valid = np.nanmedian(valid_windows, axis=1)
+        medians[valid_mask] = medians_valid
 
-    source = np.asarray(values, dtype=float)
-    filtered = source.copy()
-    if filtered.size == 0:
-        return filtered
+        deviations = np.abs(valid_windows - medians_valid[:, None])
+        mad_valid = 1.4826 * np.nanmedian(deviations, axis=1)
+        fallback_mask = (mad_valid < 1e-3) | ~np.isfinite(mad_valid)
+        if np.any(fallback_mask):
+            mad_valid[fallback_mask] = np.nanstd(valid_windows[fallback_mask], axis=1, ddof=0)
 
-    medians, mads = _rolling_median_and_mad(source, window=window)
-    global_median, global_mad = _robust_central_tendency(source)
+        mads[valid_mask] = mad_valid
+        return medians, mads
 
-    for idx, value in enumerate(source):
-        if not math.isfinite(value):
-            continue
+    # Fallback path when sliding_window_view is unavailable (older NumPy).
+    series = pd.Series(values, dtype=float)
+    rolling = series.rolling(window, center=True, min_periods=3)
+    medians_series = rolling.median()
+    medians = medians_series.to_numpy(dtype=float)
 
-        local_median = medians[idx]
-        if not math.isfinite(local_median):
-            raise RuntimeError("Hampel filter requires valid local medians.")
+    deviations = (series - medians_series).abs()
+    mad_series = deviations.rolling(window, center=True, min_periods=3).median() * 1.4826
+    mads = mad_series.to_numpy(dtype=float)
 
-        scale = mads[idx]
-        if not math.isfinite(scale) or scale < 1e-6:
-            raise RuntimeError("Hampel filter requires valid local MAD estimates.")
+    fallback_mask = (mads < 1e-3) | ~np.isfinite(mads)
+    if np.any(fallback_mask):
+        std_series = rolling.std(ddof=0)
+        std_values = std_series.to_numpy(dtype=float)
+        mads[fallback_mask] = std_values[fallback_mask]
 
-        if abs(value - local_median) > threshold * scale:
-            filtered[idx] = local_median
-
-    return filtered
+    return medians, mads
 
 
 def _robust_central_tendency(values: np.ndarray) -> Tuple[float, float]:
-    """Compute median and MAD, requiring finite input values."""
+    """Compute median and MAD with sensible fallbacks for empty arrays."""
 
     finite = values[np.isfinite(values)]
     if finite.size == 0:
-        raise ValueError("Cannot compute robust statistics on empty input.")
+        return math.nan, math.nan
     median = float(np.median(finite))
     deviations = np.abs(finite - median)
     mad = float(1.4826 * np.median(deviations)) if deviations.size else 0.0
@@ -2550,30 +2538,63 @@ def _robust_central_tendency(values: np.ndarray) -> Tuple[float, float]:
     return median, mad
 
 
+def _artifact_checks_enabled(config: ArtifactConfig) -> bool:
+    """Return ``True`` when any legacy artifact toggles are enabled."""
+
+    return (
+        config.enable_range_checks
+        or config.enable_pulse_pressure_check
+        or config.enable_pressure_deviation_check
+        or config.enable_rr_bounds_check
+        or config.enable_rr_deviation_check
+        or config.enable_prominence_check
+        or config.enable_gap_checks
+        or config.enable_post_calibration_check
+    )
+
+
 def apply_artifact_rules(beats: List[Beat], *, config: ArtifactConfig) -> None:
     """Flag beats that violate simple physiological heuristics."""
 
-    if not config.enable_artifact_rules or not beats:
+    if not beats:
+        return
+
+    if not _artifact_checks_enabled(config):
+        for beat in beats:
+            beat.is_artifact = False
+            beat.artifact_reasons = []
         return
 
     systolic_values = np.array([b.systolic_pressure for b in beats], dtype=float)
     diastolic_values = np.array([b.diastolic_pressure for b in beats], dtype=float)
-    rr_values = np.array([
-        b.rr_interval if b.rr_interval is not None else math.nan for b in beats
-    ])
 
-    hampel_window = 9
-    systolic_baseline = _hampel_filter(systolic_values, window=hampel_window)
-    diastolic_baseline = _hampel_filter(diastolic_values, window=hampel_window)
-    rr_baseline = _hampel_filter(rr_values, window=hampel_window)
+    if config.enable_pressure_deviation_check:
+        sys_med, sys_mad = _robust_central_tendency(systolic_values)
+        dia_med, dia_mad = _robust_central_tendency(diastolic_values)
+        sys_roll_med, sys_roll_mad = _rolling_median_and_mad(systolic_values, window=9)
+        dia_roll_med, dia_roll_mad = _rolling_median_and_mad(diastolic_values, window=9)
+    else:
+        sys_med = dia_med = math.nan
+        sys_mad = dia_mad = math.nan
+        sys_roll_med = np.full(len(beats), math.nan, dtype=float)
+        sys_roll_mad = np.full(len(beats), math.nan, dtype=float)
+        dia_roll_med = np.full(len(beats), math.nan, dtype=float)
+        dia_roll_mad = np.full(len(beats), math.nan, dtype=float)
 
-    sys_med, sys_mad = _robust_central_tendency(systolic_baseline)
-    dia_med, dia_mad = _robust_central_tendency(diastolic_baseline)
-    rr_med, rr_mad = _robust_central_tendency(rr_baseline)
+    if config.enable_rr_bounds_check or config.enable_rr_deviation_check:
+        rr_values = np.array([
+            b.rr_interval if b.rr_interval is not None else math.nan for b in beats
+        ])
+    else:
+        rr_values = np.array([], dtype=float)
 
-    sys_roll_med, sys_roll_mad = _rolling_median_and_mad(systolic_baseline, window=hampel_window)
-    dia_roll_med, dia_roll_mad = _rolling_median_and_mad(diastolic_baseline, window=hampel_window)
-    rr_roll_med, rr_roll_mad = _rolling_median_and_mad(rr_baseline, window=hampel_window)
+    if config.enable_rr_deviation_check:
+        rr_med, rr_mad = _robust_central_tendency(rr_values)
+        rr_roll_med, rr_roll_mad = _rolling_median_and_mad(rr_values, window=9)
+    else:
+        rr_med = rr_mad = math.nan
+        rr_roll_med = np.full(len(beats), math.nan, dtype=float)
+        rr_roll_mad = np.full(len(beats), math.nan, dtype=float)
 
     min_rr, max_rr = config.rr_bounds
 
@@ -2588,23 +2609,10 @@ def apply_artifact_rules(beats: List[Beat], *, config: ArtifactConfig) -> None:
                 severe_reasons.append("implausible systolic")
             if beat.diastolic_pressure < 20 or beat.diastolic_pressure > 160:
                 severe_reasons.append("implausible diastolic")
-        if (
-            config.enable_pulse_pressure_check
-            and math.isfinite(beat.systolic_pressure)
-            and math.isfinite(beat.diastolic_pressure)
+        if config.enable_pulse_pressure_check and (
+            beat.systolic_pressure - beat.diastolic_pressure < config.pulse_pressure_min
         ):
-            local_sbp = sys_roll_med[idx] if math.isfinite(sys_roll_med[idx]) else sys_med
-            if not math.isfinite(local_sbp):
-                local_sbp = sys_med
-            threshold = config.pulse_pressure_absolute_floor
-            if math.isfinite(local_sbp) and config.pulse_pressure_adaptive_factor > 0:
-                adaptive_floor = config.pulse_pressure_adaptive_factor * max(local_sbp, 0.0)
-                if math.isfinite(adaptive_floor):
-                    threshold = max(threshold, adaptive_floor)
-            if beat.systolic_pressure - beat.diastolic_pressure < threshold:
-                severe_reasons.append(
-                    f"low pulse pressure (threshold {threshold:.1f} mmHg)"
-                )
+            severe_reasons.append("low pulse pressure")
 
         if config.enable_pressure_deviation_check:
             sys_ref = sys_roll_med[idx] if math.isfinite(sys_roll_med[idx]) else sys_med
@@ -2669,6 +2677,119 @@ def apply_artifact_rules(beats: List[Beat], *, config: ArtifactConfig) -> None:
         beat.artifact_reasons = combined_reasons if beat.is_artifact else []
 
 
+def _apply_scipy_artifact_fallback(beats: List[Beat], *, config: ArtifactConfig) -> None:
+    """Apply SciPy-only artifact logic for beats detected via the SciPy backend."""
+
+    if not beats:
+        return
+
+    systolic = np.asarray([beat.systolic_pressure for beat in beats], dtype=float)
+    diastolic = np.asarray([beat.diastolic_pressure for beat in beats], dtype=float)
+    mean_arterial = np.asarray([beat.map_pressure for beat in beats], dtype=float)
+    rr_intervals = np.asarray(
+        [beat.rr_interval if beat.rr_interval is not None else math.nan for beat in beats],
+        dtype=float,
+    )
+
+    sys_median, sys_mad = _robust_central_tendency(systolic)
+    dia_median, dia_mad = _robust_central_tendency(diastolic)
+    rr_median, rr_mad = _robust_central_tendency(rr_intervals)
+    map_median, map_mad = _robust_central_tendency(mean_arterial)
+
+    mad_multiplier = max(config.scipy_mad_multiplier, 0.0)
+
+    for idx, beat in enumerate(beats):
+        triggered: List[str] = []
+
+        if (
+            idx > 0
+            and math.isfinite(sys_median)
+            and math.isfinite(sys_mad)
+            and math.isfinite(systolic[idx])
+            and math.isfinite(systolic[idx - 1])
+        ):
+            deviation = abs(systolic[idx] - sys_median)
+            diff_prev = abs(systolic[idx] - systolic[idx - 1])
+            if (
+                deviation > mad_multiplier * sys_mad
+                and diff_prev > config.abs_sys_difference_artifact
+            ):
+                triggered.append("systolic deviation")
+
+        if (
+            idx >= 2
+            and math.isfinite(dia_median)
+            and math.isfinite(dia_mad)
+            and math.isfinite(diastolic[idx - 1])
+            and math.isfinite(diastolic[idx - 2])
+        ):
+            prev_dev = abs(diastolic[idx - 1] - dia_median)
+            prev_diff = abs(diastolic[idx - 1] - diastolic[idx - 2])
+            if (
+                prev_dev > mad_multiplier * dia_mad
+                and prev_diff > config.abs_dia_difference_artifact
+            ):
+                triggered.append("preceding diastolic deviation")
+
+        if (
+            idx > 0
+            and math.isfinite(rr_median)
+            and math.isfinite(rr_mad)
+            and math.isfinite(rr_intervals[idx])
+        ):
+            rr_dev = abs(rr_intervals[idx] - rr_median)
+            if (
+                rr_dev > mad_multiplier * rr_mad
+                and rr_intervals[idx] < config.max_rr_artifact
+            ):
+                triggered.append("short RR interval")
+
+        criteria_count = len(triggered)
+        if criteria_count >= 2:
+            beat.is_artifact = True
+            action = "exclusion" if criteria_count == 3 else "flag"
+            beat.artifact_reasons.append(
+                "SciPy artifact {} ({} criteria: {})".format(
+                    action,
+                    f"{criteria_count}/3",
+                    ", ".join(triggered),
+                )
+            )
+
+        point_flags: List[str] = []
+        if (
+            math.isfinite(sys_median)
+            and math.isfinite(sys_mad)
+            and math.isfinite(systolic[idx])
+            and abs(systolic[idx] - sys_median) > mad_multiplier * sys_mad
+        ):
+            point_flags.append("systolic")
+        if (
+            math.isfinite(dia_median)
+            and math.isfinite(dia_mad)
+            and math.isfinite(diastolic[idx])
+            and abs(diastolic[idx] - dia_median) > mad_multiplier * dia_mad
+        ):
+            point_flags.append("diastolic")
+        if (
+            math.isfinite(map_median)
+            and math.isfinite(map_mad)
+            and math.isfinite(mean_arterial[idx])
+            and abs(mean_arterial[idx] - map_median) > mad_multiplier * map_mad
+        ):
+            point_flags.append("MAP")
+
+        if point_flags:
+            beat.is_artifact = True
+            beat.artifact_reasons.append(
+                "SciPy MAD flag for {}".format(", ".join(point_flags))
+            )
+
+    for beat in beats:
+        if beat.artifact_reasons:
+            beat.artifact_reasons = sorted(set(beat.artifact_reasons))
+
+
 def plot_waveform(
     time: np.ndarray,
     pressure: np.ndarray,
@@ -2679,6 +2800,9 @@ def plot_waveform(
     downsample_stride: int = 1,
 ) -> None:
     """Plot the waveform with annotated beat landmarks."""
+
+    if plt is None:  # pragma: no cover - handled in main
+        raise RuntimeError("matplotlib is required for plotting")
 
     plt.figure(figsize=(12, 6))
     time_values = np.asarray(time, dtype=float)
@@ -2819,17 +2943,19 @@ def compute_bpv_psd(
     resample_fs: float,
     nperseg: int = 256,
 ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """Compute Welch PSD for beat-to-beat series."""
+    """Compute Welch PSD for beat-to-beat series when SciPy is present."""
+
+    if sp_signal is None:
+        return None
 
     grid_time, resampled = _resample_even_grid(beat_times, beat_values, resample_fs)
     if grid_time.size < nperseg:
         return None
 
-    freqs, power = sp_signal.welch(
-        resampled,
-        fs=resample_fs,
-        nperseg=min(nperseg, len(resampled)),
-    )
+    try:
+        freqs, power = sp_signal.welch(resampled, fs=resample_fs, nperseg=min(nperseg, len(resampled)))
+    except Exception:
+        return None
 
     return freqs, power
 
@@ -2905,6 +3031,10 @@ def print_column_overview(frame: Optional[pd.DataFrame]) -> None:
 def select_file_via_dialog() -> Optional[Path]:
     """Open a file picker to select a waveform export."""
 
+    if tk is None or filedialog is None:
+        print("Tkinter is not available; please supply a file path as an argument.")
+        return None
+
     root = tk.Tk()
     root.withdraw()
     file_types = [("Text files", "*.txt"), ("All files", "*")]
@@ -2931,6 +3061,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Multiplier for adaptive prominence threshold based on noise.",
     )
     parser.add_argument(
+        "--beat-detector",
+        choices=("scipy", "hybrid"),
+        default="hybrid",
+        help="Select 'scipy' for plain SciPy peak detection or 'hybrid' to include rolling median/MAD heuristics.",
+    )
+    parser.add_argument(
         "--systolic-mad-multiplier",
         type=float,
         default=4.5,
@@ -2948,18 +3084,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=3.5,
         help="MAD multiplier for RR-interval outlier detection.",
     )
-    parser.add_argument(
-        "--pulse-pressure-min",
-        type=float,
-        default=10.0,
-        help="Absolute minimum pulse pressure (mmHg) before adaptive scaling.",
-    )
-    parser.add_argument(
-        "--pulse-pressure-adaptive-factor",
-        type=float,
-        default=0.18,
-        help="Multiplier applied to the local SBP median for the adaptive pulse pressure floor.",
-    )
+    parser.add_argument("--pulse-pressure-min", type=float, default=10.0, help="Minimum pulse pressure (mmHg).")
     parser.add_argument(
         "--systolic-abs-floor",
         type=float,
@@ -2979,6 +3104,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Maximum tolerated gap (s) before interpolated beats are flagged.",
     )
     parser.add_argument(
+        "--scipy-mad-multiplier",
+        type=float,
+        default=3.0,
+        help="MAD multiplier used by the SciPy fallback artifact logic.",
+    )
+    parser.add_argument(
+        "--scipy-abs-sys-diff",
+        type=float,
+        default=10.0,
+        help="Absolute systolic difference (mmHg) threshold for SciPy artifact exclusion.",
+    )
+    parser.add_argument(
+        "--scipy-abs-dia-diff",
+        type=float,
+        default=10.0,
+        help="Absolute diastolic difference (mmHg) threshold for SciPy artifact exclusion.",
+    )
+    parser.add_argument(
+        "--scipy-max-rr",
+        type=float,
+        default=0.5,
+        help="Maximum RR interval (s) considered in SciPy artifact exclusion.",
+    )
+    parser.add_argument(
         "--pnn-threshold",
         type=float,
         default=50.0,
@@ -2995,9 +3144,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--savefig", type=Path, help="Save the plot to this path instead of/as well as showing it.")
     parser.add_argument("--no-plot", action="store_true", help="Skip interactive plot display.")
     parser.add_argument(
-        "--skip-artifacts",
+        "--disable-numba",
         action="store_true",
-        help="Skip all artifact detection heuristics for maximum speed.",
+        help="Disable Numba JIT acceleration even if it is installed.",
     )
     return parser
 
@@ -3006,7 +3155,7 @@ def main(argv: Sequence[str]) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv[1:])
 
-    configure_numba(True)
+    configure_numba(not getattr(args, "disable_numba", False))
 
     if args.min_rr >= args.max_rr:
         parser.error("--min-rr must be less than --max-rr")
@@ -3046,18 +3195,20 @@ def main(argv: Sequence[str]) -> int:
     time_default = _default_column_selection(
         preview.column_names,
         args.time_column,
+        fallback="Time",
     )
     remaining = [name for name in preview.column_names if name != time_default]
     pressure_default = _default_column_selection(
         remaining if remaining else preview.column_names,
         args.column if args.column != time_default else None,
+        fallback="reBAP",
     )
 
     selected_time_column: Optional[str] = None
     selected_pressure_column: Optional[str] = None
     dialog_shown = False
     dialog_result: Optional[ImportDialogResult] = None
-    analysis_downsample = 4
+    analysis_downsample = 1
     plot_downsample = 10
     artifact_options = {
         "enable_range_checks": True,
@@ -3068,7 +3219,6 @@ def main(argv: Sequence[str]) -> int:
         "enable_prominence_check": True,
         "enable_gap_checks": True,
         "enable_post_calibration_check": True,
-        "enable_artifact_rules": True,
     }
 
     if tk is not None:
@@ -3103,12 +3253,6 @@ def main(argv: Sequence[str]) -> int:
                     "enable_post_calibration_check": dialog_result.enable_post_calibration_check,
                 }
             )
-
-    if args.skip_artifacts:
-        artifact_options["enable_artifact_rules"] = False
-        artifact_options["enable_gap_checks"] = False
-        artifact_options["enable_post_calibration_check"] = False
-        print("Skipping artifact detection heuristics per --skip-artifacts.")
 
     print(f"Loaded file preview: {file_path}")
     print(f"\nColumn preview (first {preview.preview_rows} rows loaded for preview):")
@@ -3170,12 +3314,22 @@ def main(argv: Sequence[str]) -> int:
         time = np.arange(len(frame), dtype=np.float32) * np.float32(interval)
 
     if analysis_downsample > 1:
-        effective_fs = fs / analysis_downsample if fs > 0 else fs
-        print(
-            "Applying analysis downsampling: "
-            f"peak detection uses every {analysis_downsample}th sample "
-            f"(effective fs {effective_fs:.3f} Hz)."
-        )
+        downsampled_time = time[::analysis_downsample]
+        downsampled_pressure = pressure[::analysis_downsample]
+        if downsampled_time.size == 0 or downsampled_pressure.size == 0:
+            print(
+                "Warning: analysis downsampling factor removed all samples; using full resolution."
+            )
+            analysis_downsample = 1
+        else:
+            time = downsampled_time
+            pressure = downsampled_pressure
+            interval *= analysis_downsample
+            fs = 1.0 / interval if interval > 0 else fs / analysis_downsample
+            print(
+                "Applying analysis downsampling: "
+                f"using every {analysis_downsample}th sample (effective fs {fs:.3f} Hz)."
+            )
 
     config = ArtifactConfig(
         systolic_mad_multiplier=args.systolic_mad_multiplier,
@@ -3183,14 +3337,20 @@ def main(argv: Sequence[str]) -> int:
         rr_mad_multiplier=args.rr_mad_multiplier,
         systolic_abs_floor=args.systolic_abs_floor,
         diastolic_abs_floor=args.diastolic_abs_floor,
-        pulse_pressure_absolute_floor=args.pulse_pressure_min,
-        pulse_pressure_adaptive_factor=args.pulse_pressure_adaptive_factor,
+        pulse_pressure_min=args.pulse_pressure_min,
         rr_bounds=(args.min_rr, args.max_rr),
         min_prominence=args.min_prominence,
         prominence_noise_factor=args.prominence_factor,
         max_missing_gap=args.max_gap,
+        scipy_mad_multiplier=args.scipy_mad_multiplier,
+        abs_sys_difference_artifact=args.scipy_abs_sys_diff,
+        abs_dia_difference_artifact=args.scipy_abs_dia_diff,
+        max_rr_artifact=args.scipy_max_rr,
         **artifact_options,
     )
+
+    use_rolling_statistics = args.beat_detector != "scipy"
+    apply_scipy_artifact_logic = args.beat_detector == "scipy"
 
     try:
         beats = derive_beats(
@@ -3198,7 +3358,8 @@ def main(argv: Sequence[str]) -> int:
             pressure,
             fs=fs,
             config=config,
-            analysis_downsample=analysis_downsample,
+            use_rolling_statistics=use_rolling_statistics,
+            apply_scipy_artifact_logic=apply_scipy_artifact_logic,
         )
     except Exception as exc:  # pragma: no cover - interactive feedback
         print(f"Beat detection failed: {exc}")
@@ -3255,7 +3416,9 @@ def main(argv: Sequence[str]) -> int:
         )
 
     if args.psd:
-        if clean_beats.empty:
+        if sp_signal is None:
+            print("SciPy is not installed; skipping PSD computation.")
+        elif clean_beats.empty:
             print("PSD skipped because no clean beats are available.")
         else:
             beat_times = clean_beats["systolic_time"].to_numpy(dtype=float)
@@ -3277,7 +3440,7 @@ def main(argv: Sequence[str]) -> int:
                         nperseg=args.psd_nperseg,
                     )
                     if result is None:
-                        print(f"PSD for {label} unavailable (insufficient data).")
+                        print(f"PSD for {label} unavailable (insufficient data or SciPy error).")
                         continue
                     freqs, power = result
                     lf = _bandpower(freqs, power, (0.04, 0.15))
@@ -3289,7 +3452,9 @@ def main(argv: Sequence[str]) -> int:
                     )
 
     show_plot = not args.no_plot
-    if show_plot or args.savefig:
+    if plt is None and (show_plot or args.savefig):
+        print("matplotlib is required to visualise or save the waveform plot.")
+    elif show_plot or args.savefig:
         plot_waveform(
             time,
             pressure,
