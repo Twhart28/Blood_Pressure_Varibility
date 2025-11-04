@@ -264,6 +264,979 @@ def _robust_central_tendency(values: np.ndarray) -> Tuple[float, float]:
     return median, mad
 
 
+def _parse_list_field(raw_value: str) -> List[str]:
+    """Split a metadata field that contains multiple values.
+
+    Continuous BP exports frequently separate list-style metadata (such as
+    ``ChannelTitle`` entries) using tab characters.  When tabs are not
+    available we fall back to splitting on whitespace while attempting to
+    preserve multi-word labels.
+    """
+
+    raw_value = raw_value.strip()
+    if not raw_value:
+        return []
+
+    parts = [item.strip() for item in re.split(r"\t+", raw_value) if item.strip()]
+    if parts:
+        return parts
+
+    tokens = [tok for tok in raw_value.split(" ") if tok]
+    merged: List[str] = []
+    buffer: List[str] = []
+    for tok in tokens:
+        if tok and tok[0].isupper() and not tok.isupper():
+            if buffer:
+                merged.append(" ".join(buffer))
+                buffer = []
+            buffer.append(tok)
+        elif buffer:
+            buffer.append(tok)
+        else:
+            merged.append(tok)
+    if buffer:
+        merged.append(" ".join(buffer))
+
+    return merged or tokens
+
+
+def _parse_bp_header(
+    file_path: Path, *, max_data_lines: int = 5
+) -> Tuple[Dict[str, str], List[int], List[str], Optional[str]]:
+    """Return metadata, skip rows, column names, and a detected separator."""
+
+    metadata: Dict[str, str] = {}
+    skiprows: List[int] = []
+    column_count: Optional[int] = None
+    first_numeric_row_idx: Optional[int] = None
+    numeric_samples: List[str] = []
+    numeric_lines_checked = 0
+
+    if max_data_lines <= 0:
+        max_data_lines = 1
+
+    def _numeric_values(candidate: str) -> np.ndarray:
+        tokens = [tok for tok in re.split(r"[\s,;|]+", candidate) if tok]
+        if not tokens:
+            return np.array([], dtype=float)
+        try:
+            return np.asarray([float(tok) for tok in tokens], dtype=float)
+        except ValueError:
+            return np.array([], dtype=float)
+
+    with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for idx, raw_line in enumerate(handle):
+            stripped = raw_line.strip()
+
+            if first_numeric_row_idx is None:
+                if not stripped:
+                    skiprows.append(idx)
+                    continue
+
+                candidate = stripped
+                if "#" in candidate:
+                    candidate = candidate.split("#", 1)[0].strip()
+                    if not candidate:
+                        skiprows.append(idx)
+                        continue
+
+                if "=" in candidate and not re.match(r"^[+-]?[0-9]", candidate):
+                    key, value = candidate.split("=", 1)
+                    metadata[key.strip()] = value.strip()
+                    skiprows.append(idx)
+                    continue
+
+                values = _numeric_values(candidate)
+                if values.size == 0:
+                    skiprows.append(idx)
+                    continue
+
+                column_count = int(values.size)
+                first_numeric_row_idx = idx
+                numeric_samples.append(raw_line.rstrip("\n"))
+                numeric_lines_checked = 1
+
+                if numeric_lines_checked >= max_data_lines:
+                    break
+                continue
+
+            if not stripped:
+                break
+
+            candidate = stripped
+            if "#" in candidate:
+                candidate = candidate.split("#", 1)[0].strip()
+                if not candidate:
+                    break
+
+            values = _numeric_values(candidate)
+            if values.size == 0:
+                break
+
+            if column_count is None:
+                column_count = int(values.size)
+            elif int(values.size) != column_count:
+                raise ValueError(
+                    "Encountered data row with an unexpected column count at "
+                    f"line {idx + 1}: expected {column_count}, found {int(values.size)}."
+                )
+
+            numeric_samples.append(raw_line.rstrip("\n"))
+            numeric_lines_checked += 1
+            if numeric_lines_checked >= max_data_lines:
+                break
+
+    if column_count is None or first_numeric_row_idx is None:
+        raise ValueError("No numeric data found in file.")
+
+    channels = _parse_list_field(metadata.get("ChannelTitle", ""))
+    if channels and column_count == len(channels) + 1:
+        column_names = ["Time"] + channels
+    else:
+        column_names = [f"col_{idx}" for idx in range(column_count)]
+
+    detected_separator: Optional[str] = None
+    if numeric_samples:
+        candidate_lines = numeric_samples
+
+        def _consistently_splits(
+            delimiter: str, *, allow_blank_tokens: bool = False
+        ) -> bool:
+            for line in candidate_lines:
+                stripped_line = line.strip()
+                parts = stripped_line.split(delimiter)
+                if len(parts) != column_count:
+                    return False
+                if not allow_blank_tokens and any(part == "" for part in parts):
+                    return False
+            return True
+
+        for delimiter in ("\t", ",", ";", "|"):
+            if all(delimiter in line for line in candidate_lines) and _consistently_splits(
+                delimiter, allow_blank_tokens=True
+            ):
+                detected_separator = delimiter
+                break
+
+        if detected_separator is None and all("\t" not in line for line in candidate_lines):
+            if _consistently_splits(" "):
+                detected_separator = " "
+
+    return metadata, skiprows, column_names, detected_separator
+
+
+def _scan_bp_file(
+    file_path: Path,
+    *,
+    max_numeric_rows: int = 200,
+    header_sample_lines: int = 5,
+    separator_override: Optional[str] = None,
+) -> BPFilePreview:
+    """Perform a quick pass to gather metadata and column previews."""
+
+    metadata, skiprows, column_names, detected_separator = _parse_bp_header(
+        file_path, max_data_lines=header_sample_lines
+    )
+
+    if separator_override:
+        detected_separator = separator_override
+
+    preview_frame: Optional[pd.DataFrame] = None
+    read_kwargs = dict(
+        filepath_or_buffer=file_path,
+        comment="#",
+        header=None,
+        names=column_names,
+        skiprows=skiprows,
+        nrows=max_numeric_rows,
+        na_values=["nan", "NaN", "NA"],
+        dtype=float,
+    )
+
+    if detected_separator:
+        try:
+            if len(detected_separator) == 1:
+                preview_frame = pd.read_csv(
+                    sep=detected_separator,
+                    engine="c",
+                    **read_kwargs,
+                )
+            else:
+                preview_frame = pd.read_csv(
+                    sep=detected_separator,
+                    engine="python",
+                    **read_kwargs,
+                )
+        except Exception:
+            preview_frame = pd.read_csv(
+                delim_whitespace=True,
+                engine="python",
+                **read_kwargs,
+            )
+    else:
+        preview_frame = pd.read_csv(
+            delim_whitespace=True,
+            engine="python",
+            **read_kwargs,
+        )
+
+    raw_lines: List[str] = []
+    try:
+        with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for _ in range(200):
+                line = handle.readline()
+                if not line:
+                    break
+                raw_lines.append(line.rstrip("\r\n"))
+    except Exception:
+        raw_lines = []
+
+    return BPFilePreview(
+        metadata=metadata,
+        column_names=column_names,
+        preview=preview_frame,
+        skiprows=skiprows,
+        detected_separator=detected_separator,
+        raw_lines=raw_lines,
+        preview_rows=max(1, max_numeric_rows),
+    )
+
+
+def _tokenise_preview_line(line: str, separator: Optional[str]) -> List[str]:
+    """Split a raw preview line using the provided separator."""
+
+    if not line:
+        return []
+
+    if separator is None:
+        stripped = line.strip()
+        if not stripped:
+            return []
+        return [tok for tok in re.split(r"\s+", stripped) if tok]
+
+    if separator == " ":
+        stripped = line.strip()
+        if not stripped:
+            return []
+        return [tok for tok in re.split(r"\s+", stripped) if tok]
+
+    try:
+        return next(csv.reader([line], delimiter=separator))
+    except Exception:
+        return line.split(separator)
+
+
+def _build_preview_dataframe(
+    file_path: Path,
+    *,
+    column_names: Sequence[str],
+    skiprows: Sequence[int],
+    separator: Optional[str],
+    max_rows: int,
+) -> pd.DataFrame:
+    """Construct a small DataFrame preview for the selected layout."""
+
+    read_kwargs = dict(
+        filepath_or_buffer=file_path,
+        header=None,
+        names=list(column_names),
+        skiprows=list(skiprows),
+        nrows=max_rows,
+        na_values=["nan", "NaN", "NA"],
+    )
+
+    if separator:
+        try:
+            engine = "c" if len(separator) == 1 else "python"
+            return pd.read_csv(sep=separator, engine=engine, **read_kwargs)
+        except Exception:
+            return pd.read_csv(delim_whitespace=True, engine="python", **read_kwargs)
+
+    return pd.read_csv(delim_whitespace=True, engine="python", **read_kwargs)
+
+
+def _render_preview_to_text_widget(
+    widget: tk.Text,
+    preview_rows: Sequence[Sequence[str]],
+    *,
+    header_row_index: int,
+    first_data_row_index: int,
+    time_column_index: Optional[int],
+    pressure_column_index: Optional[int],
+    max_rows: int = 200,
+) -> None:
+    """Render a preview table into a Tkinter text widget with highlights."""
+
+    if tk is None:
+        return
+
+    widget.configure(state="normal")
+    widget.delete("1.0", tk.END)
+
+    if not preview_rows:
+        widget.insert("end", "No preview data available.\n")
+        widget.configure(state="disabled")
+        return
+
+    header_row_index = max(1, header_row_index)
+    first_data_row_index = max(1, first_data_row_index)
+
+    widths: List[int] = []
+    sample_rows = list(preview_rows[:max_rows])
+    for row in sample_rows:
+        for idx, value in enumerate(row):
+            if value is None:
+                value = ""
+            text_value = str(value)
+            if idx >= len(widths):
+                widths.append(len(text_value))
+            else:
+                widths[idx] = max(widths[idx], len(text_value))
+
+    line_no = 1
+    for row_number, row_values in enumerate(sample_rows, start=1):
+        line_parts: List[str] = []
+        positions: List[Tuple[int, int, int]] = []
+        cursor = 0
+        for col_idx, width in enumerate(widths):
+            value = ""
+            if col_idx < len(row_values) and row_values[col_idx] is not None:
+                value = str(row_values[col_idx])
+            padded = value.ljust(width + 2)
+            start = cursor
+            end = cursor + len(padded)
+            positions.append((start, end, col_idx))
+            line_parts.append(padded)
+            cursor = end
+
+        line_text = "".join(line_parts)
+        widget.insert("end", line_text + "\n")
+
+        row_tag = "row_even" if row_number % 2 == 0 else "row_odd"
+        widget.tag_add(row_tag, f"{line_no}.0", f"{line_no}.end")
+
+        if row_number == header_row_index:
+            widget.tag_add("header", f"{line_no}.0", f"{line_no}.end")
+        if row_number == first_data_row_index:
+            widget.tag_add("data_start", f"{line_no}.0", f"{line_no}.end")
+
+        for start, end, col_idx in positions:
+            if time_column_index is not None and col_idx == time_column_index:
+                widget.tag_add("highlight_time", f"{line_no}.{start}", f"{line_no}.{end}")
+            if pressure_column_index is not None and col_idx == pressure_column_index:
+                widget.tag_add("highlight_pressure", f"{line_no}.{start}", f"{line_no}.{end}")
+
+        line_no += 1
+
+    widget.configure(state="disabled")
+    widget.tag_raise("column_index")
+    widget.tag_raise("highlight_time")
+    widget.tag_raise("highlight_pressure")
+    widget.tag_raise("data_start")
+    widget.tag_raise("header")
+
+
+def _default_column_selection(
+    column_names: Sequence[str],
+    requested: Optional[str],
+    *,
+    fallback: Optional[str] = None,
+) -> str:
+    """Return a sensible default column name."""
+
+    if requested and requested in column_names:
+        return requested
+
+    if fallback and fallback in column_names:
+        return fallback
+
+    if column_names:
+        return column_names[0]
+
+    raise ValueError("No columns available for selection.")
+
+
+def _select_columns_via_cli(
+    column_names: Sequence[str],
+    *,
+    default_time: str,
+    default_pressure: str,
+) -> Tuple[str, str]:
+    """Prompt for time/pressure selection using stdin."""
+
+    if not sys.stdin.isatty():
+        return default_time, default_pressure
+
+    print("\nSelect time and pressure columns (press Enter to accept defaults).")
+    for idx, name in enumerate(column_names):
+        marker = ""
+        if name == default_time:
+            marker = " (default time)"
+        elif name == default_pressure:
+            marker = " (default pressure)"
+        print(f"  [{idx}] {name}{marker}")
+
+    def _prompt(label: str, default: str) -> str:
+        while True:
+            response = input(f"{label} [{default}]: ").strip()
+            if not response:
+                return default
+            if response in column_names:
+                return response
+            if response.isdigit():
+                idx = int(response)
+                if 0 <= idx < len(column_names):
+                    return column_names[idx]
+            print("Invalid selection. Choose a column name or index.")
+
+    time_column = _prompt("Time column", default_time)
+    while True:
+        pressure_column = _prompt("Pressure column", default_pressure)
+        if pressure_column == time_column:
+            print("Pressure column must differ from the time column.")
+        else:
+            break
+
+    return time_column, pressure_column
+
+
+def _select_columns_via_tk(
+    column_names: Sequence[str],
+    *,
+    default_time: str,
+    default_pressure: str,
+) -> Tuple[str, str]:
+    """Display a Tkinter dialog for column selection."""
+
+    if tk is None:
+        return default_time, default_pressure
+
+    root = tk.Tk()
+    root.title("Select waveform columns")
+    root.geometry("360x180")
+
+    time_var = tk.StringVar(value=default_time)
+    pressure_var = tk.StringVar(value=default_pressure)
+    error_var = tk.StringVar(value="")
+
+    tk.Label(root, text="Time column:").pack(pady=(12, 0))
+    tk.OptionMenu(root, time_var, *column_names).pack()
+
+    tk.Label(root, text="Pressure column:").pack(pady=(8, 0))
+    tk.OptionMenu(root, pressure_var, *column_names).pack()
+
+    error_label = tk.Label(root, textvariable=error_var, fg="red")
+    error_label.pack(pady=(6, 0))
+
+    selection: Dict[str, str] = {}
+
+    def confirm() -> None:
+        time_choice = time_var.get()
+        pressure_choice = pressure_var.get()
+        if time_choice == pressure_choice:
+            error_var.set("Time and pressure must differ.")
+            return
+        selection["time"] = time_choice
+        selection["pressure"] = pressure_choice
+        root.quit()
+
+    tk.Button(root, text="Confirm", command=confirm).pack(pady=12)
+
+    root.mainloop()
+    root.destroy()
+
+    if "time" in selection and "pressure" in selection:
+        return selection["time"], selection["pressure"]
+
+    return default_time, default_pressure
+
+
+def select_time_pressure_columns(
+    preview: BPFilePreview,
+    *,
+    requested_time: Optional[str] = None,
+    requested_pressure: Optional[str] = None,
+    allow_gui: bool = True,
+) -> Tuple[str, str]:
+    """Resolve the time and pressure columns, prompting the user when possible."""
+
+    column_names = preview.column_names
+    time_default = _default_column_selection(column_names, requested_time, fallback="Time")
+
+    remaining = [name for name in column_names if name != time_default]
+    pressure_default = _default_column_selection(
+        remaining if remaining else column_names,
+        requested_pressure if requested_pressure != time_default else None,
+        fallback="reBAP",
+    )
+
+    if allow_gui and tk is not None:
+        try:
+            return _select_columns_via_tk(
+                column_names,
+                default_time=time_default,
+                default_pressure=pressure_default,
+            )
+        except Exception:
+            pass
+
+    return _select_columns_via_cli(
+        column_names,
+        default_time=time_default,
+        default_pressure=pressure_default,
+    )
+
+
+def launch_import_configuration_dialog(
+    file_path: Path,
+    preview: BPFilePreview,
+    *,
+    time_default: str,
+    pressure_default: str,
+    separator_override: Optional[str] = None,
+) -> Optional[ImportDialogResult]:
+    """Display a dialog allowing the user to adjust delimiter and column selections."""
+
+    if tk is None or ttk is None:
+        return None
+
+    delimiter_options: List[Tuple[str, Optional[str]]] = [
+        ("Auto-detect", None),
+        ("Tab (\\t)", "\t"),
+        ("Comma (,)", ","),
+        ("Semicolon (;)", ";"),
+        ("Pipe (|)", "|"),
+        ("Space", " "),
+    ]
+
+    downsample_options: List[Tuple[str, int]] = [
+        ("Full resolution (1×)", 1),
+        ("Every 2nd sample (2×)", 2),
+        ("Every 5th sample (5×)", 5),
+        ("Every 10th sample (10×)", 10),
+        ("Every 20th sample (20×)", 20),
+        ("Every 50th sample (50×)", 50),
+    ]
+
+    def _label_for_separator(value: Optional[str]) -> str:
+        for label, candidate in delimiter_options:
+            if value == candidate:
+                return label
+        return "Auto-detect"
+
+    def _resolve_separator_from_label(label: str) -> Optional[str]:
+        for option_label, value in delimiter_options:
+            if option_label == label:
+                return value
+        return None
+
+    def _label_for_downsample(value: int) -> str:
+        for label, candidate in downsample_options:
+            if value == candidate:
+                return label
+        return downsample_options[0][0]
+
+    root = tk.Tk()
+    root.title("Import configuration")
+    root.geometry("760x540")
+
+    main_frame = ttk.Frame(root, padding=12)
+    main_frame.grid(row=0, column=0, sticky="nsew")
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(0, weight=1)
+
+    controls_frame = ttk.Frame(main_frame)
+    controls_frame.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+    controls_frame.columnconfigure(5, weight=1)
+
+    ttk.Label(controls_frame, text="Delimiter:").grid(row=0, column=0, sticky="w")
+    delimiter_var = tk.StringVar(value=_label_for_separator(separator_override or preview.detected_separator))
+    delimiter_combo = ttk.Combobox(
+        controls_frame,
+        state="readonly",
+        values=[label for label, _ in delimiter_options],
+        textvariable=delimiter_var,
+        width=28,
+    )
+    delimiter_combo.grid(row=0, column=1, sticky="w", padx=(8, 24))
+
+    ttk.Label(controls_frame, text="Header row:").grid(row=1, column=0, sticky="w", pady=(12, 0))
+    header_var = tk.StringVar(value="1")
+    header_entry = ttk.Entry(controls_frame, textvariable=header_var, width=6)
+    header_entry.grid(row=1, column=1, sticky="w", padx=(8, 24), pady=(12, 0))
+
+    ttk.Label(controls_frame, text="First data row:").grid(row=1, column=2, sticky="w", pady=(12, 0))
+    first_data_var = tk.StringVar(value="2")
+    first_data_entry = ttk.Entry(controls_frame, textvariable=first_data_var, width=6)
+    first_data_entry.grid(row=1, column=3, sticky="w", padx=(8, 24), pady=(12, 0))
+
+    ttk.Label(controls_frame, text="Time column:").grid(row=0, column=2, sticky="w")
+    time_var = tk.StringVar(value=time_default)
+    time_combo = ttk.Combobox(
+        controls_frame,
+        state="readonly",
+        values=preview.column_names,
+        textvariable=time_var,
+        width=28,
+    )
+    time_combo.grid(row=0, column=3, sticky="w", padx=(8, 24))
+
+    ttk.Label(controls_frame, text="Pressure column:").grid(row=0, column=4, sticky="w")
+    pressure_var = tk.StringVar(value=pressure_default)
+    pressure_combo = ttk.Combobox(
+        controls_frame,
+        state="readonly",
+        values=preview.column_names,
+        textvariable=pressure_var,
+        width=28,
+    )
+    pressure_combo.grid(row=0, column=5, sticky="w", padx=(8, 0))
+
+    ttk.Label(controls_frame, text="Analysis downsampling:").grid(
+        row=2, column=0, sticky="w", pady=(12, 0)
+    )
+    analysis_downsample_var = tk.StringVar(value=_label_for_downsample(1))
+    analysis_downsample_combo = ttk.Combobox(
+        controls_frame,
+        state="readonly",
+        values=[label for label, _ in downsample_options],
+        textvariable=analysis_downsample_var,
+        width=28,
+    )
+    analysis_downsample_combo.grid(row=2, column=1, sticky="w", padx=(8, 24), pady=(12, 0))
+
+    ttk.Label(controls_frame, text="Plot downsampling:").grid(row=2, column=2, sticky="w", pady=(12, 0))
+    plot_downsample_var = tk.StringVar(value=_label_for_downsample(10))
+    plot_downsample_combo = ttk.Combobox(
+        controls_frame,
+        state="readonly",
+        values=[label for label, _ in downsample_options],
+        textvariable=plot_downsample_var,
+        width=28,
+    )
+    plot_downsample_combo.grid(row=2, column=3, sticky="w", padx=(8, 24), pady=(12, 0))
+
+    ttk.Label(controls_frame, text="Comment column index (optional):").grid(
+        row=2, column=4, sticky="w", pady=(12, 0)
+    )
+    comment_index_var = tk.StringVar(value="")
+    comment_entry = ttk.Entry(controls_frame, textvariable=comment_index_var, width=6)
+    comment_entry.grid(row=2, column=5, sticky="w", padx=(8, 0), pady=(12, 0))
+
+    ttk.Label(
+        main_frame,
+        text="Data preview (first 200 rows)",
+        font=("TkDefaultFont", 10, "bold"),
+    ).grid(row=1, column=0, sticky="w")
+
+    preview_frame = ttk.Frame(main_frame, relief=tk.SOLID, borderwidth=1)
+    preview_frame.grid(row=2, column=0, sticky="nsew")
+    preview_frame.columnconfigure(0, weight=1)
+    preview_frame.rowconfigure(0, weight=1)
+
+    preview_text = tk.Text(
+        preview_frame,
+        wrap="none",
+        font=("Courier New", 10),
+        height=20,
+    )
+    preview_text.grid(row=0, column=0, sticky="nsew")
+    preview_text.configure(cursor="arrow")
+    preview_text.bind("<Key>", lambda _: "break")
+
+    y_scroll = ttk.Scrollbar(preview_frame, orient="vertical", command=preview_text.yview)
+    y_scroll.grid(row=0, column=1, sticky="ns")
+    x_scroll = ttk.Scrollbar(preview_frame, orient="horizontal", command=preview_text.xview)
+    x_scroll.grid(row=1, column=0, sticky="ew")
+    preview_text.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+
+    index_bar = tk.Text(
+        preview_frame,
+        width=6,
+        wrap="none",
+        font=("Courier New", 10),
+    )
+    index_bar.grid(row=0, column=2, sticky="ns")
+    index_bar.configure(state="disabled", cursor="arrow")
+
+    preview_rows = [
+        _tokenise_preview_line(line, separator_override or preview.detected_separator)
+        for line in preview.raw_lines[: preview.preview_rows]
+    ]
+
+    def _update_preview_widget() -> None:
+        try:
+            header_row = max(1, int(header_var.get()))
+        except Exception:
+            header_row = 1
+        try:
+            first_data_row = max(1, int(first_data_var.get()))
+        except Exception:
+            first_data_row = 2
+        time_index = None
+        pressure_index = None
+        if time_var.get() in preview.column_names:
+            time_index = preview.column_names.index(time_var.get())
+        if pressure_var.get() in preview.column_names:
+            pressure_index = preview.column_names.index(pressure_var.get())
+
+        index_bar.configure(state="normal")
+        index_bar.delete("1.0", tk.END)
+        for idx in range(1, len(preview_rows) + 1):
+            index_bar.insert("end", f"{idx:>4}\n")
+        index_bar.configure(state="disabled")
+
+        _render_preview_to_text_widget(
+            preview_text,
+            preview_rows,
+            header_row_index=header_row,
+            first_data_row_index=first_data_row,
+            time_column_index=time_index,
+            pressure_column_index=pressure_index,
+        )
+
+    def _refresh_preview_from_separator(*_: object) -> None:
+        separator_value = _resolve_separator_from_label(delimiter_var.get())
+        local_preview = preview
+        try:
+            local_preview = _scan_bp_file(
+                file_path,
+                separator_override=separator_value,
+                max_numeric_rows=preview.preview_rows,
+            )
+        except Exception:
+            pass
+
+        preview_rows[:] = [
+            _tokenise_preview_line(line, separator_value or local_preview.detected_separator)
+            for line in local_preview.raw_lines[: local_preview.preview_rows]
+        ]
+        _update_preview_widget()
+
+    button_frame = ttk.Frame(main_frame)
+    button_frame.grid(row=3, column=0, sticky="e", pady=(12, 0))
+
+    result: Dict[str, object] = {}
+
+    def _confirm() -> None:
+        try:
+            header_row = max(1, int(header_var.get()))
+        except Exception:
+            header_row = 1
+        try:
+            first_data_row = max(1, int(first_data_var.get()))
+        except Exception:
+            first_data_row = 2
+
+        time_choice = time_var.get()
+        pressure_choice = pressure_var.get()
+        if time_choice == pressure_choice:
+            return
+
+        comment_index_value: Optional[int] = None
+        comment_column_name: Optional[str] = None
+        if comment_index_var.get().strip():
+            try:
+                comment_index_value = int(comment_index_var.get())
+                if comment_index_value >= 1 and comment_index_value <= len(preview.column_names):
+                    comment_column_name = preview.column_names[comment_index_value - 1]
+            except Exception:
+                comment_index_value = None
+
+        separator_value = _resolve_separator_from_label(delimiter_var.get())
+
+        result.update(
+            {
+                "preview": preview,
+                "separator": separator_value,
+                "time": time_choice,
+                "pressure": pressure_choice,
+                "header_row": header_row,
+                "first_data_row": first_data_row,
+                "time_index": preview.column_names.index(time_choice),
+                "pressure_index": preview.column_names.index(pressure_choice),
+                "analysis_downsample": next(
+                    value for label, value in downsample_options if label == analysis_downsample_var.get()
+                ),
+                "plot_downsample": next(
+                    value for label, value in downsample_options if label == plot_downsample_var.get()
+                ),
+                "comment_index": comment_index_value,
+                "comment_name": comment_column_name,
+            }
+        )
+        root.quit()
+
+    def _cancel() -> None:
+        result.clear()
+        root.quit()
+
+    delimiter_var.trace_add("write", _refresh_preview_from_separator)
+    time_var.trace_add("write", lambda *_: _update_preview_widget())
+    pressure_var.trace_add("write", lambda *_: _update_preview_widget())
+
+    ttk.Button(button_frame, text="Cancel", command=_cancel).grid(row=0, column=0, padx=(0, 8))
+    ttk.Button(button_frame, text="Import", command=_confirm).grid(row=0, column=1)
+
+    root.protocol("WM_DELETE_WINDOW", _cancel)
+
+    _update_preview_widget()
+
+    root.mainloop()
+    root.destroy()
+
+    required_keys = {
+        "time",
+        "pressure",
+        "preview",
+        "separator",
+        "header_row",
+        "first_data_row",
+        "time_index",
+        "pressure_index",
+        "analysis_downsample",
+        "plot_downsample",
+    }
+    if required_keys.issubset(result.keys()):
+        return ImportDialogResult(
+            preview=result["preview"],
+            separator=result.get("separator"),
+            time_column=str(result["time"]),
+            pressure_column=str(result["pressure"]),
+            header_row=int(result["header_row"]),
+            first_data_row=int(result["first_data_row"]),
+            time_column_index=int(result["time_index"]),
+            pressure_column_index=int(result["pressure_index"]),
+            comment_column=(
+                str(result["comment_name"])
+                if result.get("comment_name") not in (None, "")
+                else None
+            ),
+            comment_column_index=(
+                int(result["comment_index"])
+                if isinstance(result.get("comment_index"), int)
+                else None
+            ),
+            analysis_downsample=int(result["analysis_downsample"]),
+            plot_downsample=int(result["plot_downsample"]),
+        )
+
+    return None
+
+
+def load_bp_file(
+    file_path: Path,
+    *,
+    preview: Optional[BPFilePreview] = None,
+    time_column: Optional[str] = None,
+    pressure_column: Optional[str] = None,
+    separator: Optional[str] = None,
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Load the selected columns from a waveform export."""
+
+    if preview is None:
+        preview = _scan_bp_file(file_path, separator_override=separator)
+    elif separator:
+        preview.detected_separator = separator
+
+    if (
+        time_column is None
+        or time_column not in preview.column_names
+        or pressure_column is None
+        or pressure_column not in preview.column_names
+    ):
+        time_column, pressure_column = select_time_pressure_columns(
+            preview,
+            requested_time=time_column,
+            requested_pressure=pressure_column,
+            allow_gui=False,
+        )
+
+    desired = [time_column, pressure_column]
+    usecols = list(dict.fromkeys(desired))
+    dtype_map = {name: np.float32 for name in usecols}
+
+    read_kwargs = dict(
+        filepath_or_buffer=file_path,
+        comment="#",
+        header=None,
+        names=preview.column_names,
+        usecols=usecols,
+        skiprows=preview.skiprows,
+        na_values=["nan", "NaN", "NA"],
+        dtype=dtype_map,
+    )
+
+    detected_separator = preview.detected_separator
+    frame: pd.DataFrame
+    if detected_separator:
+        try:
+            if len(detected_separator) == 1:
+                frame = pd.read_csv(
+                    sep=detected_separator,
+                    engine="c",
+                    **read_kwargs,
+                )
+            else:
+                frame = pd.read_csv(
+                    sep=detected_separator,
+                    engine="python",
+                    **read_kwargs,
+                )
+        except Exception:
+            frame = pd.read_csv(
+                delim_whitespace=True,
+                engine="python",
+                **read_kwargs,
+            )
+    else:
+        frame = pd.read_csv(
+            delim_whitespace=True,
+            engine="python",
+            **read_kwargs,
+        )
+
+    return frame, preview.metadata
+
+
+def parse_interval(metadata: Dict[str, str], frame: pd.DataFrame) -> float:
+    """Extract the sampling interval from metadata or infer it from the data."""
+
+    metadata_interval: Optional[float] = None
+    inferred_interval: Optional[float] = None
+
+    interval_raw = metadata.get("Interval")
+    if interval_raw:
+        match = re.search(r"([0-9]+\.?[0-9]*)", interval_raw)
+        if match:
+            metadata_interval = float(match.group(1))
+
+    if "Time" in frame.columns:
+        time_values = frame["Time"].to_numpy()
+        if len(time_values) > 1:
+            diffs = np.diff(time_values)
+            diffs = diffs[~np.isnan(diffs)]
+            if len(diffs) > 0:
+                inferred_interval = float(np.median(diffs))
+
+    if metadata_interval and inferred_interval:
+        if metadata_interval > 0 and abs(inferred_interval - metadata_interval) / metadata_interval > 0.1:
+            print(
+                "Warning: metadata interval"
+                f" ({metadata_interval:.4f}s) differs from inferred interval"
+                f" ({inferred_interval:.4f}s)."
+            )
+        return metadata_interval
+
+    if metadata_interval:
+        return metadata_interval
+
+    if inferred_interval:
+        return inferred_interval
+
+    return 1.0
+
+
 def detect_systolic_peaks(
     signal: np.ndarray,
     fs: float,
