@@ -2296,8 +2296,14 @@ def derive_beats(
     *,
     config: ArtifactConfig,
     use_rolling_statistics: bool = True,
+    apply_scipy_artifact_logic: bool = False,
 ) -> List[Beat]:
-    """Derive systolic/diastolic/MAP landmarks from a continuous waveform."""
+    """Derive systolic/diastolic/MAP landmarks from a continuous waveform.
+
+    When ``apply_scipy_artifact_logic`` is ``True`` the SciPy-specific
+    artefact heuristics are executed after the legacy checks regardless of the
+    legacy toggle configuration.
+    """
 
     if len(time) != len(pressure):
         raise ValueError("Time and pressure arrays must have the same length.")
@@ -2454,7 +2460,7 @@ def derive_beats(
         prev_dia_sample = dia_idx
 
     apply_artifact_rules(beats, config=config)
-    if not use_rolling_statistics and not _artifact_checks_enabled(config):
+    if apply_scipy_artifact_logic:
         _apply_scipy_artifact_fallback(beats, config=config)
     return beats
 
@@ -2672,7 +2678,7 @@ def apply_artifact_rules(beats: List[Beat], *, config: ArtifactConfig) -> None:
 
 
 def _apply_scipy_artifact_fallback(beats: List[Beat], *, config: ArtifactConfig) -> None:
-    """Apply SciPy-only artifact logic when legacy toggles are disabled."""
+    """Apply SciPy-only artifact logic for beats detected via the SciPy backend."""
 
     if not beats:
         return
@@ -3344,6 +3350,7 @@ def main(argv: Sequence[str]) -> int:
     )
 
     use_rolling_statistics = args.beat_detector != "scipy"
+    apply_scipy_artifact_logic = args.beat_detector == "scipy"
 
     try:
         beats = derive_beats(
@@ -3352,6 +3359,7 @@ def main(argv: Sequence[str]) -> int:
             fs=fs,
             config=config,
             use_rolling_statistics=use_rolling_statistics,
+            apply_scipy_artifact_logic=apply_scipy_artifact_logic,
         )
     except Exception as exc:  # pragma: no cover - interactive feedback
         print(f"Beat detection failed: {exc}")
