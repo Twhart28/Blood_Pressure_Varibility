@@ -802,20 +802,23 @@ def launch_import_configuration_dialog(
 
     delimiter_options: List[Tuple[str, Optional[str]]] = [
         ("Auto-detect", None),
-        ("Tab (\\t)", "\t"),
+        ("Tab (\t)", "	"),
         ("Comma (,)", ","),
         ("Semicolon (;)", ";"),
         ("Pipe (|)", "|"),
         ("Space", " "),
+        ("Colon (:)", ":"),
     ]
 
     downsample_options: List[Tuple[str, int]] = [
         ("Full resolution (1×)", 1),
         ("Every 2nd sample (2×)", 2),
+        ("Every 4th sample (4×)", 4),
         ("Every 5th sample (5×)", 5),
         ("Every 10th sample (10×)", 10),
         ("Every 20th sample (20×)", 20),
         ("Every 50th sample (50×)", 50),
+        ("Every 100th sample (100×)", 100),
     ]
 
     def _label_for_separator(value: Optional[str]) -> str:
@@ -836,64 +839,161 @@ def launch_import_configuration_dialog(
                 return label
         return downsample_options[0][0]
 
-    root = tk.Tk()
-    root.title("Import configuration")
-    root.geometry("760x540")
+    def _resolve_downsample_from_label(label: str) -> Optional[int]:
+        for option_label, value in downsample_options:
+            if option_label == label:
+                return value
+        return None
 
-    main_frame = ttk.Frame(root, padding=12)
+    def _effective_separator(value: Optional[str]) -> Optional[str]:
+        if value is not None:
+            return value
+        return preview.detected_separator
+
+    raw_lines = list(preview.raw_lines)
+    if not raw_lines:
+        with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for _ in range(200):
+                line = handle.readline()
+                if not line:
+                    break
+                raw_lines.append(line.rstrip("\r\n"))
+
+    def _split_line(line: str, separator: Optional[str]) -> List[str]:
+        return _tokenise_preview_line(line, separator)
+
+    def _split_preview_lines(separator: Optional[str]) -> List[List[str]]:
+        effective = _effective_separator(separator)
+        return [_split_line(line, effective) for line in raw_lines]
+
+    initial_separator = separator_override if separator_override is not None else preview.detected_separator
+    current_rows = _split_preview_lines(initial_separator)
+
+    if preview.skiprows:
+        header_default = max(1, max(preview.skiprows) + 1)
+    else:
+        header_default = 1
+    max_available_rows = max(len(raw_lines), 1)
+    header_default = min(header_default, max_available_rows)
+    first_data_default = header_default + 1 if header_default < max_available_rows else header_default + 1
+
+    default_time_index = 1
+    default_pressure_index = 2 if len(preview.column_names) >= 2 else 1
+    if preview.column_names:
+        if time_default in preview.column_names:
+            default_time_index = preview.column_names.index(time_default) + 1
+        if pressure_default in preview.column_names:
+            default_pressure_index = preview.column_names.index(pressure_default) + 1
+        if len(preview.column_names) >= 2:
+            for idx in range(1, len(preview.column_names) + 1):
+                if idx != default_time_index:
+                    default_pressure_index = idx
+                    break
+        if default_time_index == default_pressure_index:
+            default_pressure_index = max(1, min(default_time_index + 1, len(preview.column_names) or 1))
+
+    root = tk.Tk()
+    root.title("Import options")
+    root.geometry("960x640")
+
+    main_frame = ttk.Frame(root, padding=16)
     main_frame.grid(row=0, column=0, sticky="nsew")
     root.columnconfigure(0, weight=1)
     root.rowconfigure(0, weight=1)
+    main_frame.columnconfigure(0, weight=1)
+    main_frame.rowconfigure(2, weight=1)
 
     controls_frame = ttk.Frame(main_frame)
     controls_frame.grid(row=0, column=0, sticky="ew", pady=(0, 12))
-    controls_frame.columnconfigure(5, weight=1)
+    controls_frame.columnconfigure(6, weight=1)
 
     ttk.Label(controls_frame, text="Delimiter:").grid(row=0, column=0, sticky="w")
-    delimiter_var = tk.StringVar(value=_label_for_separator(separator_override or preview.detected_separator))
+    delimiter_var = tk.StringVar(value=_label_for_separator(initial_separator))
     delimiter_combo = ttk.Combobox(
         controls_frame,
         state="readonly",
         values=[label for label, _ in delimiter_options],
         textvariable=delimiter_var,
-        width=28,
+        width=18,
     )
     delimiter_combo.grid(row=0, column=1, sticky="w", padx=(8, 24))
 
-    ttk.Label(controls_frame, text="Header row:").grid(row=1, column=0, sticky="w", pady=(12, 0))
-    header_var = tk.StringVar(value="1")
-    header_entry = ttk.Entry(controls_frame, textvariable=header_var, width=6)
-    header_entry.grid(row=1, column=1, sticky="w", padx=(8, 24), pady=(12, 0))
+    ttk.Label(controls_frame, text="Header row:").grid(row=0, column=2, sticky="w")
+    header_var = tk.IntVar(value=header_default)
+    header_spin = tk.Spinbox(
+        controls_frame,
+        from_=1,
+        to=max(max_available_rows, header_default + 100),
+        textvariable=header_var,
+        width=8,
+    )
+    header_spin.grid(row=0, column=3, sticky="w", padx=(8, 24))
 
-    ttk.Label(controls_frame, text="First data row:").grid(row=1, column=2, sticky="w", pady=(12, 0))
-    first_data_var = tk.StringVar(value="2")
-    first_data_entry = ttk.Entry(controls_frame, textvariable=first_data_var, width=6)
-    first_data_entry.grid(row=1, column=3, sticky="w", padx=(8, 24), pady=(12, 0))
+    ttk.Label(controls_frame, text="First data row:").grid(row=0, column=4, sticky="w")
+    first_data_var = tk.IntVar(value=first_data_default)
+    first_data_spin = tk.Spinbox(
+        controls_frame,
+        from_=1,
+        to=max(max_available_rows, first_data_default + 100),
+        textvariable=first_data_var,
+        width=8,
+    )
+    first_data_spin.grid(row=0, column=5, sticky="w")
 
-    ttk.Label(controls_frame, text="Time column:").grid(row=0, column=2, sticky="w")
-    time_var = tk.StringVar(value=time_default)
+    ttk.Label(controls_frame, text="Time column:").grid(row=1, column=0, sticky="w", pady=(12, 0))
+    time_var = tk.StringVar()
     time_combo = ttk.Combobox(
         controls_frame,
         state="readonly",
-        values=preview.column_names,
         textvariable=time_var,
-        width=28,
+        width=24,
     )
-    time_combo.grid(row=0, column=3, sticky="w", padx=(8, 24))
+    time_combo.grid(row=1, column=1, sticky="w", padx=(8, 24), pady=(12, 0))
 
-    ttk.Label(controls_frame, text="Pressure column:").grid(row=0, column=4, sticky="w")
-    pressure_var = tk.StringVar(value=pressure_default)
+    ttk.Label(controls_frame, text="Pressure column:").grid(row=1, column=2, sticky="w", pady=(12, 0))
+    pressure_var = tk.StringVar()
     pressure_combo = ttk.Combobox(
         controls_frame,
         state="readonly",
-        values=preview.column_names,
         textvariable=pressure_var,
-        width=28,
+        width=24,
     )
-    pressure_combo.grid(row=0, column=5, sticky="w", padx=(8, 0))
+    pressure_combo.grid(row=1, column=3, sticky="w", padx=(8, 24), pady=(12, 0))
+
+    comment_enabled_var = tk.BooleanVar(value=False)
+    comment_index_var = tk.StringVar(value="")
+
+    def _on_comment_toggle(*_: object) -> None:
+        enabled = bool(comment_enabled_var.get())
+        state = "normal" if enabled else "disabled"
+        comment_entry.configure(state=state)
+        if not enabled:
+            comment_index_var.set("")
+        _update_column_options()
+        _update_preview_widget()
+
+    def _on_comment_index_change(*_: object) -> None:
+        _update_column_options()
+        _update_preview_widget()
+
+    ttk.Checkbutton(
+        controls_frame,
+        text="Include comment column",
+        variable=comment_enabled_var,
+        command=_on_comment_toggle,
+    ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+    ttk.Label(controls_frame, text="Column #:").grid(row=2, column=2, sticky="w", pady=(12, 0))
+    comment_entry = ttk.Entry(
+        controls_frame,
+        width=8,
+        textvariable=comment_index_var,
+        state="disabled",
+    )
+    comment_entry.grid(row=2, column=3, sticky="w", padx=(8, 24), pady=(12, 0))
 
     ttk.Label(controls_frame, text="Analysis downsampling:").grid(
-        row=2, column=0, sticky="w", pady=(12, 0)
+        row=3, column=0, sticky="w", pady=(12, 0)
     )
     analysis_downsample_var = tk.StringVar(value=_label_for_downsample(1))
     analysis_downsample_combo = ttk.Combobox(
@@ -903,9 +1003,11 @@ def launch_import_configuration_dialog(
         textvariable=analysis_downsample_var,
         width=28,
     )
-    analysis_downsample_combo.grid(row=2, column=1, sticky="w", padx=(8, 24), pady=(12, 0))
+    analysis_downsample_combo.grid(row=3, column=1, sticky="w", padx=(8, 24), pady=(12, 0))
 
-    ttk.Label(controls_frame, text="Plot downsampling:").grid(row=2, column=2, sticky="w", pady=(12, 0))
+    ttk.Label(controls_frame, text="Plot downsampling:").grid(
+        row=3, column=2, sticky="w", pady=(12, 0)
+    )
     plot_downsample_var = tk.StringVar(value=_label_for_downsample(10))
     plot_downsample_combo = ttk.Combobox(
         controls_frame,
@@ -914,14 +1016,17 @@ def launch_import_configuration_dialog(
         textvariable=plot_downsample_var,
         width=28,
     )
-    plot_downsample_combo.grid(row=2, column=3, sticky="w", padx=(8, 24), pady=(12, 0))
+    plot_downsample_combo.grid(row=3, column=3, sticky="w", padx=(8, 24), pady=(12, 0))
 
-    ttk.Label(controls_frame, text="Comment column index (optional):").grid(
-        row=2, column=4, sticky="w", pady=(12, 0)
-    )
-    comment_index_var = tk.StringVar(value="")
-    comment_entry = ttk.Entry(controls_frame, textvariable=comment_index_var, width=6)
-    comment_entry.grid(row=2, column=5, sticky="w", padx=(8, 0), pady=(12, 0))
+    initial_comment_index: Optional[int] = None
+    for idx, name in enumerate(preview.column_names, start=1):
+        if str(name).strip().lower() == "comment":
+            initial_comment_index = idx
+            break
+    if initial_comment_index is not None:
+        comment_enabled_var.set(True)
+        comment_entry.configure(state="normal")
+        comment_index_var.set(str(initial_comment_index))
 
     ttk.Label(
         main_frame,
@@ -950,137 +1055,364 @@ def launch_import_configuration_dialog(
     x_scroll.grid(row=1, column=0, sticky="ew")
     preview_text.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
 
-    index_bar = tk.Text(
-        preview_frame,
-        width=6,
-        wrap="none",
-        font=("Courier New", 10),
-    )
-    index_bar.grid(row=0, column=2, sticky="ns")
-    index_bar.configure(state="disabled", cursor="arrow")
+    preview_text.tag_configure("column_index", background="#ccd6f6", font=("Courier New", 10, "bold"))
+    preview_text.tag_configure("header", background="#d9d9d9", font=("Courier New", 10, "bold"))
+    preview_text.tag_configure("row_even", background="#f5f5f5")
+    preview_text.tag_configure("row_odd", background="#ededed")
+    preview_text.tag_configure("highlight_time", background="#dbeafe")
+    preview_text.tag_configure("highlight_pressure", background="#fdeac5")
+    preview_text.tag_configure("data_start", background="#e7f5e4")
 
-    preview_rows = [
-        _tokenise_preview_line(line, separator_override or preview.detected_separator)
-        for line in preview.raw_lines[: preview.preview_rows]
-    ]
+    error_var = tk.StringVar(value="")
+    error_label = ttk.Label(main_frame, textvariable=error_var, foreground="red")
+    error_label.grid(row=3, column=0, sticky="w", pady=(8, 0))
+
+    button_frame = ttk.Frame(main_frame)
+    button_frame.grid(row=4, column=0, sticky="e", pady=(16, 0))
+
+    result: Dict[str, object] = {}
+    current_preview_state: Dict[str, object] = {
+        "preview": preview,
+        "separator": initial_separator,
+        "resolved_separator": _effective_separator(initial_separator),
+        "rows": current_rows,
+        "header_row": header_default,
+        "first_data_row": first_data_default,
+        "preview_rows": preview.preview_rows,
+    }
+
+    column_option_map: Dict[str, int] = {}
+
+    def _current_preview() -> BPFilePreview:
+        stored = current_preview_state.get("preview")
+        if isinstance(stored, BPFilePreview):
+            return stored
+        return preview
+
+    def _current_rows() -> List[List[str]]:
+        rows = current_preview_state.get("rows")
+        if isinstance(rows, list):
+            return rows
+        return current_rows
+
+    def _parse_column_index(value: str) -> Optional[int]:
+        if not value:
+            return None
+        if value in column_option_map:
+            return column_option_map[value]
+        prefix = value.split(":", 1)[0].strip()
+        if prefix.isdigit():
+            return int(prefix)
+        return None
+
+    def _parse_comment_index() -> Optional[int]:
+        if not comment_enabled_var.get():
+            return None
+        raw = comment_index_var.get().strip()
+        if not raw:
+            return None
+        if not raw.isdigit():
+            return None
+        value = int(raw)
+        if value <= 0:
+            return None
+        return value
+
+    def _get_header_row() -> int:
+        try:
+            value = int(header_var.get())
+        except (tk.TclError, ValueError):
+            value = header_default
+        return max(1, value)
+
+    def _get_first_data_row() -> int:
+        try:
+            value = int(first_data_var.get())
+        except (tk.TclError, ValueError):
+            value = first_data_default
+        return max(1, value)
+
+    def _build_column_options() -> List[Tuple[str, int]]:
+        rows = _current_rows()
+        header_index = _get_header_row()
+        if rows:
+            header_index = min(header_index, len(rows))
+        header_values: Sequence[str] = []
+        if 1 <= header_index <= len(rows):
+            header_values = rows[header_index - 1]
+        sample_rows = rows[:50]
+        column_count = max((len(row) for row in sample_rows), default=len(preview.column_names))
+        column_count = max(column_count, len(header_values))
+        comment_index = _parse_comment_index()
+        if comment_index:
+            column_count = max(column_count, comment_index)
+        if column_count == 0:
+            column_count = len(preview.column_names) or 1
+        options: List[Tuple[str, int]] = []
+        for idx in range(column_count):
+            header_label = ""
+            if idx < len(header_values):
+                raw_value = header_values[idx]
+                header_label = str(raw_value).strip() if raw_value is not None else ""
+            if not header_label:
+                if comment_index and (idx + 1) == comment_index:
+                    header_label = "Comment"
+                else:
+                    header_label = f"Column {idx + 1}"
+            options.append((f"{idx + 1}: {header_label}", idx + 1))
+        return options
+
+    def _select_label_for_index(options: Sequence[Tuple[str, int]], desired_index: int) -> str:
+        for label, idx in options:
+            if idx == desired_index:
+                return label
+        return options[0][0] if options else ""
+
+    def _update_column_options(initial: bool = False) -> None:
+        nonlocal column_option_map
+        options = _build_column_options()
+        column_option_map = {label: idx for label, idx in options}
+        labels = [label for label, _ in options]
+        time_combo.configure(values=labels)
+        pressure_combo.configure(values=labels)
+
+        if not options:
+            time_var.set("")
+            pressure_var.set("")
+            return
+
+        current_time_index = _parse_column_index(time_var.get()) or default_time_index
+        current_pressure_index = _parse_column_index(pressure_var.get()) or default_pressure_index
+
+        if initial:
+            current_time_index = default_time_index
+            current_pressure_index = default_pressure_index
+
+        current_time_index = max(1, min(current_time_index, options[-1][1]))
+        current_pressure_index = max(1, min(current_pressure_index, options[-1][1]))
+
+        if current_pressure_index == current_time_index and len(options) > 1:
+            for _, idx in options:
+                if idx != current_time_index:
+                    current_pressure_index = idx
+                    break
+
+        time_var.set(_select_label_for_index(options, current_time_index))
+        pressure_var.set(_select_label_for_index(options, current_pressure_index))
+
+    def _get_time_index() -> Optional[int]:
+        return _parse_column_index(time_var.get())
+
+    def _get_pressure_index() -> Optional[int]:
+        return _parse_column_index(pressure_var.get())
+
+    def _get_comment_index() -> Optional[int]:
+        return _parse_comment_index()
 
     def _update_preview_widget() -> None:
-        try:
-            header_row = max(1, int(header_var.get()))
-        except Exception:
-            header_row = 1
-        try:
-            first_data_row = max(1, int(first_data_var.get()))
-        except Exception:
-            first_data_row = 2
-        time_index = None
-        pressure_index = None
-        if time_var.get() in preview.column_names:
-            time_index = preview.column_names.index(time_var.get())
-        if pressure_var.get() in preview.column_names:
-            pressure_index = preview.column_names.index(pressure_var.get())
-
-        index_bar.configure(state="normal")
-        index_bar.delete("1.0", tk.END)
-        for idx in range(1, len(preview_rows) + 1):
-            index_bar.insert("end", f"{idx:>4}\n")
-        index_bar.configure(state="disabled")
-
+        rows = _current_rows()
+        header_index = _get_header_row()
+        data_index = _get_first_data_row()
+        time_index = _get_time_index()
+        pressure_index = _get_pressure_index()
+        preview_limit = current_preview_state.get("preview_rows")
+        if not isinstance(preview_limit, int) or preview_limit <= 0:
+            preview_limit = _current_preview().preview_rows
         _render_preview_to_text_widget(
             preview_text,
-            preview_rows,
-            header_row_index=header_row,
-            first_data_row_index=first_data_row,
-            time_column_index=time_index,
-            pressure_column_index=pressure_index,
+            rows,
+            header_row_index=header_index,
+            first_data_row_index=data_index,
+            time_column_index=(time_index - 1) if time_index else None,
+            pressure_column_index=(pressure_index - 1) if pressure_index else None,
+            max_rows=preview_limit,
         )
 
     def _refresh_preview_from_separator(*_: object) -> None:
-        separator_value = _resolve_separator_from_label(delimiter_var.get())
-        local_preview = preview
-        try:
-            local_preview = _scan_bp_file(
-                file_path,
-                separator_override=separator_value,
-                max_numeric_rows=preview.preview_rows,
-            )
-        except Exception:
-            pass
-
-        preview_rows[:] = [
-            _tokenise_preview_line(line, separator_value or local_preview.detected_separator)
-            for line in local_preview.raw_lines[: local_preview.preview_rows]
-        ]
+        selection = delimiter_var.get()
+        desired_separator = _resolve_separator_from_label(selection)
+        rows = _split_preview_lines(desired_separator)
+        current_preview_state["rows"] = rows
+        current_preview_state["separator"] = desired_separator
+        current_preview_state["resolved_separator"] = _effective_separator(desired_separator)
+        _update_column_options()
         _update_preview_widget()
 
-    button_frame = ttk.Frame(main_frame)
-    button_frame.grid(row=3, column=0, sticky="e", pady=(12, 0))
+    def _on_structure_change(*_: object) -> None:
+        error_var.set("")
+        current_preview_state["header_row"] = _get_header_row()
+        current_preview_state["first_data_row"] = _get_first_data_row()
+        _update_column_options()
+        _update_preview_widget()
 
-    result: Dict[str, object] = {}
+    def _read_tokens_for_line(line_number: int, separator: Optional[str]) -> List[str]:
+        if line_number <= len(raw_lines):
+            return _split_line(raw_lines[line_number - 1], separator)
+        with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for idx, raw_line in enumerate(handle, start=1):
+                if idx == line_number:
+                    return _split_line(raw_line.rstrip("\r\n"), separator)
+        return []
+
+    def _derive_column_names(
+        header_tokens: Sequence[str],
+        column_count: int,
+        *,
+        comment_index: Optional[int] = None,
+    ) -> List[str]:
+        names: List[str] = []
+        seen: Dict[str, int] = {}
+        for idx in range(column_count):
+            raw_value = header_tokens[idx] if idx < len(header_tokens) else ""
+            candidate = str(raw_value).strip() if raw_value is not None else ""
+            if not candidate:
+                if comment_index and (idx + 1) == comment_index:
+                    candidate = "Comment"
+                else:
+                    candidate = f"column_{idx + 1}"
+            base = candidate
+            suffix = 1
+            while candidate in seen:
+                suffix += 1
+                candidate = f"{base}_{suffix}"
+            seen[candidate] = suffix
+            names.append(candidate)
+        return names
 
     def _confirm() -> None:
-        try:
-            header_row = max(1, int(header_var.get()))
-        except Exception:
-            header_row = 1
-        try:
-            first_data_row = max(1, int(first_data_var.get()))
-        except Exception:
-            first_data_row = 2
+        header_index = _get_header_row()
+        data_index = _get_first_data_row()
+        time_index = _get_time_index()
+        pressure_index = _get_pressure_index()
+        comment_index = _get_comment_index()
 
-        time_choice = time_var.get()
-        pressure_choice = pressure_var.get()
-        if time_choice == pressure_choice:
+        if time_index is None or pressure_index is None:
+            error_var.set("Select both time and pressure columns.")
+            return
+        if time_index == pressure_index:
+            error_var.set("Time and pressure selections must differ.")
+            return
+        if comment_enabled_var.get() and comment_index is None:
+            error_var.set("Enter a valid comment column number.")
+            return
+        if data_index <= header_index:
+            error_var.set("First data row must be after the header row.")
             return
 
-        comment_index_value: Optional[int] = None
-        comment_column_name: Optional[str] = None
-        if comment_index_var.get().strip():
-            try:
-                comment_index_value = int(comment_index_var.get())
-                if comment_index_value >= 1 and comment_index_value <= len(preview.column_names):
-                    comment_column_name = preview.column_names[comment_index_value - 1]
-            except Exception:
-                comment_index_value = None
+        rows = _current_rows()
+        resolved_candidate = current_preview_state.get("resolved_separator")
+        if isinstance(resolved_candidate, str) or resolved_candidate is None:
+            resolved_separator = resolved_candidate
+        else:
+            resolved_separator = _effective_separator(current_preview_state.get("separator"))
 
-        separator_value = _resolve_separator_from_label(delimiter_var.get())
+        header_tokens = _read_tokens_for_line(header_index, resolved_separator)
+        sample_rows = rows[:50]
+        column_count = max((len(row) for row in sample_rows), default=0)
+        column_count = max(column_count, len(header_tokens), time_index, pressure_index)
+        if comment_index:
+            column_count = max(column_count, comment_index)
+        if column_count <= 0:
+            column_count = max(time_index, pressure_index)
 
-        result.update(
-            {
-                "preview": preview,
-                "separator": separator_value,
-                "time": time_choice,
-                "pressure": pressure_choice,
-                "header_row": header_row,
-                "first_data_row": first_data_row,
-                "time_index": preview.column_names.index(time_choice),
-                "pressure_index": preview.column_names.index(pressure_choice),
-                "analysis_downsample": next(
-                    value for label, value in downsample_options if label == analysis_downsample_var.get()
-                ),
-                "plot_downsample": next(
-                    value for label, value in downsample_options if label == plot_downsample_var.get()
-                ),
-                "comment_index": comment_index_value,
-                "comment_name": comment_column_name,
-            }
+        downsample_label = analysis_downsample_var.get()
+        downsample_value = _resolve_downsample_from_label(downsample_label)
+        if downsample_value is None or downsample_value <= 0:
+            error_var.set("Select a valid analysis downsampling factor.")
+            return
+
+        plot_downsample_label = plot_downsample_var.get()
+        plot_downsample_value = _resolve_downsample_from_label(plot_downsample_label)
+        if plot_downsample_value is None or plot_downsample_value <= 0:
+            error_var.set("Select a valid plot downsampling factor.")
+            return
+
+        column_names = _derive_column_names(
+            header_tokens,
+            column_count,
+            comment_index=comment_index,
         )
+        if time_index > len(column_names) or pressure_index > len(column_names):
+            error_var.set("Selected columns exceed detected column count.")
+            return
+        if comment_index and comment_index > len(column_names):
+            error_var.set("Comment column exceeds detected column count.")
+            return
+
+        skiprows = set(preview.skiprows)
+        skiprows.update(range(max(0, data_index - 1)))
+        skiprows_list = sorted(skiprows)
+
+        preview_row_limit = current_preview_state.get("preview_rows")
+        if isinstance(preview_row_limit, int) and preview_row_limit > 0:
+            max_rows = preview_row_limit
+        else:
+            max_rows = preview.preview_rows
+
+        try:
+            preview_df = _build_preview_dataframe(
+                file_path,
+                column_names=column_names,
+                skiprows=skiprows_list,
+                separator=resolved_separator,
+                max_rows=max_rows,
+            )
+        except Exception as exc:  # pragma: no cover - interactive feedback
+            error_var.set(f"Failed to build preview: {exc}")
+            return
+
+        updated_preview = BPFilePreview(
+            metadata=preview.metadata,
+            column_names=column_names,
+            preview=preview_df,
+            skiprows=skiprows_list,
+            detected_separator=resolved_separator,
+            raw_lines=raw_lines,
+            preview_rows=max_rows,
+        )
+
+        current_preview_state["preview"] = updated_preview
+        current_preview_state["header_row"] = header_index
+        current_preview_state["first_data_row"] = data_index
+        current_preview_state["preview_rows"] = max_rows
+
+        result["time"] = column_names[time_index - 1]
+        result["pressure"] = column_names[pressure_index - 1]
+        result["time_index"] = time_index
+        result["pressure_index"] = pressure_index
+        if comment_index:
+            result["comment_index"] = comment_index
+            result["comment_name"] = column_names[comment_index - 1]
+        else:
+            result["comment_index"] = None
+            result["comment_name"] = None
+        result["analysis_downsample"] = downsample_value
+        result["plot_downsample"] = plot_downsample_value
+        result["separator"] = current_preview_state.get("separator")
+        result["preview"] = updated_preview
+        result["header_row"] = header_index
+        result["first_data_row"] = data_index
+        error_var.set("")
         root.quit()
 
     def _cancel() -> None:
         result.clear()
         root.quit()
 
+    _update_column_options(initial=True)
+    _update_preview_widget()
+
     delimiter_var.trace_add("write", _refresh_preview_from_separator)
+    header_var.trace_add("write", _on_structure_change)
+    first_data_var.trace_add("write", _on_structure_change)
     time_var.trace_add("write", lambda *_: _update_preview_widget())
     pressure_var.trace_add("write", lambda *_: _update_preview_widget())
+    comment_index_var.trace_add("write", _on_comment_index_change)
 
     ttk.Button(button_frame, text="Cancel", command=_cancel).grid(row=0, column=0, padx=(0, 8))
     ttk.Button(button_frame, text="Import", command=_confirm).grid(row=0, column=1)
 
     root.protocol("WM_DELETE_WINDOW", _cancel)
-
-    _update_preview_widget()
 
     root.mainloop()
     root.destroy()
