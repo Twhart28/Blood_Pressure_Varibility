@@ -11,6 +11,10 @@ from dataclasses import dataclass, asdict
 from statistics import mean as _pymean
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from typing import Dict, Any, Optional, Tuple, List
+import numpy as np
+from matplotlib import colors as mcolors
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 
 # ----------------------------- Core parsing & ARV -----------------------------
 
@@ -178,6 +182,111 @@ def arv(values):
     return num / denom if denom > 0 else float("nan")
 
 
+# ----------------------------- Plotting helpers -----------------------------
+
+def _lighten_color(color: str, amount: float = 0.5) -> str:
+    """Return a lighter shade of ``color`` by mixing it with white."""
+    try:
+        rgb = np.array(mcolors.to_rgb(color))
+    except ValueError:
+        rgb = np.array([0.5, 0.5, 0.5])
+    amount = max(0.0, min(1.0, amount))
+    mixed = rgb + (np.array([1.0, 1.0, 1.0]) - rgb) * amount
+    return mcolors.to_hex(mixed.clip(0.0, 1.0))
+
+
+def compute_loess_line(x_values: List[float], y_values: List[float], frac: float = 0.3, degree: int = 1) -> List[float]:
+    """Return LOESS-smoothed ``y`` values evaluated at ``x`` positions.
+
+    Args:
+        x_values: Sequence of x coordinates (e.g., time).
+        y_values: Sequence of y coordinates (e.g., BP readings).
+        frac: Fraction of points used in each local regression window (0 < frac <= 1).
+        degree: Polynomial degree for local regression (typically 1 or 2).
+
+    Returns:
+        List of smoothed values (NaN where insufficient data).
+    """
+
+    if not x_values or not y_values or len(x_values) != len(y_values):
+        return []
+
+    x = np.asarray(x_values, dtype=float)
+    y = np.asarray(y_values, dtype=float)
+    valid_mask = ~(np.isnan(x) | np.isnan(y))
+    if not np.any(valid_mask):
+        return [float("nan")] * len(x_values)
+
+    x = x[valid_mask]
+    y = y[valid_mask]
+    if len(x) == 0:
+        return [float("nan")] * len(x_values)
+
+    order = np.argsort(x)
+    x_sorted = x[order]
+    y_sorted = y[order]
+    n = len(x_sorted)
+
+    frac = float(frac) if frac and not math.isnan(frac) else 0.3
+    if frac <= 0:
+        frac = 0.1
+    if frac > 1:
+        frac = 1.0
+
+    window = max(2, int(math.ceil(frac * n)))
+    degree = max(0, min(int(round(degree)), 2))
+
+    fitted_sorted = np.full(n, np.nan, dtype=float)
+    for idx, xi in enumerate(x_sorted):
+        left = max(0, idx - window // 2)
+        right = min(n, left + window)
+        left = max(0, right - window)
+        x_subset = x_sorted[left:right]
+        y_subset = y_sorted[left:right]
+        if len(x_subset) == 0:
+            continue
+        distances = np.abs(x_subset - xi)
+        max_distance = distances.max() if len(distances) else 0.0
+        if max_distance == 0:
+            weights = np.ones_like(distances)
+        else:
+            scaled = distances / max_distance
+            weights = (1 - scaled ** 3) ** 3
+        deg = min(degree, len(x_subset) - 1)
+        if deg < 0:
+            deg = 0
+        try:
+            coeffs = np.polyfit(x_subset, y_subset, deg, w=weights)
+            fitted_sorted[idx] = np.polyval(coeffs, xi)
+        except Exception:
+            fitted_sorted[idx] = float(np.average(y_subset))
+
+    fitted = np.full(len(x_values), np.nan, dtype=float)
+    fitted_positions = np.nonzero(valid_mask)[0]
+    fitted[fitted_positions[order]] = fitted_sorted
+    return fitted.tolist()
+
+
+PLOT_SERIES_COLORS = {
+    "SBP": "#8b1a1a",
+    "DBP": "#104e8b",
+    "MAP": "#1b7f3a",
+}
+
+MEASURE_ORDER = ("SBP", "DBP", "MAP")
+
+
+def format_time_stamp(seconds: Optional[float]) -> str:
+    if seconds is None or math.isnan(seconds):
+        return ""
+    total = max(0.0, float(seconds))
+    minutes, secs = divmod(total, 60.0)
+    hours, minutes = divmod(minutes, 60.0)
+    if hours >= 1:
+        return f"{int(hours):02d}:{int(minutes):02d}:{secs:05.2f}"
+    return f"{int(minutes):02d}:{secs:05.2f}"
+
+
 # -------------------------- Outlier filtering (artifacts) ---------------------
 
 FILTER_METHOD_ORDER = ["moving_average", "absolute_change", "std_from_mean"]
@@ -245,23 +354,88 @@ def _mad(xs):
            else 0.5*(abs_dev[mid2-1]+abs_dev[mid2]))
     return mad
 
+
+def _filter_global_mask(values, k_sd=3.0):
+    if not values:
+        return []
+    m = _nanmean(values)
+    s = _nansd(values, ddof=1)
+    clean = [v for v in values if not math.isnan(v)]
+    if math.isnan(m) or math.isnan(s) or s == 0:
+        return [True] * len(values)
+    lo, hi = m - k_sd * s, m + k_sd * s
+    return [lo <= v <= hi for v in values]
+
+
+def _filter_rolling_mask(values, interval_s, window_s=15.0, k_mad=4.0):
+    n = len(values)
+    if n == 0 or interval_s <= 0:
+        return [True] * n
+    vals = [float(v) for v in values]
+    w = max(3, int(round(window_s / interval_s)))
+    half = w // 2
+    mask = [True] * n
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        window = vals[lo:hi]
+        if not window:
+            mask[i] = True
+            continue
+        ws = sorted(window)
+        mid = len(ws) // 2
+        if len(ws) % 2 == 1:
+            med = ws[mid]
+        else:
+            med = 0.5 * (ws[mid - 1] + ws[mid])
+        abs_dev = sorted(abs(v - med) for v in window)
+        mid2 = len(abs_dev) // 2
+        if not abs_dev:
+            sigma = 0.0
+        elif len(abs_dev) % 2 == 1:
+            sigma = 1.4826 * abs_dev[mid2]
+        else:
+            sigma = 1.4826 * 0.5 * (abs_dev[mid2 - 1] + abs_dev[mid2])
+        x = vals[i]
+        if sigma == 0:
+            mask[i] = abs(x - med) <= 1e-12
+        else:
+            mask[i] = abs(x - med) <= k_mad * sigma
+    return mask
+
+
+def _filter_absolute_change_mask(values, max_delta):
+    if not values:
+        return []
+    try:
+        threshold = float(max_delta)
+    except (TypeError, ValueError):
+        threshold = 0.0
+    if threshold <= 0:
+        return [True] * len(values)
+    mask = []
+    prev = None
+    for v in values:
+        if prev is None:
+            mask.append(True)
+            prev = v
+            continue
+        if abs(v - prev) <= threshold:
+            mask.append(True)
+            prev = v
+        else:
+            mask.append(False)
+    return mask
+
 def filter_outliers_global(values, k_sd=3.0):
     """
     Simple global filter: drop points > k_sd * SD from the global mean.
     Returns (kept_values, excluded_values).
     """
-    m = _nanmean(values)
-    s = _nansd(values, ddof=1)
     clean = [v for v in values if not math.isnan(v)]
-    if math.isnan(m) or math.isnan(s) or s == 0:
-        return clean, []
-    lo, hi = m - k_sd * s, m + k_sd * s
-    kept, excluded = [], []
-    for v in clean:
-        if lo <= v <= hi:
-            kept.append(v)
-        else:
-            excluded.append(v)
+    mask = _filter_global_mask(clean, k_sd=k_sd)
+    kept = [val for val, keep in zip(clean, mask) if keep]
+    excluded = [val for val, keep in zip(clean, mask) if not keep]
     return kept, excluded
 
 def filter_outliers_rolling_robust(values, interval_s, window_s=15.0, k_mad=4.0):
@@ -271,72 +445,19 @@ def filter_outliers_rolling_robust(values, interval_s, window_s=15.0, k_mad=4.0)
     - Convert MAD to robust sigma: sigma ≈ 1.4826 * MAD.
     - Drop points with |x - median| > k_mad * sigma_robust.
     """
-    vals = [float(v) for v in values]
-    n = len(vals)
-    if n == 0 or interval_s <= 0:
-        return [v for v in vals if not math.isnan(v)], []
-
-    w = max(3, int(round(window_s / interval_s)))  # window length in samples
-    half = w // 2
-
-    kept, excluded = [], []
-    for i in range(n):
-        lo = max(0, i - half)
-        hi = min(n, i + half + 1)
-        window = [v for v in vals[lo:hi] if not math.isnan(v)]
-        if not window:
-            continue
-        # median
-        ws = sorted(window)
-        mid = len(ws)//2
-        med = ws[mid] if len(ws)%2==1 else 0.5*(ws[mid-1]+ws[mid])
-
-        # MAD
-        abs_dev = [abs(v - med) for v in window]
-        abs_dev.sort()
-        mid2 = len(abs_dev)//2
-        mad = abs_dev[mid2] if len(abs_dev)%2==1 else 0.5*(abs_dev[mid2-1]+abs_dev[mid2])
-        sigma = 1.4826 * mad  # ~equivalent to SD if normal
-        x = vals[i]
-        if math.isnan(x):
-            continue
-        if sigma == 0:
-            # if flat window, keep point if exactly med
-            if abs(x - med) <= 1e-12:
-                kept.append(x)
-            else:
-                excluded.append(x)
-        else:
-            if abs(x - med) <= k_mad * sigma:
-                kept.append(x)
-            else:
-                excluded.append(x)
+    vals = [float(v) for v in values if not math.isnan(v)]
+    mask = _filter_rolling_mask(vals, interval_s=interval_s, window_s=window_s, k_mad=k_mad)
+    kept = [val for val, keep in zip(vals, mask) if keep]
+    excluded = [val for val, keep in zip(vals, mask) if not keep]
     return kept, excluded
 
 
 def filter_outliers_absolute_change(values, max_delta):
     """Exclude beats where the absolute change from the previous kept beat exceeds ``max_delta``."""
     clean = [v for v in values if not math.isnan(v)]
-    if not clean:
-        return [], []
-    try:
-        threshold = float(max_delta)
-    except (TypeError, ValueError):
-        threshold = 0.0
-    if threshold <= 0:
-        return clean, []
-    kept, excluded = [], []
-    prev = None
-    for v in clean:
-        if prev is None:
-            kept.append(v)
-            prev = v
-            continue
-        if abs(v - prev) <= threshold:
-            kept.append(v)
-            prev = v
-        else:
-            excluded.append(v)
+    mask = _filter_absolute_change_mask(clean, max_delta=max_delta)
+    kept = [val for val, keep in zip(clean, mask) if keep]
+    excluded = [val for val, keep in zip(clean, mask) if not keep]
     return kept, excluded
 
 
@@ -346,25 +467,31 @@ def compute_metrics(series, use_filter=False, filter_method="moving_average", in
     Returns dict with:
       n_raw, n_kept, mean, sd, cv, arv
     """
-    raw = [v for v in series if not math.isnan(v)]
-    n_raw = len(raw)
+    valid_points = [(idx, val) for idx, val in enumerate(series) if not math.isnan(val)]
+    raw_values = [val for _, val in valid_points]
+    raw_indices = [idx for idx, _ in valid_points]
+    n_raw = len(raw_values)
 
     if not use_filter:
-        kept = list(raw)
-        excluded = []
+        mask = [True] * n_raw
     else:
         method_code = normalize_filter_method(filter_method)
         if method_code == "std_from_mean":
-            kept, excluded = filter_outliers_global(raw, k_sd=float(k_sd))
+            mask = _filter_global_mask(raw_values, k_sd=float(k_sd))
         elif method_code == "absolute_change":
-            kept, excluded = filter_outliers_absolute_change(raw, max_delta=float(delta_cutoff))
+            mask = _filter_absolute_change_mask(raw_values, max_delta=float(delta_cutoff))
         else:
-            kept, excluded = filter_outliers_rolling_robust(
-                raw,
+            mask = _filter_rolling_mask(
+                raw_values,
                 interval_s=interval_s,
                 window_s=float(window_s),
                 k_mad=float(k_mad),
             )
+    kept = [val for val, keep in zip(raw_values, mask) if keep]
+    kept_indices = [idx for idx, keep in zip(raw_indices, mask) if keep]
+    excluded = [val for val, keep in zip(raw_values, mask) if not keep]
+    excluded_indices = [idx for idx, keep in zip(raw_indices, mask) if not keep]
+
     n_kept = len(kept)
     m = _pymean(kept) if n_kept else float("nan")
 
@@ -380,6 +507,8 @@ def compute_metrics(series, use_filter=False, filter_method="moving_average", in
         "cv": cv,
         "arv": arv_val,
         "excluded_values": excluded,
+        "kept_indices": kept_indices,
+        "excluded_indices": excluded_indices,
     }
 
 
@@ -439,6 +568,11 @@ def compute_all_for_file(path, window_spec, use_filter, filter_method,
         mapp, use_filter, filter_method, interval_s, k_sd, window_s, k_mad, delta_cutoff
     )
 
+    time_points = [
+        (start_idx + i) * interval_s
+        for i in range(len(sbp))
+    ]
+
     return {
         "file": os.path.basename(path),
         "interval_s": interval_s,
@@ -472,6 +606,24 @@ def compute_all_for_file(path, window_spec, use_filter, filter_method,
             "SBP": list(ms_sbp.get("excluded_values", [])),
             "DBP": list(ms_dbp.get("excluded_values", [])),
             "MAP": list(ms_map.get("excluded_values", [])),
+        },
+        "series": {
+            "time": time_points,
+            "SBP": {
+                "values": list(sbp),
+                "kept_indices": list(ms_sbp.get("kept_indices", [])),
+                "excluded_indices": list(ms_sbp.get("excluded_indices", [])),
+            },
+            "DBP": {
+                "values": list(dbp),
+                "kept_indices": list(ms_dbp.get("kept_indices", [])),
+                "excluded_indices": list(ms_dbp.get("excluded_indices", [])),
+            },
+            "MAP": {
+                "values": list(mapp),
+                "kept_indices": list(ms_map.get("kept_indices", [])),
+                "excluded_indices": list(ms_map.get("excluded_indices", [])),
+            },
         },
     }
 
@@ -740,6 +892,8 @@ class ARVApp(tk.Tk):
         self.output_std = tk.BooleanVar(value=True)
         self.output_cov = tk.BooleanVar(value=True)
         self.output_arv = tk.BooleanVar(value=True)
+        self.loess_span_var = tk.StringVar(value="0.3")
+        self.loess_degree_var = tk.StringVar(value="1")
 
         self._preferences_window = None
         self._preferences_snapshot = None
@@ -758,9 +912,17 @@ class ARVApp(tk.Tk):
         self._layout_field_traces = []
         self._layout_config_combo = None
 
-        self._exclusions_window = None
-        self._exclusion_tree = None
-        self._exclusion_records = []
+        self._graph_window = None
+        self._graph_canvas = None
+        self._graph_figure = None
+        self._graph_ax = None
+        self._graph_file_combo = None
+        self._graph_exclusion_tree = None
+        self._graph_prev_button = None
+        self._graph_next_button = None
+        self._graph_selection_var = tk.StringVar()
+        self._graph_results_cache = []
+        self._graph_index = 0
 
         # Styling (optional nicer look)
         self.style = ttk.Style(self)
@@ -805,7 +967,7 @@ class ARVApp(tk.Tk):
 
         ttk.Button(controls, text="Compute", command=self.compute).pack(side=tk.RIGHT)
         ttk.Button(controls, text="Save CSV…", command=self.save_csv).pack(side=tk.RIGHT, padx=(0, 8))
-        ttk.Button(controls, text="View exclusions", command=self.view_exclusions).pack(side=tk.RIGHT, padx=(0, 8))
+        ttk.Button(controls, text="View graphs", command=self.view_graphs).pack(side=tk.RIGHT, padx=(0, 8))
 
         # Results table
         self._tree_columns = (
@@ -893,7 +1055,7 @@ class ARVApp(tk.Tk):
         self.update_file_list()
         for i in self.tree.get_children():
             self.tree.delete(i)
-        self._refresh_exclusions_window()
+        self._refresh_graph_window()
         self.status.set("Cleared files and results.")
 
     def update_file_list(self):
@@ -1473,6 +1635,28 @@ class ARVApp(tk.Tk):
             command=self._on_metric_preference_changed,
         ).grid(row=1, column=2, sticky="w", pady=(8, 0), padx=(16, 0))
 
+        graph_frame = ttk.LabelFrame(content, text="Graph visualization")
+        graph_frame.pack(fill=tk.X, expand=True, pady=(0, 12))
+        graph_frame.columnconfigure(1, weight=1)
+        ttk.Label(
+            graph_frame,
+            text="Configure LOESS smoothing used in blood pressure graphs.",
+            foreground="gray",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        ttk.Label(graph_frame, text="LOESS span (0-1)").grid(row=1, column=0, sticky="w")
+        ttk.Entry(graph_frame, textvariable=self.loess_span_var, width=10).grid(
+            row=1, column=1, sticky="w", padx=(12, 0)
+        )
+        ttk.Label(graph_frame, text="Polynomial degree").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        loess_degree_combo = ttk.Combobox(
+            graph_frame,
+            textvariable=self.loess_degree_var,
+            values=("1", "2"),
+            width=10,
+            state="readonly",
+        )
+        loess_degree_combo.grid(row=2, column=1, sticky="w", padx=(12, 0), pady=(8, 0))
+
         buttons = ttk.Frame(content)
         buttons.pack(fill=tk.X, expand=True)
         ttk.Button(buttons, text="Cancel", command=lambda: self._cancel_preferences(win)).pack(side=tk.RIGHT, padx=(8, 0))
@@ -1607,137 +1791,285 @@ class ARVApp(tk.Tk):
                 values.append(fmt_float(result.get(col), 6))
         return values
 
-    def _gather_exclusion_records(self):
-        records = []
+    def _graphable_results(self) -> List[Dict[str, Any]]:
+        ready = []
         for res in self.results:
             if not isinstance(res, dict):
                 continue
             if res.get("error"):
                 continue
-            excluded_map = res.get("excluded_values") or {}
-            if not isinstance(excluded_map, dict):
-                continue
-            file_name = res.get("file", "")
-            ordered_measures = ("SBP", "DBP", "MAP")
-            for measure in ordered_measures:
-                values = excluded_map.get(measure)
-                if values:
-                    records.append({
-                        "file": file_name,
-                        "measure": measure,
-                        "values": list(values),
-                    })
-            for measure, values in excluded_map.items():
-                if measure in ordered_measures:
-                    continue
-                if values:
-                    records.append({
-                        "file": file_name,
-                        "measure": measure,
-                        "values": list(values),
-                    })
-        return records
+            if res.get("series"):
+                ready.append(res)
+        return ready
 
-    def _refresh_exclusions_window(self):
-        if self._exclusions_window is None or not self._exclusions_window.winfo_exists():
-            self._exclusion_tree = None
-            self._exclusion_records = []
-            return
-        tree = self._exclusion_tree
-        if tree is None:
-            return
-        tree.delete(*tree.get_children())
-        records = self._gather_exclusion_records()
-        self._exclusion_records = records
-        if not records:
-            tree.insert("", tk.END, values=("No excluded values recorded.", "", ""))
-        else:
-            for rec in records:
-                formatted = ", ".join(fmt_float(val, 6) for val in rec["values"])
-                tree.insert("", tk.END, values=(rec["file"], rec["measure"], formatted))
-        self._autofit_tree_columns(tree, min_width=120, padding=32, max_width=None)
-
-    def _close_exclusions_window(self):
-        win = self._exclusions_window
+    def _close_graph_window(self):
+        win = self._graph_window
         if win is not None and win.winfo_exists():
             try:
                 win.destroy()
             except tk.TclError:
                 pass
-        self._exclusions_window = None
-        self._exclusion_tree = None
-        self._exclusion_records = []
+        self._graph_window = None
+        self._graph_canvas = None
+        self._graph_figure = None
+        self._graph_ax = None
+        self._graph_file_combo = None
+        self._graph_exclusion_tree = None
+        self._graph_prev_button = None
+        self._graph_next_button = None
+        self._graph_results_cache = []
+        self._graph_selection_var.set("")
+        self._graph_index = 0
 
-    def _export_exclusions_csv(self):
-        records = self._gather_exclusion_records()
-        value_rows = []
-        for rec in records:
-            for value in rec["values"]:
-                value_rows.append((rec["file"], rec["measure"], fmt_float(value, 10)))
-        if not value_rows:
-            messagebox.showinfo("No exclusions", "No excluded values to export.")
+    def _refresh_graph_window(self):
+        if self._graph_window is None or not self._graph_window.winfo_exists():
             return
-        path = filedialog.asksaveasfilename(
-            title="Save exclusions CSV",
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-        )
-        if not path:
+        self._graph_results_cache = self._graphable_results()
+        if not self._graph_results_cache:
+            self._graph_index = 0
+        else:
+            self._graph_index = max(0, min(self._graph_index, len(self._graph_results_cache) - 1))
+        self._update_graph_controls()
+        self._update_graph_content()
+
+    def _update_graph_controls(self):
+        names = [res.get("file", "") for res in self._graph_results_cache]
+        if self._graph_file_combo is not None:
+            try:
+                self._graph_file_combo["values"] = names
+            except tk.TclError:
+                pass
+            if names:
+                idx = max(0, min(self._graph_index, len(names) - 1))
+                try:
+                    self._graph_file_combo.current(idx)
+                except tk.TclError:
+                    pass
+                self._graph_selection_var.set(names[idx])
+            else:
+                self._graph_selection_var.set("")
+                try:
+                    self._graph_file_combo.set("")
+                except tk.TclError:
+                    pass
+        state_prev = "normal" if self._graph_index > 0 else "disabled"
+        state_next = "normal" if self._graph_results_cache and self._graph_index < len(self._graph_results_cache) - 1 else "disabled"
+        if self._graph_prev_button is not None:
+            try:
+                self._graph_prev_button.configure(state=state_prev)
+            except tk.TclError:
+                pass
+        if self._graph_next_button is not None:
+            try:
+                self._graph_next_button.configure(state=state_next)
+            except tk.TclError:
+                pass
+
+    def _get_loess_parameters(self) -> Tuple[float, int]:
+        try:
+            span = float(self.loess_span_var.get())
+        except Exception:
+            span = 0.3
+        if span <= 0:
+            span = 0.1
+        if span > 1:
+            span = 1.0
+        try:
+            degree = int(float(self.loess_degree_var.get()))
+        except Exception:
+            degree = 1
+        degree = 2 if degree >= 2 else 1
+        return span, degree
+
+    def _update_graph_content(self):
+        ax = self._graph_ax
+        canvas = self._graph_canvas
+        tree = self._graph_exclusion_tree
+        if ax is None or canvas is None:
+            return
+        ax.clear()
+        results = self._graph_results_cache
+        if not results:
+            ax.text(0.5, 0.5, "No computed results", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            canvas.draw_idle()
+            if tree is not None:
+                tree.delete(*tree.get_children())
+                tree.insert("", tk.END, values=("No excluded values", "", ""))
+                self._autofit_tree_columns(tree, min_width=80, padding=24, max_width=None)
+            return
+
+        ax.set_axis_on()
+        result = results[self._graph_index]
+        series = result.get("series", {})
+        times = series.get("time") or []
+        span, degree = self._get_loess_parameters()
+
+        excluded_rows = []
+        shown_excluded_label = False
+        for measure in MEASURE_ORDER:
+            color = PLOT_SERIES_COLORS.get(measure, "#444444")
+            measure_data = series.get(measure, {}) or {}
+            values = measure_data.get("values") or []
+            excluded_indices = set(measure_data.get("excluded_indices") or [])
+            n = min(len(values), len(times))
+            kept_x, kept_y = [], []
+            excluded_x, excluded_y = [], []
+            loess_x, loess_y = [], []
+            for idx in range(n):
+                val = values[idx]
+                t = times[idx]
+                if math.isnan(val):
+                    continue
+                loess_x.append(t)
+                loess_y.append(val)
+                if idx in excluded_indices:
+                    excluded_x.append(t)
+                    excluded_y.append(val)
+                    excluded_rows.append((measure, t, val))
+                else:
+                    kept_x.append(t)
+                    kept_y.append(val)
+            if kept_x:
+                ax.scatter(kept_x, kept_y, s=28, color=color, edgecolor="white", linewidths=0.3, label=f"{measure}")
+            if excluded_x:
+                label = "Excluded" if not shown_excluded_label else None
+                ax.scatter(excluded_x, excluded_y, s=32, color="#000000", marker="o", label=label)
+                shown_excluded_label = True
+            if len(loess_x) >= 2:
+                loess_vals = compute_loess_line(loess_x, loess_y, frac=span, degree=degree)
+                if loess_vals:
+                    sorted_points = sorted(zip(loess_x, loess_vals), key=lambda item: item[0])
+                    xs = [pt[0] for pt in sorted_points]
+                    ys = [pt[1] for pt in sorted_points]
+                    ax.plot(xs, ys, color=_lighten_color(color, 0.5), linewidth=2.0, label=f"{measure} LOESS")
+
+        ax.set_title(f"Blood pressure vs time – {result.get('file', '')}")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Blood pressure")
+        ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+        ax.legend(loc="best")
+        canvas.draw_idle()
+
+        if tree is not None:
+            tree.delete(*tree.get_children())
+            if not excluded_rows:
+                tree.insert("", tk.END, values=("None", "", ""))
+            else:
+                excluded_rows.sort(key=lambda item: item[1])
+                for measure, timestamp, value in excluded_rows:
+                    tree.insert(
+                        "",
+                        tk.END,
+                        values=(measure, format_time_stamp(timestamp), fmt_float(value, 6)),
+                    )
+            self._autofit_tree_columns(tree, min_width=80, padding=24, max_width=None)
+
+    def _change_graph_index(self, delta: int):
+        if not self._graph_results_cache:
+            return
+        new_idx = max(0, min(self._graph_index + delta, len(self._graph_results_cache) - 1))
+        if new_idx == self._graph_index:
+            return
+        self._graph_index = new_idx
+        self._update_graph_controls()
+        self._update_graph_content()
+
+    def _on_graph_combo_selected(self, *_args):
+        if self._graph_file_combo is None:
             return
         try:
-            with open(path, "w", newline="", encoding="utf-8") as fh:
-                writer = csv.writer(fh)
-                writer.writerow(["file", "measurement", "excluded_value"])
-                for file_name, measure, value in value_rows:
-                    writer.writerow([file_name, measure, value])
-            self.status.set(f"Saved exclusion CSV: {path}")
-        except Exception as exc:
-            messagebox.showerror("Export error", str(exc))
+            idx = self._graph_file_combo.current()
+        except tk.TclError:
+            idx = -1
+        if idx is None or idx < 0:
+            return
+        if idx != self._graph_index:
+            self._graph_index = idx
+            self._update_graph_controls()
+            self._update_graph_content()
 
-    def view_exclusions(self):
-        if self._exclusions_window is not None and self._exclusions_window.winfo_exists():
-            self._exclusions_window.lift()
-            self._refresh_exclusions_window()
+    def view_graphs(self):
+        graphable = self._graphable_results()
+        if not graphable:
+            messagebox.showinfo("No graphs", "Compute results before viewing graphs.")
+            return
+        if self._graph_window is not None and self._graph_window.winfo_exists():
+            self._graph_results_cache = graphable
+            self._graph_index = max(0, min(self._graph_index, len(graphable) - 1))
+            self._update_graph_controls()
+            self._update_graph_content()
+            self._graph_window.lift()
             return
 
         win = tk.Toplevel(self)
-        win.title("Excluded blood pressure values")
+        win.title("Blood pressure graphs")
         win.transient(self)
         win.resizable(True, True)
-        self._exclusions_window = win
+        self._graph_window = win
+        win.protocol("WM_DELETE_WINDOW", self._close_graph_window)
 
-        content = ttk.Frame(win, padding=12)
-        content.pack(fill=tk.BOTH, expand=True)
-        content.columnconfigure(0, weight=1)
-        content.rowconfigure(0, weight=1)
+        container = ttk.Frame(win, padding=12)
+        container.pack(fill=tk.BOTH, expand=True)
 
-        columns = ("file", "measure", "values")
-        tree = ttk.Treeview(content, columns=columns, show="headings", height=14)
-        tree.heading("file", text="Participant")
-        tree.heading("measure", text="Measurement")
-        tree.heading("values", text="Excluded values")
-        tree.column("file", anchor=tk.W, width=200, stretch=False)
-        tree.column("measure", anchor=tk.W, width=140, stretch=False)
-        tree.column("values", anchor=tk.W, stretch=True)
-        tree.grid(row=0, column=0, sticky="nsew")
+        top_controls = ttk.Frame(container)
+        top_controls.pack(fill=tk.X)
 
-        y_scroll = ttk.Scrollbar(content, orient=tk.VERTICAL, command=tree.yview)
-        y_scroll.grid(row=0, column=1, sticky="ns")
+        combo = ttk.Combobox(
+            top_controls,
+            textvariable=self._graph_selection_var,
+            state="readonly",
+            width=40,
+        )
+        combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        combo.bind("<<ComboboxSelected>>", self._on_graph_combo_selected)
+
+        prev_btn = ttk.Button(top_controls, text="<", width=3, command=lambda: self._change_graph_index(-1))
+        prev_btn.pack(side=tk.LEFT, padx=(8, 0))
+        next_btn = ttk.Button(top_controls, text=">", width=3, command=lambda: self._change_graph_index(1))
+        next_btn.pack(side=tk.LEFT, padx=(4, 0))
+
+        main_pane = ttk.PanedWindow(container, orient=tk.HORIZONTAL)
+        main_pane.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
+
+        figure_frame = ttk.Frame(main_pane)
+        main_pane.add(figure_frame, weight=3)
+        side_frame = ttk.Frame(main_pane)
+        main_pane.add(side_frame, weight=1)
+
+        fig = Figure(figsize=(6, 4), dpi=100)
+        ax = fig.add_subplot(111)
+        canvas = FigureCanvasTkAgg(fig, master=figure_frame)
+        canvas_widget = canvas.get_tk_widget()
+        canvas_widget.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(side_frame, text="Excluded values", anchor="w").pack(fill=tk.X, pady=(0, 4))
+        tree = ttk.Treeview(side_frame, columns=("measure", "time", "value"), show="headings", height=16)
+        tree.heading("measure", text="Measure")
+        tree.heading("time", text="Time")
+        tree.heading("value", text="Value")
+        tree.column("measure", anchor=tk.W, width=90)
+        tree.column("time", anchor=tk.W, width=110)
+        tree.column("value", anchor=tk.E, width=90)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        y_scroll = ttk.Scrollbar(side_frame, orient=tk.VERTICAL, command=tree.yview)
+        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         tree.configure(yscrollcommand=y_scroll.set)
 
-        x_scroll = ttk.Scrollbar(content, orient=tk.HORIZONTAL, command=tree.xview)
-        x_scroll.grid(row=1, column=0, sticky="ew")
-        tree.configure(xscrollcommand=x_scroll.set)
+        self._graph_canvas = canvas
+        self._graph_figure = fig
+        self._graph_ax = ax
+        self._graph_file_combo = combo
+        self._graph_exclusion_tree = tree
+        self._graph_prev_button = prev_btn
+        self._graph_next_button = next_btn
+        self._graph_results_cache = graphable
+        self._graph_index = 0
 
-        btns = ttk.Frame(content)
-        btns.grid(row=2, column=0, columnspan=2, sticky="e", pady=(12, 0))
-        ttk.Button(btns, text="Close", command=self._close_exclusions_window).pack(side=tk.RIGHT)
-        ttk.Button(btns, text="Export CSV…", command=self._export_exclusions_csv).pack(side=tk.RIGHT, padx=(0, 8))
+        self._update_graph_controls()
+        self._update_graph_content()
 
-        self._exclusion_tree = tree
-        win.protocol("WM_DELETE_WINDOW", self._close_exclusions_window)
-
-        self._refresh_exclusions_window()
 
     def _export_preferences(self) -> Dict[str, Any]:
         return {
@@ -1760,6 +2092,8 @@ class ARVApp(tk.Tk):
             "show_std": bool(self.output_std.get()),
             "show_cov": bool(self.output_cov.get()),
             "show_arv": bool(self.output_arv.get()),
+            "loess_span": self.loess_span_var.get(),
+            "loess_degree": self.loess_degree_var.get(),
         }
 
     def _restore_preferences(self, snapshot: Optional[Dict[str, Any]]):
@@ -1792,6 +2126,8 @@ class ARVApp(tk.Tk):
         self.output_std.set(bool(snapshot.get("show_std", True)))
         self.output_cov.set(bool(snapshot.get("show_cov", True)))
         self.output_arv.set(bool(snapshot.get("show_arv", True)))
+        self.loess_span_var.set(snapshot.get("loess_span", "0.3"))
+        self.loess_degree_var.set(str(snapshot.get("loess_degree", "1")))
         self._update_window_mode_frames()
         self._update_filter_setting_frames()
         self._update_filter_controls_state()
@@ -2144,6 +2480,7 @@ class ARVApp(tk.Tk):
         self._preferences_snapshot = None
         self._start_mode_frames = {}
         self._end_mode_frames = {}
+        self._refresh_graph_window()
 
     def _close_layout(self, window):
         if window.winfo_exists():
@@ -2364,7 +2701,7 @@ class ARVApp(tk.Tk):
             self.status.set(f"Done with {len(self.results)} result(s). {errors} file(s) had errors (see table).")
         else:
             self.status.set(f"Done. Computed metrics for {len(self.results)} file(s).")
-        self._refresh_exclusions_window()
+        self._refresh_graph_window()
 
     def save_csv(self):
         if not self.results:

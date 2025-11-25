@@ -16,9 +16,7 @@ landmarks.  It also prints summary statistics for the detected beats and
 flags potential artefacts using simple heuristics.
 
 Command-line flags allow overriding the column separator used when
-reading whitespace-heavy exports (``--separator``) and limiting the
-number of raw samples rendered in the interactive plot
-(``--plot-max-points``) to speed up large-file analysis.
+reading whitespace-heavy exports (``--separator``).
 """
 
 from __future__ import annotations
@@ -34,11 +32,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 try:
     import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+    from tkinter import filedialog, ttk
 except Exception:  # pragma: no cover - tkinter may be unavailable in some envs.
     tk = None
     filedialog = None
-    messagebox = None
     ttk = None
 
 try:
@@ -68,28 +65,159 @@ try:  # pragma: no cover - optional acceleration for rolling statistics
 except Exception:  # pragma: no cover - fallback when unavailable
     sliding_window_view = None  # type: ignore[assignment]
 
+try:  # pragma: no cover - optional JIT acceleration
+    from numba import njit
+except Exception:  # pragma: no cover - optional dependency
+    njit = None  # type: ignore[assignment]
+
 try:
     import pandas as pd
-    from pandas import DataFrame
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
     raise SystemExit("pandas is required to run this script. Please install it and retry.") from exc
-
-try:  # pragma: no cover - optional dependency for fast CSV ingestion
-    import pyarrow as pa
-    import pyarrow.csv as pa_csv
-except ModuleNotFoundError:  # pragma: no cover - optional dependency
-    pa = None  # type: ignore[assignment]
-    pa_csv = None  # type: ignore[assignment]
-
-try:  # pragma: no cover - optional fast moving-window statistics
-    import bottleneck as bn
-except ModuleNotFoundError:  # pragma: no cover - optional dependency
-    bn = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency for zero-phase filtering/PSD
     from scipy import signal as sp_signal
 except ModuleNotFoundError:  # pragma: no cover - optional dependency
     sp_signal = None
+
+
+NUMBA_AVAILABLE = njit is not None
+USE_NUMBA = NUMBA_AVAILABLE
+
+
+def configure_numba(enabled: bool) -> None:
+    """Enable/disable Numba-backed kernels based on availability and user choice."""
+
+    global USE_NUMBA
+    USE_NUMBA = bool(enabled and NUMBA_AVAILABLE)
+
+
+if NUMBA_AVAILABLE:
+
+    @njit(cache=True)  # type: ignore[misc]
+    def _rolling_median_and_mad_numba_core(
+        values: np.ndarray, window: int, min_periods: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        n = values.size
+        medians = np.empty(n, dtype=np.float64)
+        mads = np.empty(n, dtype=np.float64)
+        for idx in range(n):
+            medians[idx] = np.nan
+            mads[idx] = np.nan
+
+        half = window // 2
+        buffer_vals = np.empty(window, dtype=np.float64)
+        deviations = np.empty(window, dtype=np.float64)
+
+        for center in range(n):
+            start = center - half
+            end = center + half + 1
+            count = 0
+
+            for offset in range(start, end):
+                if 0 <= offset < n:
+                    val = values[offset]
+                    if np.isfinite(val):
+                        buffer_vals[count] = val
+                        count += 1
+
+            if count < min_periods:
+                continue
+
+            sorted_vals = np.sort(buffer_vals[:count])
+            if count % 2 == 1:
+                median = sorted_vals[count // 2]
+            else:
+                median = 0.5 * (sorted_vals[count // 2 - 1] + sorted_vals[count // 2])
+            medians[center] = median
+
+            for idx in range(count):
+                deviations[idx] = abs(buffer_vals[idx] - median)
+
+            sorted_dev = np.sort(deviations[:count])
+            if count % 2 == 1:
+                mad = sorted_dev[count // 2]
+            else:
+                mad = 0.5 * (sorted_dev[count // 2 - 1] + sorted_dev[count // 2])
+
+            if np.isfinite(mad):
+                mad *= 1.4826
+            else:
+                mad = np.nan
+
+            if not np.isfinite(mad) or mad < 1e-3:
+                mean = 0.0
+                for idx in range(count):
+                    mean += buffer_vals[idx]
+                mean /= count
+
+                var = 0.0
+                for idx in range(count):
+                    diff = buffer_vals[idx] - mean
+                    var += diff * diff
+                var /= count
+
+                if var > 0.0:
+                    mad = math.sqrt(var)
+                else:
+                    mad = 0.0
+
+            mads[center] = mad
+
+        return medians, mads
+
+
+    @njit(cache=True)  # type: ignore[misc]
+    def _prominence_numba_core(
+        signal: np.ndarray, peaks: np.ndarray, max_distance: int
+    ) -> np.ndarray:
+        result = np.empty(peaks.size, dtype=np.float64)
+        for idx in range(peaks.size):
+            result[idx] = np.nan
+
+        n = signal.size
+        for idx in range(peaks.size):
+            peak_idx = int(peaks[idx])
+            if peak_idx < 0 or peak_idx >= n:
+                continue
+            peak_val = signal[peak_idx]
+            if not np.isfinite(peak_val):
+                continue
+
+            left_start = peak_idx - max_distance
+            if left_start < 0:
+                left_start = 0
+            right_end = peak_idx + max_distance
+            if right_end > n:
+                right_end = n
+
+            left_min = np.inf
+            left_found = False
+            for pos in range(left_start, peak_idx + 1):
+                val = signal[pos]
+                if np.isfinite(val):
+                    left_found = True
+                    if val < left_min:
+                        left_min = val
+
+            right_min = np.inf
+            right_found = False
+            for pos in range(peak_idx, right_end):
+                val = signal[pos]
+                if np.isfinite(val):
+                    right_found = True
+                    if val < right_min:
+                        right_min = val
+
+            if left_found and right_found:
+                baseline = left_min if left_min >= right_min else right_min
+                result[idx] = peak_val - baseline
+
+        return result
+
+else:  # pragma: no cover - Numba unavailable
+    _rolling_median_and_mad_numba_core = None  # type: ignore[assignment]
+    _prominence_numba_core = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -107,7 +235,6 @@ class Beat:
     systolic_prominence: float
     is_artifact: bool
     artifact_reasons: List[str] = field(default_factory=list)
-    is_post_calibration_recovery: bool = False
 
 
 @dataclass
@@ -124,6 +251,18 @@ class ArtifactConfig:
     min_prominence: float = 8.0
     prominence_noise_factor: float = 0.18
     max_missing_gap: float = 10.0
+    scipy_mad_multiplier: float = 3.0
+    abs_sys_difference_artifact: float = 10.0
+    abs_dia_difference_artifact: float = 10.0
+    max_rr_artifact: float = 0.5
+    enable_range_checks: bool = True
+    enable_pulse_pressure_check: bool = True
+    enable_pressure_deviation_check: bool = True
+    enable_rr_bounds_check: bool = True
+    enable_rr_deviation_check: bool = True
+    enable_prominence_check: bool = True
+    enable_gap_checks: bool = True
+    enable_post_calibration_check: bool = True
 
 
 @dataclass
@@ -132,10 +271,10 @@ class BPFilePreview:
 
     metadata: Dict[str, str]
     column_names: List[str]
-    preview: Optional[DataFrame]
+    preview: Optional[pd.DataFrame]
     skiprows: List[int]
     detected_separator: Optional[str]
-    raw_lines: List[str]
+    raw_lines: List[str] = field(default_factory=list)
     preview_rows: int = 200
 
 
@@ -153,14 +292,259 @@ class ImportDialogResult:
     pressure_column_index: int
     comment_column: Optional[str] = None
     comment_column_index: Optional[int] = None
+    analysis_downsample: int = 1
+    plot_downsample: int = 1
+    enable_range_checks: bool = True
+    enable_pulse_pressure_check: bool = True
+    enable_pressure_deviation_check: bool = True
+    enable_rr_bounds_check: bool = True
+    enable_rr_deviation_check: bool = True
+    enable_prominence_check: bool = True
+    enable_gap_checks: bool = True
+    enable_post_calibration_check: bool = True
 
 
-class FastParserError(RuntimeError):
-    """Raised when the fast column loader fails to parse the file."""
+def _parse_list_field(raw_value: str) -> List[str]:
+    """Split a metadata field that contains multiple values.
 
-    def __init__(self, message: str):
-        super().__init__(message)
-        self.message = message
+    The files we ingest typically separate list fields using tabs.  When
+    tabs are not present, we fall back to any amount of whitespace.
+    """
+
+    raw_value = raw_value.strip()
+    if not raw_value:
+        return []
+
+    # Try splitting on one or more tab characters first.
+    parts = [item.strip() for item in re.split(r"\t+", raw_value) if item.strip()]
+    if parts:
+        return parts
+
+    # Fallback: split on whitespace while keeping multi-word labels intact
+    # by joining adjacent capitalised tokens (e.g., "Respiratory Belt").
+    tokens = [tok for tok in raw_value.split(" ") if tok]
+    merged: List[str] = []
+    buffer: List[str] = []
+    for tok in tokens:
+        if tok and tok[0].isupper() and not tok.isupper():
+            if buffer:
+                merged.append(" ".join(buffer))
+                buffer = []
+            buffer.append(tok)
+        elif buffer:
+            buffer.append(tok)
+        else:
+            merged.append(tok)
+    if buffer:
+        merged.append(" ".join(buffer))
+
+    return merged or tokens
+
+
+def _parse_bp_header(
+    file_path: Path, *, max_data_lines: int = 5
+) -> Tuple[Dict[str, str], List[int], List[str], Optional[str]]:
+    """Return metadata, line numbers to skip, and inferred column names.
+
+    The parser treats blank lines, comments, and ``key=value`` metadata entries
+    as non-numeric content.  All remaining rows are expected to contain the
+    same number of whitespace-delimited values; inconsistent rows raise a
+    ``ValueError`` instead of being silently truncated.
+    """
+
+    metadata: Dict[str, str] = {}
+    skiprows: List[int] = []
+    column_count: Optional[int] = None
+    first_numeric_row_idx: Optional[int] = None
+    numeric_samples: List[str] = []
+    numeric_lines_checked = 0
+
+    if max_data_lines <= 0:
+        max_data_lines = 1
+
+    def _numeric_values(candidate: str) -> np.ndarray:
+        tokens = [tok for tok in re.split(r"[\s,;|]+", candidate) if tok]
+        if not tokens:
+            return np.array([], dtype=float)
+        try:
+            return np.asarray([float(tok) for tok in tokens], dtype=float)
+        except ValueError:
+            return np.array([], dtype=float)
+
+    with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for idx, raw_line in enumerate(handle):
+            stripped = raw_line.strip()
+
+            if first_numeric_row_idx is None:
+                if not stripped:
+                    skiprows.append(idx)
+                    continue
+
+                candidate = stripped
+                if "#" in candidate:
+                    candidate = candidate.split("#", 1)[0].strip()
+                    if not candidate:
+                        skiprows.append(idx)
+                        continue
+
+                if "=" in candidate and not re.match(r"^[+-]?[0-9]", candidate):
+                    key, value = candidate.split("=", 1)
+                    metadata[key.strip()] = value.strip()
+                    skiprows.append(idx)
+                    continue
+
+                values = _numeric_values(candidate)
+                if values.size == 0:
+                    skiprows.append(idx)
+                    continue
+
+                column_count = int(values.size)
+                first_numeric_row_idx = idx
+                numeric_samples.append(raw_line.rstrip("\n"))
+                numeric_lines_checked = 1
+
+                if numeric_lines_checked >= max_data_lines:
+                    break
+                continue
+
+            # Once numeric data begins, avoid adding more skip rows and only
+            # validate a limited sample for column consistency.
+            if not stripped:
+                break
+
+            candidate = stripped
+            if "#" in candidate:
+                candidate = candidate.split("#", 1)[0].strip()
+                if not candidate:
+                    break
+
+            values = _numeric_values(candidate)
+            if values.size == 0:
+                break
+
+            if column_count is None:
+                column_count = int(values.size)
+            elif int(values.size) != column_count:
+                raise ValueError(
+                    "Encountered data row with an unexpected column count at "
+                    f"line {idx + 1}: expected {column_count}, found {int(values.size)}."
+                )
+
+            numeric_samples.append(raw_line.rstrip("\n"))
+            numeric_lines_checked += 1
+            if numeric_lines_checked >= max_data_lines:
+                break
+
+    if column_count is None or first_numeric_row_idx is None:
+        raise ValueError("No numeric data found in file.")
+
+    channels = _parse_list_field(metadata.get("ChannelTitle", ""))
+    if channels and column_count == len(channels) + 1:
+        column_names = ["Time"] + channels
+    else:
+        column_names = [f"col_{idx}" for idx in range(column_count)]
+
+    detected_separator: Optional[str] = None
+    if numeric_samples:
+        candidate_lines = numeric_samples
+
+        def _consistently_splits(delimiter: str, *, allow_blank_tokens: bool = False) -> bool:
+            for line in candidate_lines:
+                stripped_line = line.strip()
+                parts = stripped_line.split(delimiter)
+                if len(parts) != column_count:
+                    return False
+                if not allow_blank_tokens and any(part == "" for part in parts):
+                    return False
+            return True
+
+        for delimiter in ("\t", ",", ";", "|"):
+            if all(delimiter in line for line in candidate_lines) and _consistently_splits(delimiter, allow_blank_tokens=True):
+                detected_separator = delimiter
+                break
+
+        if detected_separator is None and all("\t" not in line for line in candidate_lines):
+            if _consistently_splits(" "):
+                detected_separator = " "
+
+    return metadata, skiprows, column_names, detected_separator
+
+
+def _scan_bp_file(
+    file_path: Path,
+    max_numeric_rows: int = 200,
+    *,
+    header_sample_lines: int = 5,
+    separator_override: Optional[str] = None,
+) -> BPFilePreview:
+    """Perform a quick pass to gather metadata and column previews."""
+
+    metadata, skiprows, column_names, detected_separator = _parse_bp_header(
+        file_path, max_data_lines=header_sample_lines
+    )
+
+    if separator_override:
+        detected_separator = separator_override
+
+    preview_frame: Optional[pd.DataFrame] = None
+    read_kwargs = dict(
+        filepath_or_buffer=file_path,
+        comment="#",
+        header=None,
+        names=column_names,
+        skiprows=skiprows,
+        nrows=max_numeric_rows,
+        na_values=["nan", "NaN", "NA"],
+        dtype=float,
+    )
+
+    if detected_separator:
+        try:
+            if len(detected_separator) == 1:
+                preview_frame = pd.read_csv(
+                    sep=detected_separator,
+                    engine="c",
+                    **read_kwargs,
+                )
+            else:
+                preview_frame = pd.read_csv(
+                    sep=detected_separator,
+                    engine="python",
+                    **read_kwargs,
+                )
+        except Exception:
+            preview_frame = pd.read_csv(
+                delim_whitespace=True,
+                engine="python",
+                **read_kwargs,
+            )
+    else:
+        preview_frame = pd.read_csv(
+            delim_whitespace=True,
+            engine="python",
+            **read_kwargs,
+        )
+
+    raw_lines: List[str] = []
+    try:
+        with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for _ in range(200):
+                line = handle.readline()
+                if not line:
+                    break
+                raw_lines.append(line.rstrip("\r\n"))
+    except Exception:
+        raw_lines = []
+
+    return BPFilePreview(
+        metadata=metadata,
+        column_names=column_names,
+        preview=preview_frame,
+        skiprows=skiprows,
+        detected_separator=detected_separator,
+        raw_lines=raw_lines,
+        preview_rows=max(1, max_numeric_rows),
+    )
 
 
 def _tokenise_preview_line(line: str, separator: Optional[str]) -> List[str]:
@@ -187,80 +571,6 @@ def _tokenise_preview_line(line: str, separator: Optional[str]) -> List[str]:
         return line.split(separator)
 
 
-def _scan_bp_file(
-    file_path: Path,
-    max_preview_rows: int = 200,
-    *,
-    separator_override: Optional[str] = None,
-) -> BPFilePreview:
-    """Read a lightweight preview without inferring structure."""
-
-    metadata: Dict[str, str] = {}
-    skiprows: List[int] = []
-
-    preview_line_cap = max(max_preview_rows, 200)
-    raw_lines: List[str] = []
-    with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
-        for _ in range(preview_line_cap):
-            line = handle.readline()
-            if not line:
-                break
-            raw_lines.append(line.rstrip("\r\n"))
-
-    meaningful_lines = [line for line in raw_lines if line.strip() and not line.strip().startswith("#")]
-
-    detected_separator: Optional[str] = separator_override
-    if detected_separator is None:
-        sample = meaningful_lines[:20]
-
-        def _consistent_split(delimiter: Optional[str]) -> bool:
-            if not sample:
-                return False
-            lengths: List[int] = []
-            has_multiple = False
-            for line in sample:
-                tokens = _tokenise_preview_line(line, delimiter)
-                if not tokens:
-                    return False
-                if len(tokens) > 1:
-                    has_multiple = True
-                lengths.append(len(tokens))
-            return has_multiple and len(set(lengths)) == 1
-
-        for delimiter in ("\t", ",", ";", "|"):
-            if _consistent_split(delimiter):
-                detected_separator = delimiter
-                break
-
-        if detected_separator is None and _consistent_split(" "):
-            detected_separator = " "
-
-    preview_rows = max_preview_rows if max_preview_rows > 0 else 200
-
-    column_names: List[str] = []
-    lines_for_tokens = meaningful_lines if meaningful_lines else raw_lines
-    if lines_for_tokens:
-        effective_separator = detected_separator if detected_separator is not None else None
-        column_count = 0
-        for line in lines_for_tokens:
-            tokens = _tokenise_preview_line(line, effective_separator)
-            if tokens:
-                column_count = len(tokens)
-                break
-        if column_count:
-            column_names = [f"column_{idx + 1}" for idx in range(column_count)]
-
-    return BPFilePreview(
-        metadata=metadata,
-        column_names=column_names,
-        preview=None,
-        skiprows=skiprows,
-        detected_separator=detected_separator,
-        raw_lines=raw_lines,
-        preview_rows=preview_rows,
-    )
-
-
 def _build_preview_dataframe(
     file_path: Path,
     *,
@@ -268,7 +578,7 @@ def _build_preview_dataframe(
     skiprows: Sequence[int],
     separator: Optional[str],
     max_rows: int,
-) -> DataFrame:
+) -> pd.DataFrame:
     """Construct a small DataFrame preview for the selected layout."""
 
     read_kwargs = dict(
@@ -290,21 +600,6 @@ def _build_preview_dataframe(
     return pd.read_csv(delim_whitespace=True, engine="python", **read_kwargs)
 
 
-def _default_column_selection(column_names: Sequence[str], requested: Optional[str], *, fallback: Optional[str] = None) -> str:
-    """Return a sensible default column name."""
-
-    if requested and requested in column_names:
-        return requested
-
-    if fallback and fallback in column_names:
-        return fallback
-
-    if column_names:
-        return column_names[0]
-
-    raise ValueError("No columns available for selection.")
-
-
 def _render_preview_to_text_widget(
     widget: tk.Text,
     preview_rows: Sequence[Sequence[str]],
@@ -321,45 +616,38 @@ def _render_preview_to_text_widget(
         return
 
     widget.configure(state="normal")
-    widget.delete("1.0", "end")
+    widget.delete("1.0", tk.END)
 
     if not preview_rows:
-        widget.insert("1.0", "No preview data available.")
+        widget.insert("end", "No preview data available.\n")
         widget.configure(state="disabled")
         return
 
-    total_rows = len(preview_rows)
-    display_rows = list(preview_rows[:max_rows])
-    column_count = max((len(row) for row in display_rows), default=0)
-    row_number_width = max(3, len(str(min(total_rows, max_rows)))) + 1
+    header_row_index = max(1, header_row_index)
+    first_data_row_index = max(1, first_data_row_index)
 
     widths: List[int] = []
-    for col_idx in range(column_count):
-        col_values = [
-            str(row[col_idx]) if col_idx < len(row) and row[col_idx] is not None else ""
-            for row in display_rows
-        ]
-        widths.append(max((len(value) for value in col_values), default=0))
+    sample_rows = list(preview_rows[:max_rows])
+    for row in sample_rows:
+        for idx, value in enumerate(row):
+            if value is None:
+                value = ""
+            text_value = str(value)
+            if idx >= len(widths):
+                widths.append(len(text_value))
+            else:
+                widths[idx] = max(widths[idx], len(text_value))
 
-    header_line_parts = [f"{'#':>{row_number_width}} "]
-    for col_idx in range(column_count):
-        label = str(col_idx + 1)
-        header_line_parts.append(label.ljust(widths[col_idx] + 2))
-    header_text = "".join(header_line_parts)
-    widget.insert("end", header_text + "\n")
-    widget.tag_add("column_index", "1.0", "1.end")
-
-    line_no = 2
-    for row_number, row_values in enumerate(display_rows, start=1):
-        line_parts: List[str] = [f"{row_number:>{row_number_width}} "]
-        cursor = len(line_parts[0])
+    line_no = 1
+    for row_number, row_values in enumerate(sample_rows, start=1):
+        line_parts: List[str] = []
         positions: List[Tuple[int, int, int]] = []
-
-        for col_idx in range(column_count):
+        cursor = 0
+        for col_idx, width in enumerate(widths):
             value = ""
             if col_idx < len(row_values) and row_values[col_idx] is not None:
                 value = str(row_values[col_idx])
-            padded = value.ljust(widths[col_idx] + 2)
+            padded = value.ljust(width + 2)
             start = cursor
             end = cursor + len(padded)
             positions.append((start, end, col_idx))
@@ -393,6 +681,148 @@ def _render_preview_to_text_widget(
     widget.tag_raise("header")
 
 
+def _default_column_selection(column_names: Sequence[str], requested: Optional[str], *, fallback: Optional[str] = None) -> str:
+    """Return a sensible default column name."""
+
+    if requested and requested in column_names:
+        return requested
+
+    if fallback and fallback in column_names:
+        return fallback
+
+    if column_names:
+        return column_names[0]
+
+    raise ValueError("No columns available for selection.")
+
+
+def _select_columns_via_cli(
+    column_names: Sequence[str],
+    *,
+    default_time: str,
+    default_pressure: str,
+) -> Tuple[str, str]:
+    """Prompt for time/pressure selection using stdin."""
+
+    if not sys.stdin.isatty():
+        return default_time, default_pressure
+
+    print("\nSelect time and pressure columns (press Enter to accept defaults).")
+    for idx, name in enumerate(column_names):
+        marker = ""
+        if name == default_time:
+            marker = " (default time)"
+        elif name == default_pressure:
+            marker = " (default pressure)"
+        print(f"  [{idx}] {name}{marker}")
+
+    def _prompt(label: str, default: str) -> str:
+        while True:
+            response = input(f"{label} [{default}]: ").strip()
+            if not response:
+                return default
+            if response in column_names:
+                return response
+            if response.isdigit():
+                idx = int(response)
+                if 0 <= idx < len(column_names):
+                    return column_names[idx]
+            print("Invalid selection. Choose a column name or index.")
+
+    time_column = _prompt("Time column", default_time)
+    while True:
+        pressure_column = _prompt("Pressure column", default_pressure)
+        if pressure_column == time_column:
+            print("Pressure column must differ from the time column.")
+        else:
+            break
+
+    return time_column, pressure_column
+
+
+def _select_columns_via_tk(
+    column_names: Sequence[str],
+    *,
+    default_time: str,
+    default_pressure: str,
+) -> Tuple[str, str]:
+    """Display a Tkinter dialog for column selection."""
+
+    if tk is None:
+        return default_time, default_pressure
+
+    root = tk.Tk()
+    root.title("Select waveform columns")
+    root.geometry("360x180")
+
+    time_var = tk.StringVar(value=default_time)
+    pressure_var = tk.StringVar(value=default_pressure)
+    error_var = tk.StringVar(value="")
+
+    tk.Label(root, text="Time column:").pack(pady=(12, 0))
+    tk.OptionMenu(root, time_var, *column_names).pack()
+
+    tk.Label(root, text="Pressure column:").pack(pady=(8, 0))
+    tk.OptionMenu(root, pressure_var, *column_names).pack()
+
+    error_label = tk.Label(root, textvariable=error_var, fg="red")
+    error_label.pack(pady=(6, 0))
+
+    selection: Dict[str, str] = {}
+
+    def confirm() -> None:
+        time_choice = time_var.get()
+        pressure_choice = pressure_var.get()
+        if time_choice == pressure_choice:
+            error_var.set("Time and pressure must differ.")
+            return
+        selection["time"] = time_choice
+        selection["pressure"] = pressure_choice
+        root.quit()
+
+    tk.Button(root, text="Confirm", command=confirm).pack(pady=12)
+
+    root.mainloop()
+    root.destroy()
+
+    if "time" in selection and "pressure" in selection:
+        return selection["time"], selection["pressure"]
+
+    return default_time, default_pressure
+
+
+def select_time_pressure_columns(
+    preview: BPFilePreview,
+    *,
+    requested_time: Optional[str] = None,
+    requested_pressure: Optional[str] = None,
+    allow_gui: bool = True,
+) -> Tuple[str, str]:
+    """Resolve the time and pressure columns, prompting the user when possible."""
+
+    column_names = preview.column_names
+    time_default = _default_column_selection(column_names, requested_time, fallback="Time")
+
+    remaining = [name for name in column_names if name != time_default]
+    pressure_default = _default_column_selection(
+        remaining if remaining else column_names,
+        requested_pressure if requested_pressure != time_default else None,
+        fallback="reBAP",
+    )
+
+    if allow_gui and tk is not None:
+        try:
+            return _select_columns_via_tk(
+                column_names,
+                default_time=time_default,
+                default_pressure=pressure_default,
+            )
+        except Exception:
+            pass
+
+    return _select_columns_via_cli(column_names, default_time=time_default, default_pressure=pressure_default)
+
+
 def launch_import_configuration_dialog(
     file_path: Path,
     preview: BPFilePreview,
@@ -416,6 +846,17 @@ def launch_import_configuration_dialog(
         ("Colon (:)", ":"),
     ]
 
+    downsample_options: List[Tuple[str, int]] = [
+        ("Full resolution (1×)", 1),
+        ("Every 2nd sample (2×)", 2),
+        ("Every 4th sample (4×)", 4),
+        ("Every 5th sample (5×)", 5),
+        ("Every 10th sample (10×)", 10),
+        ("Every 20th sample (20×)", 20),
+        ("Every 50th sample (50×)", 50),
+        ("Every 100th sample (100×)", 100),
+    ]
+
     def _label_for_separator(value: Optional[str]) -> str:
         for label, candidate in delimiter_options:
             if value == candidate:
@@ -424,6 +865,18 @@ def launch_import_configuration_dialog(
 
     def _resolve_separator_from_label(label: str) -> Optional[str]:
         for option_label, value in delimiter_options:
+            if option_label == label:
+                return value
+        return None
+
+    def _label_for_downsample(value: int) -> str:
+        for label, candidate in downsample_options:
+            if value == candidate:
+                return label
+        return downsample_options[0][0]
+
+    def _resolve_downsample_from_label(label: str) -> Optional[int]:
+        for option_label, value in downsample_options:
             if option_label == label:
                 return value
         return None
@@ -575,6 +1028,89 @@ def launch_import_configuration_dialog(
         state="disabled",
     )
     comment_entry.grid(row=2, column=3, sticky="w", padx=(8, 24), pady=(12, 0))
+
+    ttk.Label(controls_frame, text="Analysis downsampling:").grid(
+        row=3, column=0, sticky="w", pady=(12, 0)
+    )
+    analysis_downsample_var = tk.StringVar(value=_label_for_downsample(1))
+    analysis_downsample_combo = ttk.Combobox(
+        controls_frame,
+        state="readonly",
+        values=[label for label, _ in downsample_options],
+        textvariable=analysis_downsample_var,
+        width=28,
+    )
+    analysis_downsample_combo.grid(row=3, column=1, sticky="w", padx=(8, 24), pady=(12, 0))
+
+    ttk.Label(controls_frame, text="Plot downsampling:").grid(
+        row=3, column=2, sticky="w", pady=(12, 0)
+    )
+    plot_downsample_var = tk.StringVar(value=_label_for_downsample(10))
+    plot_downsample_combo = ttk.Combobox(
+        controls_frame,
+        state="readonly",
+        values=[label for label, _ in downsample_options],
+        textvariable=plot_downsample_var,
+        width=28,
+    )
+    plot_downsample_combo.grid(row=3, column=3, sticky="w", padx=(8, 24), pady=(12, 0))
+
+    artifact_frame = ttk.LabelFrame(controls_frame, text="Artifact detection")
+    artifact_frame.grid(row=4, column=0, columnspan=6, sticky="ew", pady=(16, 0))
+    for col in range(3):
+        artifact_frame.columnconfigure(col, weight=1)
+
+    artifact_toggle_vars = {
+        "range": tk.BooleanVar(value=True),
+        "pulse_pressure": tk.BooleanVar(value=True),
+        "pressure_deviation": tk.BooleanVar(value=True),
+        "rr_bounds": tk.BooleanVar(value=True),
+        "rr_deviation": tk.BooleanVar(value=True),
+        "prominence": tk.BooleanVar(value=True),
+        "long_gaps": tk.BooleanVar(value=True),
+        "post_calibration": tk.BooleanVar(value=True),
+    }
+
+    ttk.Checkbutton(
+        artifact_frame,
+        text="Implausible range checks",
+        variable=artifact_toggle_vars["range"],
+    ).grid(row=0, column=0, sticky="w", padx=(4, 8), pady=(4, 0))
+    ttk.Checkbutton(
+        artifact_frame,
+        text="Minimum pulse pressure",
+        variable=artifact_toggle_vars["pulse_pressure"],
+    ).grid(row=0, column=1, sticky="w", padx=(4, 8), pady=(4, 0))
+    ttk.Checkbutton(
+        artifact_frame,
+        text="Pressure deviation (MAD)",
+        variable=artifact_toggle_vars["pressure_deviation"],
+    ).grid(row=0, column=2, sticky="w", padx=(4, 8), pady=(4, 0))
+    ttk.Checkbutton(
+        artifact_frame,
+        text="RR absolute bounds",
+        variable=artifact_toggle_vars["rr_bounds"],
+    ).grid(row=1, column=0, sticky="w", padx=(4, 8), pady=(4, 0))
+    ttk.Checkbutton(
+        artifact_frame,
+        text="RR deviation (MAD)",
+        variable=artifact_toggle_vars["rr_deviation"],
+    ).grid(row=1, column=1, sticky="w", padx=(4, 8), pady=(4, 0))
+    ttk.Checkbutton(
+        artifact_frame,
+        text="Minimum prominence",
+        variable=artifact_toggle_vars["prominence"],
+    ).grid(row=1, column=2, sticky="w", padx=(4, 8), pady=(4, 0))
+    ttk.Checkbutton(
+        artifact_frame,
+        text="Long gap interpolation",
+        variable=artifact_toggle_vars["long_gaps"],
+    ).grid(row=2, column=0, sticky="w", padx=(4, 8), pady=(4, 4))
+    ttk.Checkbutton(
+        artifact_frame,
+        text="Post calibration reset",
+        variable=artifact_toggle_vars["post_calibration"],
+    ).grid(row=2, column=1, sticky="w", padx=(4, 8), pady=(4, 4))
 
     initial_comment_index: Optional[int] = None
     for idx, name in enumerate(preview.column_names, start=1):
@@ -873,6 +1409,18 @@ def launch_import_configuration_dialog(
         if column_count <= 0:
             column_count = max(time_index, pressure_index)
 
+        downsample_label = analysis_downsample_var.get()
+        downsample_value = _resolve_downsample_from_label(downsample_label)
+        if downsample_value is None or downsample_value <= 0:
+            error_var.set("Select a valid analysis downsampling factor.")
+            return
+
+        plot_downsample_label = plot_downsample_var.get()
+        plot_downsample_value = _resolve_downsample_from_label(plot_downsample_label)
+        if plot_downsample_value is None or plot_downsample_value <= 0:
+            error_var.set("Select a valid plot downsampling factor.")
+            return
+
         column_names = _derive_column_names(
             header_tokens,
             column_count,
@@ -932,10 +1480,20 @@ def launch_import_configuration_dialog(
         else:
             result["comment_index"] = None
             result["comment_name"] = None
+        result["analysis_downsample"] = downsample_value
+        result["plot_downsample"] = plot_downsample_value
         result["separator"] = current_preview_state.get("separator")
         result["preview"] = updated_preview
         result["header_row"] = header_index
         result["first_data_row"] = data_index
+        result["enable_range_checks"] = bool(artifact_toggle_vars["range"].get())
+        result["enable_pulse_pressure_check"] = bool(artifact_toggle_vars["pulse_pressure"].get())
+        result["enable_pressure_deviation_check"] = bool(artifact_toggle_vars["pressure_deviation"].get())
+        result["enable_rr_bounds_check"] = bool(artifact_toggle_vars["rr_bounds"].get())
+        result["enable_rr_deviation_check"] = bool(artifact_toggle_vars["rr_deviation"].get())
+        result["enable_prominence_check"] = bool(artifact_toggle_vars["prominence"].get())
+        result["enable_gap_checks"] = bool(artifact_toggle_vars["long_gaps"].get())
+        result["enable_post_calibration_check"] = bool(artifact_toggle_vars["post_calibration"].get())
         error_var.set("")
         root.quit()
 
@@ -970,6 +1528,8 @@ def launch_import_configuration_dialog(
         "first_data_row",
         "time_index",
         "pressure_index",
+        "analysis_downsample",
+        "plot_downsample",
     }
     if required_keys.issubset(result.keys()):
         return ImportDialogResult(
@@ -991,277 +1551,19 @@ def launch_import_configuration_dialog(
                 if isinstance(result.get("comment_index"), int)
                 else None
             ),
+            analysis_downsample=int(result["analysis_downsample"]),
+            plot_downsample=int(result["plot_downsample"]),
+            enable_range_checks=bool(result.get("enable_range_checks", True)),
+            enable_pulse_pressure_check=bool(result.get("enable_pulse_pressure_check", True)),
+            enable_pressure_deviation_check=bool(result.get("enable_pressure_deviation_check", True)),
+            enable_rr_bounds_check=bool(result.get("enable_rr_bounds_check", True)),
+            enable_rr_deviation_check=bool(result.get("enable_rr_deviation_check", True)),
+            enable_prominence_check=bool(result.get("enable_prominence_check", True)),
+            enable_gap_checks=bool(result.get("enable_gap_checks", True)),
+            enable_post_calibration_check=bool(result.get("enable_post_calibration_check", True)),
         )
 
     return None
-
-
-def _prompt_fast_parser_decision(*, title: str, summary: str, details: str) -> bool:
-    """Display a dialog explaining why the fast parser is unavailable or failed."""
-
-    message = (
-        f"{summary}\n\n"
-        f"Details:\n{details.strip()}\n\n"
-        "Would you like to continue with the slower parser?"
-    )
-
-    if tk is not None and messagebox is not None:
-        dialog_root: Optional[tk.Tk] = None
-        try:
-            dialog_root = tk.Tk()
-            dialog_root.withdraw()
-            result = messagebox.askyesno(
-                title,
-                message,
-                parent=dialog_root,
-            )
-            return bool(result)
-        except Exception:
-            pass
-        finally:
-            if dialog_root is not None:
-                dialog_root.destroy()
-
-    print(
-        f"{title}: {summary} "
-        f"Details: {details.strip()} "
-        "Proceeding with the slower parser."
-    )
-    return True
-
-
-def _select_columns_via_cli(
-    column_names: Sequence[str],
-    *,
-    default_time: str,
-    default_pressure: str,
-) -> Tuple[str, str]:
-    """Prompt for time/pressure selection using stdin."""
-
-    if not sys.stdin.isatty():
-        return default_time, default_pressure
-
-    print("\nSelect time and pressure columns (press Enter to accept defaults).")
-    for idx, name in enumerate(column_names):
-        marker = ""
-        if name == default_time:
-            marker = " (default time)"
-        elif name == default_pressure:
-            marker = " (default pressure)"
-        print(f"  [{idx}] {name}{marker}")
-
-    def _prompt(label: str, default: str) -> str:
-        while True:
-            response = input(f"{label} [{default}]: ").strip()
-            if not response:
-                return default
-            if response in column_names:
-                return response
-            if response.isdigit():
-                idx = int(response)
-                if 0 <= idx < len(column_names):
-                    return column_names[idx]
-            print("Invalid selection. Choose a column name or index.")
-
-    time_column = _prompt("Time column", default_time)
-    while True:
-        pressure_column = _prompt("Pressure column", default_pressure)
-        if pressure_column == time_column:
-            print("Pressure column must differ from the time column.")
-        else:
-            break
-
-    return time_column, pressure_column
-
-
-def _select_columns_via_tk(
-    column_names: Sequence[str],
-    *,
-    default_time: str,
-    default_pressure: str,
-) -> Tuple[str, str]:
-    """Display a Tkinter dialog for column selection."""
-
-    if tk is None:
-        return default_time, default_pressure
-
-    root = tk.Tk()
-    root.title("Select waveform columns")
-    root.geometry("360x180")
-
-    time_var = tk.StringVar(value=default_time)
-    pressure_var = tk.StringVar(value=default_pressure)
-    error_var = tk.StringVar(value="")
-
-    tk.Label(root, text="Time column:").pack(pady=(12, 0))
-    tk.OptionMenu(root, time_var, *column_names).pack()
-
-    tk.Label(root, text="Pressure column:").pack(pady=(8, 0))
-    tk.OptionMenu(root, pressure_var, *column_names).pack()
-
-    error_label = tk.Label(root, textvariable=error_var, fg="red")
-    error_label.pack(pady=(6, 0))
-
-    selection: Dict[str, str] = {}
-
-    def confirm() -> None:
-        time_choice = time_var.get()
-        pressure_choice = pressure_var.get()
-        if time_choice == pressure_choice:
-            error_var.set("Time and pressure must differ.")
-            return
-        selection["time"] = time_choice
-        selection["pressure"] = pressure_choice
-        root.quit()
-
-    tk.Button(root, text="Confirm", command=confirm).pack(pady=12)
-
-    root.mainloop()
-    root.destroy()
-
-    if "time" in selection and "pressure" in selection:
-        return selection["time"], selection["pressure"]
-
-    return default_time, default_pressure
-
-
-def select_time_pressure_columns(
-    preview: BPFilePreview,
-    *,
-    requested_time: Optional[str] = None,
-    requested_pressure: Optional[str] = None,
-    allow_gui: bool = True,
-) -> Tuple[str, str]:
-    """Resolve the time and pressure columns, prompting the user when possible."""
-
-    column_names = preview.column_names
-    time_default = _default_column_selection(column_names, requested_time, fallback="Time")
-
-    remaining = [name for name in column_names if name != time_default]
-    pressure_default = _default_column_selection(
-        remaining if remaining else column_names,
-        requested_pressure if requested_pressure != time_default else None,
-        fallback="reBAP",
-    )
-
-    if allow_gui and tk is not None:
-        try:
-            return _select_columns_via_tk(
-                column_names,
-                default_time=time_default,
-                default_pressure=pressure_default,
-            )
-        except Exception:
-            pass
-
-    return _select_columns_via_cli(column_names, default_time=time_default, default_pressure=pressure_default)
-
-
-def _load_selected_columns_fast(
-    file_path: Path,
-    *,
-    column_indices: Sequence[int],
-    column_names: Sequence[str],
-    first_data_row: int,
-    separator: Optional[str],
-    skiprows: Sequence[int],
-) -> DataFrame:
-    """Attempt to load selected columns quickly using PyArrow's CSV reader."""
-
-    if pa_csv is None or pa is None:
-        raise FastParserError("PyArrow is not installed; fast parsing is unavailable.")
-
-    if not column_indices:
-        raise FastParserError("No column indices were provided for fast parsing.")
-
-    try:
-        resolved_indices = [int(idx) for idx in column_indices]
-    except Exception as exc:
-        raise FastParserError("Column indices for fast parsing must be integers.") from exc
-
-    for idx in resolved_indices:
-        if idx < 0 or idx >= len(column_names):
-            raise FastParserError(
-                "One or more requested column indices are outside the detected column range."
-            )
-
-    selected_column_names = [column_names[idx] for idx in resolved_indices]
-
-    if separator is None:
-        raise FastParserError("Fast parser requires a resolved delimiter to use the PyArrow reader.")
-
-    if not separator or len(separator) != 1:
-        raise FastParserError(
-            "Fast parser using the PyArrow reader supports only single-character delimiters."
-        )
-
-    delimiter = separator
-
-    combined_skiprows = set(skiprows)
-    combined_skiprows.update(range(max(0, first_data_row - 1)))
-    skiprows_list = sorted(combined_skiprows)
-
-    contiguous_prefix = 0
-    for expected, row_index in enumerate(skiprows_list):
-        if row_index != expected:
-            break
-        contiguous_prefix = expected + 1
-
-    non_contiguous_skips = skiprows_list[contiguous_prefix:]
-    if non_contiguous_skips:
-        raise FastParserError(
-            "PyArrow's CSV reader only supports skipping an initial contiguous block of rows, "
-            "but additional rows were requested: "
-            f"{non_contiguous_skips}."
-        )
-
-    skip_rows_count = contiguous_prefix
-
-    if not column_names:
-        raise FastParserError("No column names were provided for fast parsing.")
-
-    file_path_str = str(file_path)
-
-    try:
-        read_options = pa_csv.ReadOptions(
-            column_names=list(column_names),
-            skip_rows=skip_rows_count,
-        )
-        parse_options = pa_csv.ParseOptions(delimiter=delimiter)
-        convert_options = pa_csv.ConvertOptions(
-            include_columns=selected_column_names,
-            column_types={name: pa.float32() for name in selected_column_names},
-            strings_can_be_null=True,
-            null_values=["", "nan", "NaN", "NA"],
-        )
-        table = pa_csv.read_csv(
-            file_path_str,
-            read_options=read_options,
-            parse_options=parse_options,
-            convert_options=convert_options,
-        )
-    except Exception as exc:
-        raise FastParserError(
-            "PyArrow CSV reader failed to parse the selected columns: "
-            f"{exc}. Requested columns: {selected_column_names}"
-        ) from exc
-
-    if table.num_rows == 0:
-        return pd.DataFrame(columns=selected_column_names)
-
-    frame = table.to_pandas(self_destruct=True, split_blocks=True)
-    frame = frame.reindex(columns=selected_column_names)
-
-    for column in frame.columns:
-        try:
-            frame[column] = pd.to_numeric(frame[column], errors="coerce").astype(
-                np.float32, copy=False
-            )
-        except Exception:
-            frame[column] = frame[column]
-
-    frame = frame.dropna(how="all")
-    return frame
 
 
 def load_bp_file(
@@ -1271,8 +1573,7 @@ def load_bp_file(
     time_column: Optional[str] = None,
     pressure_column: Optional[str] = None,
     separator: Optional[str] = None,
-    import_settings: Optional[ImportDialogResult] = None,
-) -> Tuple[DataFrame, Dict[str, str]]:
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """Load the selected columns from a waveform export."""
 
     if preview is None:
@@ -1285,6 +1586,7 @@ def load_bp_file(
             preview,
             requested_time=time_column,
             requested_pressure=pressure_column,
+            allow_gui=False,
         )
 
     desired = [time_column, pressure_column]
@@ -1298,118 +1600,24 @@ def load_bp_file(
         header=None,
         names=preview.column_names,
         usecols=usecols,
-
         skiprows=preview.skiprows,
         na_values=["nan", "NaN", "NA"],
         dtype=dtype_map,
     )
 
     detected_separator = preview.detected_separator
-    resolved_separator = separator if separator is not None else detected_separator
-
-    frame: Optional[DataFrame] = None
-    fast_failure_reason: Optional[str] = None
-    fast_unavailable_reason: Optional[str] = None
-
-    fast_usecols: Optional[List[int]] = None
-    fast_debug_indices: Optional[List[int]] = None
-    if import_settings is None:
-        fast_unavailable_reason = (
-            "Fast parser requires the interactive import dialog to capture column indices "
-            f"(time column: '{time_column}', pressure column: '{pressure_column}')."
-        )
-    else:
-        index_lookup = {
-            import_settings.time_column: import_settings.time_column_index - 1,
-            import_settings.pressure_column: import_settings.pressure_column_index - 1,
-        }
-        fast_usecols = []
-        for column_name in usecols:
-            idx = index_lookup.get(column_name)
-            if idx is None:
-                fast_unavailable_reason = (
-                    f"Column '{column_name}' does not have a recorded index from the preview dialog, "
-                    "so the fast parser cannot be configured."
-                )
-                fast_usecols = None
-                break
-            fast_usecols.append(idx)
-
-        if fast_usecols is not None:
-            if resolved_separator is None:
-                fast_unavailable_reason = (
-                    "The fast parser requires a resolved delimiter to use the PyArrow reader."
-                )
-                fast_usecols = None
-            elif not resolved_separator or len(resolved_separator) != 1:
-                fast_unavailable_reason = (
-                    "The fast parser using the PyArrow reader supports only single-character delimiters, "
-                    f"but '{resolved_separator}' was selected."
-                )
-                fast_usecols = None
-
-    if fast_usecols:
-        fast_debug_indices = list(fast_usecols)
+    frame: pd.DataFrame
+    if detected_separator:
         try:
-            frame = _load_selected_columns_fast(
-                file_path,
-                column_indices=fast_usecols,
-                column_names=preview.column_names,
-                first_data_row=import_settings.first_data_row if import_settings else 1,
-                separator=resolved_separator,
-                skiprows=preview.skiprows,
-            )
-        except FastParserError as exc:
-            debug_lines = [exc.message]
-            debug_lines.append(
-                "Resolved separator: "
-                + (repr(resolved_separator) if resolved_separator is not None else "None")
-            )
-            debug_lines.append(f"Requested columns: {usecols}")
-            if fast_debug_indices is not None:
-                debug_lines.append(f"Column indices: {fast_debug_indices}")
-            fast_failure_reason = "\n".join(debug_lines)
-
-    if frame is not None:
-        return frame, preview.metadata
-
-    if fast_failure_reason:
-        if not _prompt_fast_parser_decision(
-            title="Fast parser failed",
-            summary="The fast parser was unable to load the selected columns.",
-            details=fast_failure_reason,
-        ):
-            raise RuntimeError(
-                "Import cancelled after fast parser failure."
-            )
-    elif fast_unavailable_reason:
-        debug_lines = [fast_unavailable_reason]
-        debug_lines.append(
-            "Resolved separator: "
-            + (repr(resolved_separator) if resolved_separator is not None else "None")
-        )
-        debug_lines.append(f"Requested columns: {usecols}")
-        fast_unavailable_reason = "\n".join(debug_lines)
-        if not _prompt_fast_parser_decision(
-            title="Fast parser unavailable",
-            summary="The fast parser could not be used for this file.",
-            details=fast_unavailable_reason,
-        ):
-            raise RuntimeError(
-                "Import cancelled because the fast parser could not be used."
-            )
-
-    if resolved_separator:
-        try:
-            if len(resolved_separator) == 1:
+            if len(detected_separator) == 1:
                 frame = pd.read_csv(
-                    sep=resolved_separator,
+                    sep=detected_separator,
                     engine="c",
                     **read_kwargs,
                 )
             else:
                 frame = pd.read_csv(
-                    sep=resolved_separator,
+                    sep=detected_separator,
                     engine="python",
                     **read_kwargs,
                 )
@@ -1429,7 +1637,7 @@ def load_bp_file(
     return frame, preview.metadata
 
 
-def parse_interval(metadata: Dict[str, str], frame: DataFrame) -> float:
+def parse_interval(metadata: Dict[str, str], frame: pd.DataFrame) -> float:
     """Extract the sampling interval from metadata or infer it from the data."""
 
     metadata_interval: Optional[float] = None
@@ -1562,6 +1770,7 @@ def detect_systolic_peaks(
     max_rr: float,
     prominence_floor: float,
     prominence_noise_factor: float,
+    use_rolling_statistics: bool,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Tuple[int, int]]]:
     """Detect systolic peaks using adaptive upstroke and prominence checks.
 
@@ -1573,6 +1782,8 @@ def detect_systolic_peaks(
     generated in a vectorised fashion (using :func:`scipy.signal.find_peaks`
     when available) to reduce Python-level looping while preserving the legacy
     gating heuristics.
+    When ``use_rolling_statistics`` is ``False`` the rolling median/MAD gating
+    is skipped and the detector relies solely on the SciPy peak finder.
     """
 
     if signal.size == 0:
@@ -1582,6 +1793,54 @@ def detect_systolic_peaks(
             np.array([], dtype=int),
             [],
         )
+
+    min_distance = max(1, int(round(min_rr * fs)))
+    max_distance = max(min_distance + 1, int(round(max_rr * fs)))
+    max_search_window = min(0.45, 0.6 * max(min_rr, 0.2))
+    search_horizon = max(min_distance, int(round(max_search_window * fs)))
+
+    amplitude_span = float(np.percentile(signal, 95) - np.percentile(signal, 5))
+    if signal.size > 1:
+        noise_proxy = float(np.median(np.abs(np.diff(signal))))
+    else:
+        noise_proxy = 0.0
+    adaptive_floor = max(amplitude_span * prominence_noise_factor, noise_proxy * 5.0)
+    min_prominence = max(prominence_floor, adaptive_floor)
+
+    if not use_rolling_statistics:
+        if sp_signal is not None:
+            peaks, properties = sp_signal.find_peaks(
+                signal,
+                distance=min_distance,
+                prominence=min_prominence,
+            )
+            peaks = np.asarray(peaks, dtype=int)
+            prominences = properties.get("prominences")
+            if prominences is None and peaks.size:
+                prominences = sp_signal.peak_prominences(signal, peaks)[0]
+            elif prominences is None:
+                prominences = np.array([], dtype=float)
+            else:
+                prominences = np.asarray(prominences, dtype=float)
+        else:
+            peaks, prominences = find_prominent_peaks(
+                signal,
+                fs=fs,
+                min_rr=min_rr,
+                max_rr=max_rr,
+                min_prominence=min_prominence,
+            )
+
+        if peaks.size == 0:
+            return (
+                np.array([], dtype=int),
+                np.array([], dtype=float),
+                np.array([], dtype=int),
+                [],
+            )
+
+        notches = np.full_like(peaks, -1, dtype=int)
+        return peaks.astype(int), prominences.astype(float), notches, []
 
     detrended = detrend_signal(signal, fs, window_seconds=0.6)
     velocity = np.gradient(detrended)
@@ -1608,89 +1867,47 @@ def detect_systolic_peaks(
     if global_threshold <= 0:
         global_threshold = baseline * 1.5 if baseline > 0 else 0.5
 
-    velocity_scale = float(np.nanmedian(np.abs(velocity))) if velocity.size else 0.0
-    plateau_eps = max(0.02, 0.3 * velocity_scale)
-    plateau_samples = max(1, int(round(0.5 * fs)))
-    calibration_segments: List[Tuple[int, int]] = []
-    if plateau_samples > 1:
-        mask = np.abs(velocity) <= plateau_eps
-        idx = 0
-        while idx < mask.size:
-            if mask[idx]:
-                start = idx
-                while idx < mask.size and mask[idx]:
-                    idx += 1
-                if idx - start >= plateau_samples:
-                    calibration_segments.append((start, idx))
-            else:
-                idx += 1
-
-    rolling_window_seconds = 0.2
-    default_window = max(3, int(round(rolling_window_seconds * fs)))
-    if default_window % 2 == 0:
-        default_window += 1
-
-    local_medians = np.full(signal.size, np.nan, dtype=float)
-    local_mads = np.full(signal.size, np.nan, dtype=float)
-
-    segment_boundaries: List[Tuple[int, int]] = []
-    cursor = 0
-    for start, end in calibration_segments:
-        if start > cursor:
-            segment_boundaries.append((cursor, start))
-        cursor = max(cursor, end)
-    if cursor < signal.size:
-        segment_boundaries.append((cursor, signal.size))
-
-    stride = max(1, int(round(fs / 125.0)))
-
-    for seg_start, seg_end in segment_boundaries:
-        seg_len = seg_end - seg_start
-        if seg_len < 3:
-            continue
-        window = min(default_window, seg_len if seg_len % 2 == 1 else seg_len - 1)
-        if window < 3:
-            continue
-        segment = positive_velocity[seg_start:seg_end]
-        if stride == 1:
-            seg_med, seg_mad = _rolling_median_and_mad(segment, window)
-        else:
-            reduced_series = segment[::stride]
-            if reduced_series.size < 3:
-                seg_med, seg_mad = _rolling_median_and_mad(segment, window)
-            else:
-                reduced_window = max(3, int(round(window / stride)))
-                if reduced_window % 2 == 0:
-                    reduced_window += 1
-                if reduced_window > reduced_series.size:
-                    reduced_window = reduced_series.size
-                    if reduced_window % 2 == 0:
-                        reduced_window -= 1
-                if reduced_window < 3:
-                    seg_med, seg_mad = _rolling_median_and_mad(segment, window)
-                else:
-                    reduced_med, reduced_mad = _rolling_median_and_mad(
-                        reduced_series, reduced_window
-                    )
-                    seg_med = np.repeat(reduced_med, stride)[:seg_len]
-                    seg_mad = np.repeat(reduced_mad, stride)[:seg_len]
-        local_medians[seg_start:seg_end] = seg_med
-        local_mads[seg_start:seg_end] = seg_mad
+    calibration_segments = _detect_calibration_segments(velocity, fs)
 
     thresholds = np.full(signal.size, global_threshold, dtype=float)
-    valid_local = np.isfinite(local_medians)
-    adjusted_mads = np.where(
-        valid_local & np.isfinite(local_mads) & (local_mads > 1e-6),
-        local_mads,
-        mad,
-    )
-    local_thresholds = local_medians + 2.5 * adjusted_mads
-    local_thresholds = np.where(
-        local_thresholds <= 0,
-        np.where(local_medians > 0, local_medians * 1.5, global_threshold),
-        local_thresholds,
-    )
-    np.copyto(thresholds, local_thresholds, where=valid_local)
+
+    if use_rolling_statistics:
+        rolling_window_seconds = 4.0
+        default_window = max(3, int(round(rolling_window_seconds * fs)))
+        if default_window % 2 == 0:
+            default_window += 1
+
+        local_medians = np.full(signal.size, np.nan, dtype=float)
+        local_mads = np.full(signal.size, np.nan, dtype=float)
+
+        segment_boundaries = _split_by_calibration(signal.size, calibration_segments)
+
+        for seg_start, seg_end in segment_boundaries:
+            seg_len = seg_end - seg_start
+            if seg_len < 3:
+                continue
+            window = min(default_window, seg_len if seg_len % 2 == 1 else seg_len - 1)
+            if window < 3:
+                continue
+            seg_med, seg_mad = _rolling_median_and_mad(
+                positive_velocity[seg_start:seg_end], window
+            )
+            local_medians[seg_start:seg_end] = seg_med
+            local_mads[seg_start:seg_end] = seg_mad
+
+        valid_local = np.isfinite(local_medians)
+        adjusted_mads = np.where(
+            valid_local & np.isfinite(local_mads) & (local_mads > 1e-6),
+            local_mads,
+            mad,
+        )
+        local_thresholds = local_medians + 2.5 * adjusted_mads
+        local_thresholds = np.where(
+            local_thresholds <= 0,
+            np.where(local_medians > 0, local_medians * 1.5, global_threshold),
+            local_thresholds,
+        )
+        np.copyto(thresholds, local_thresholds, where=valid_local)
 
     thresholds = np.clip(thresholds, 0.05, None)
 
@@ -1700,19 +1917,6 @@ def detect_systolic_peaks(
         candidate_onsets = crossings + 1
     else:
         candidate_onsets = np.arange(signal.size)
-
-    min_distance = max(1, int(round(min_rr * fs)))
-    max_distance = max(min_distance + 1, int(round(max_rr * fs)))
-    max_search_window = min(0.45, 0.6 * max(min_rr, 0.2))
-    search_horizon = max(min_distance, int(round(max_search_window * fs)))
-
-    amplitude_span = float(np.percentile(signal, 95) - np.percentile(signal, 5))
-    if signal.size > 1:
-        noise_proxy = float(np.median(np.abs(np.diff(signal))))
-    else:
-        noise_proxy = 0.0
-    adaptive_floor = max(amplitude_span * prominence_noise_factor, noise_proxy * 5.0)
-    min_prominence = max(prominence_floor, adaptive_floor)
 
     downstroke_grace = max(1, int(round(0.02 * fs)))
     sustained_negative = max(1, int(round(0.02 * fs)))
@@ -1773,45 +1977,6 @@ def detect_systolic_peaks(
     order = np.argsort(candidate_peaks, kind="mergesort")
     candidate_peaks = candidate_peaks[order]
 
-    precomputed_prominences: Optional[np.ndarray]
-    if candidate_peaks.size and sp_signal is not None:
-        try:
-            wlen = int(min(signal.size, 2 * max_distance))
-            wlen = max(wlen, 3)
-            if wlen % 2 == 0:
-                wlen = max(3, wlen - 1)
-            precomputed_prominences, _, _ = sp_signal.peak_prominences(
-                signal,
-                candidate_peaks,
-                wlen=wlen,
-            )
-        except Exception:
-            precomputed_prominences = None
-    else:
-        precomputed_prominences = None
-
-    negative_mask = np.isfinite(velocity) & (velocity <= 0)
-    if negative_mask.size >= sustained_negative:
-        downstroke_kernel = np.ones(sustained_negative, dtype=int)
-        downstroke_counts = np.convolve(
-            negative_mask.astype(int), downstroke_kernel, mode="valid"
-        )
-    else:
-        downstroke_counts = np.array([], dtype=int)
-
-    def _estimate_prominence(peak_idx: int) -> Optional[float]:
-        left = signal[max(0, peak_idx - max_distance) : peak_idx + 1]
-        right = signal[peak_idx : min(signal.size, peak_idx + max_distance)]
-
-        left = left[np.isfinite(left)]
-        right = right[np.isfinite(right)]
-        if left.size == 0 or right.size == 0:
-            return None
-
-        left_min = float(np.min(left))
-        right_min = float(np.min(right))
-        return float(signal[peak_idx] - max(left_min, right_min))
-
     def _estimate_notch(peak_idx: int) -> int:
         notch_idx = -1
         notch_start = peak_idx + 1
@@ -1833,7 +1998,7 @@ def detect_systolic_peaks(
                         notch_idx = local_start + notch_rel
         return notch_idx
 
-    def _legacy_has_sustained_downstroke(peak_idx: int) -> bool:
+    def _has_sustained_downstroke(peak_idx: int) -> bool:
         window_end = min(signal.size, peak_idx + sustained_negative + downstroke_grace + 1)
         if window_end <= peak_idx:
             return False
@@ -1848,40 +2013,22 @@ def detect_systolic_peaks(
         sustained = np.convolve(negative_mask.astype(int), kernel, mode="valid")
         return bool(np.any(sustained >= sustained_negative))
 
-    def _has_sustained_downstroke(peak_idx: int) -> bool:
-        if downstroke_counts.size:
-            window_end = min(
-                signal.size, peak_idx + sustained_negative + downstroke_grace + 1
-            )
-            if window_end - peak_idx < sustained_negative:
-                return False
-            max_start = downstroke_counts.size - 1
-            start = peak_idx
-            if start > max_start:
-                return False
-            stop = min(window_end - sustained_negative, max_start)
-            if stop < start:
-                return False
-            return bool(
-                np.any(downstroke_counts[start : stop + 1] >= sustained_negative)
-            )
-        return _legacy_has_sustained_downstroke(peak_idx)
-
     peaks: List[int] = []
     prominences: List[float] = []
     notches: List[int] = []
     suppress_until = -1
 
-    for idx, peak_idx in enumerate(candidate_peaks):
-        if precomputed_prominences is not None:
-            prominence = float(precomputed_prominences[idx])
-            if not np.isfinite(prominence):
-                continue
-        else:
-            prominence = _estimate_prominence(peak_idx)
-            if prominence is None:
-                continue
-        if prominence < min_prominence:
+    candidate_prominences = _compute_candidate_prominences(
+        signal, candidate_peaks, max_distance
+    )
+
+    for candidate_idx, peak_idx in enumerate(candidate_peaks):
+        prominence = (
+            float(candidate_prominences[candidate_idx])
+            if candidate_prominences.size > candidate_idx
+            else math.nan
+        )
+        if not math.isfinite(prominence) or prominence < min_prominence:
             continue
         if not _has_sustained_downstroke(peak_idx):
             continue
@@ -1913,32 +2060,18 @@ def detect_systolic_peaks(
         suppress_until = (notch_idx if notch_idx >= 0 else peak_idx) + notch_guard
 
     if peaks:
-        peak_diffs = np.diff(peaks) / fs if len(peaks) > 1 else np.array([], dtype=float)
-        global_interval = float(np.median(peak_diffs)) if peak_diffs.size else math.nan
-        cleaned_peaks: List[int] = [peaks[0]]
-        cleaned_prom: List[float] = [prominences[0]]
-        cleaned_notches: List[int] = [notches[0]]
-        interval_history: List[float] = []
-        for idx in range(1, len(peaks)):
-            interval = float((peaks[idx] - cleaned_peaks[-1]) / fs)
-            if interval_history:
-                local_median = float(np.median(interval_history[-3:]))
-            else:
-                local_median = global_interval if not math.isnan(global_interval) else interval
-            short_interval = local_median > 0 and interval < 0.4 * local_median
-            weak_prominence = prominences[idx] <= 0.6 * cleaned_prom[-1]
-            if short_interval or weak_prominence:
-                continue
-            cleaned_peaks.append(peaks[idx])
-            cleaned_prom.append(prominences[idx])
-            cleaned_notches.append(notches[idx])
-            interval_history.append(interval)
+        peaks_arr, prominences_arr, notches_arr = _dedupe_peaks_by_refractory(
+            peaks,
+            prominences,
+            notches,
+            fs=fs,
+        )
+    else:
+        peaks_arr = np.array([], dtype=int)
+        prominences_arr = np.array([], dtype=float)
+        notches_arr = np.array([], dtype=int)
 
-        peaks = cleaned_peaks
-        prominences = cleaned_prom
-        notches = cleaned_notches
-
-    if len(peaks) < 3:
+    if peaks_arr.size < 3:
         fallback_peaks, fallback_prom = find_prominent_peaks(
             signal,
             fs=fs,
@@ -1951,11 +2084,145 @@ def detect_systolic_peaks(
             return fallback_peaks, fallback_prom, fallback_notches, calibration_segments
 
     return (
-        np.asarray(peaks, dtype=int),
-        np.asarray(prominences, dtype=float),
-        np.asarray(notches, dtype=int),
+        peaks_arr,
+        prominences_arr,
+        notches_arr,
         calibration_segments,
     )
+
+
+def _detect_calibration_segments(
+    velocity: np.ndarray, fs: float
+) -> List[Tuple[int, int]]:
+    """Identify quasi-flat velocity spans that likely correspond to calibration."""
+
+    if velocity.size == 0:
+        return []
+
+    velocity_scale = float(np.nanmedian(np.abs(velocity))) if velocity.size else 0.0
+    plateau_eps = max(0.02, 0.3 * velocity_scale)
+    plateau_samples = max(1, int(round(0.5 * fs)))
+    if plateau_samples <= 1:
+        return []
+
+    mask = np.abs(velocity) <= plateau_eps
+    segments: List[Tuple[int, int]] = []
+    idx = 0
+    while idx < mask.size:
+        if mask[idx]:
+            start = idx
+            while idx < mask.size and mask[idx]:
+                idx += 1
+            if idx - start >= plateau_samples:
+                segments.append((start, idx))
+        else:
+            idx += 1
+    return segments
+
+
+def _split_by_calibration(
+    total_length: int, calibration_segments: Sequence[Tuple[int, int]]
+) -> List[Tuple[int, int]]:
+    """Return non-calibration slices given calibration spans."""
+
+    if total_length <= 0:
+        return []
+
+    if not calibration_segments:
+        return [(0, total_length)]
+
+    segment_boundaries: List[Tuple[int, int]] = []
+    cursor = 0
+    for start, end in sorted(calibration_segments):
+        if start > cursor:
+            segment_boundaries.append((cursor, min(start, total_length)))
+        cursor = max(cursor, min(end, total_length))
+        if cursor >= total_length:
+            break
+    if cursor < total_length:
+        segment_boundaries.append((cursor, total_length))
+    return [seg for seg in segment_boundaries if seg[1] - seg[0] > 0]
+
+
+def _compute_candidate_prominences(
+    signal: np.ndarray, candidate_peaks: np.ndarray, max_distance: int
+) -> np.ndarray:
+    """Compute prominence estimates for peaks, using Numba when available."""
+
+    peaks = np.asarray(candidate_peaks, dtype=np.int64)
+    if peaks.size == 0:
+        return np.array([], dtype=float)
+
+    signal = np.asarray(signal, dtype=float)
+
+    if USE_NUMBA and _prominence_numba_core is not None:
+        return _prominence_numba_core(signal, peaks, int(max_distance))
+
+    prominences = np.full(peaks.shape, np.nan, dtype=float)
+    n = signal.size
+    for idx, peak_idx in enumerate(peaks):
+        if peak_idx < 0 or peak_idx >= n:
+            continue
+        peak_val = signal[peak_idx]
+        if not math.isfinite(peak_val):
+            continue
+
+        left = signal[max(0, peak_idx - max_distance) : peak_idx + 1]
+        right = signal[peak_idx : min(n, peak_idx + max_distance)]
+
+        left = left[np.isfinite(left)]
+        right = right[np.isfinite(right)]
+        if left.size == 0 or right.size == 0:
+            continue
+
+        left_min = float(np.min(left))
+        right_min = float(np.min(right))
+        prominences[idx] = float(peak_val - max(left_min, right_min))
+
+    return prominences
+
+
+def _dedupe_peaks_by_refractory(
+    peaks: Sequence[int],
+    prominences: Sequence[float],
+    notches: Sequence[int],
+    *,
+    fs: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Remove peaks that violate refractory spacing or are weak duplicates."""
+
+    if not peaks:
+        empty_int = np.array([], dtype=int)
+        empty_float = np.array([], dtype=float)
+        return empty_int, empty_float, empty_int.copy()
+
+    peaks_arr = np.asarray(peaks, dtype=int)
+    prom_arr = np.asarray(prominences, dtype=float)
+    notch_arr = np.asarray(notches, dtype=int)
+
+    if peaks_arr.size <= 1:
+        return peaks_arr, prom_arr, notch_arr
+
+    intervals = np.diff(peaks_arr) / fs
+    global_interval = float(np.median(intervals)) if intervals.size else math.nan
+
+    kept_indices: List[int] = [0]
+    interval_history: List[float] = []
+    for idx in range(1, peaks_arr.size):
+        last_idx = kept_indices[-1]
+        interval = float((peaks_arr[idx] - peaks_arr[last_idx]) / fs)
+        if interval_history:
+            local_median = float(np.median(interval_history[-3:]))
+        else:
+            local_median = global_interval if not math.isnan(global_interval) else interval
+        short_interval = local_median > 0 and interval < 0.4 * local_median
+        weak_prominence = prom_arr[idx] <= 0.6 * prom_arr[last_idx]
+        if short_interval or weak_prominence:
+            continue
+        kept_indices.append(idx)
+        interval_history.append(interval)
+
+    return peaks_arr[kept_indices], prom_arr[kept_indices], notch_arr[kept_indices]
 
 
 def find_prominent_peaks(
@@ -2028,8 +2295,15 @@ def derive_beats(
     fs: float,
     *,
     config: ArtifactConfig,
+    use_rolling_statistics: bool = True,
+    apply_scipy_artifact_logic: bool = False,
 ) -> List[Beat]:
-    """Derive systolic/diastolic/MAP landmarks from a continuous waveform."""
+    """Derive systolic/diastolic/MAP landmarks from a continuous waveform.
+
+    When ``apply_scipy_artifact_logic`` is ``True`` the SciPy-specific
+    artefact heuristics are executed after the legacy checks regardless of the
+    legacy toggle configuration.
+    """
 
     if len(time) != len(pressure):
         raise ValueError("Time and pressure arrays must have the same length.")
@@ -2040,7 +2314,10 @@ def derive_beats(
 
     pressure_filled = pressure.copy()
     missing_mask = ~finite_mask
-    invalid_spans = _find_long_gaps(time, missing_mask, config.max_missing_gap)
+    if config.enable_gap_checks:
+        invalid_spans = _find_long_gaps(time, missing_mask, config.max_missing_gap)
+    else:
+        invalid_spans = []
     if not np.all(finite_mask):
         pressure_filled[~finite_mask] = np.interp(
             np.flatnonzero(~finite_mask),
@@ -2052,6 +2329,17 @@ def derive_beats(
 
     filtered = zero_phase_filter(pressure_filled, fs=fs)
     smoothed = smooth_signal(filtered, window_seconds=0.03, fs=fs)
+
+    rolling_required = use_rolling_statistics and (
+        config.enable_prominence_check
+        or config.enable_pressure_deviation_check
+        or config.enable_rr_deviation_check
+    )
+    prominence_floor = (
+        config.min_prominence
+        if config.enable_prominence_check
+        else max(0.5, config.min_prominence * 0.1)
+    )
     (
         systolic_indices,
         prominences,
@@ -2062,45 +2350,53 @@ def derive_beats(
         fs=fs,
         min_rr=min_rr,
         max_rr=max_rr,
-        prominence_floor=config.min_prominence,
+        prominence_floor=prominence_floor,
         prominence_noise_factor=config.prominence_noise_factor,
+        use_rolling_statistics=rolling_required,
     )
 
     beats: List[Beat] = []
     prev_dia_sample: Optional[int] = None
 
-    reset_boundaries = [end for _, end in calibration_segments]
-    post_calibration_targets: set[int] = set()
-    for _, end in calibration_segments:
-        for candidate in systolic_indices:
-            if candidate >= end:
-                post_calibration_targets.add(candidate)
-                break
+    post_gap_targets: set[int] = set()
+    if config.enable_post_calibration_check:
+        for _, end in calibration_segments:
+            for candidate in systolic_indices:
+                if candidate >= end:
+                    post_gap_targets.add(candidate)
+                    break
 
     for idx, sys_idx in enumerate(systolic_indices):
-        prev_sys = systolic_indices[idx - 1] if idx > 0 else None
         next_sys = systolic_indices[idx + 1] if idx + 1 < len(systolic_indices) else None
 
         notch_idx = notch_indices[idx] if idx < len(notch_indices) else -1
 
-        if prev_sys is not None:
-            search_start = prev_sys + max(1, int(round(0.05 * fs)))
-        else:
-            search_start = max(0, sys_idx - int(round(max_rr * fs)))
+        forward_offset = max(1, int(round(0.02 * fs)))
+        search_start = sys_idx + forward_offset
+        if search_start <= sys_idx:
+            search_start = sys_idx + 1
+        if search_start >= smoothed.size:
+            continue
 
-        last_reset = max(
-            (boundary for boundary in reset_boundaries if boundary <= sys_idx),
-            default=-1,
-        )
-        if last_reset >= 0:
-            search_start = max(search_start, int(last_reset))
-
-        search_end = sys_idx
         if next_sys is not None:
-            search_end = min(search_end, next_sys - max(1, int(round(0.15 * fs))))
+            search_end = next_sys
+        else:
+            search_end = smoothed.size
 
-        search_start = max(0, min(search_start, sys_idx))
-        search_end = max(search_start + 1, min(sys_idx + 1, search_end + 1))
+        next_calibration_start = min(
+            (start for start, _ in calibration_segments if start > sys_idx),
+            default=None,
+        )
+        if next_calibration_start is not None:
+            search_end = min(search_end, int(next_calibration_start))
+
+        search_end = min(search_end, smoothed.size)
+        if search_end <= search_start:
+            fallback_end = sys_idx + max(2, int(round(max_rr * fs)))
+            search_end = max(search_start + 1, min(fallback_end, smoothed.size))
+
+        if search_end <= search_start:
+            continue
 
         segment = smoothed[search_start:search_end]
         if segment.size == 0:
@@ -2117,12 +2413,9 @@ def derive_beats(
         notch_time = float(time[notch_idx]) if 0 <= notch_idx < len(time) else math.nan
         map_time = float((systolic_time + diastolic_time) / 2.0)
         area_map = math.nan
-        integration_end = dia_idx
-        if 0 <= notch_idx <= dia_idx:
-            integration_end = notch_idx
-        if prev_dia_sample is not None and prev_dia_sample < integration_end:
+        if prev_dia_sample is not None and prev_dia_sample < dia_idx:
             start_idx = prev_dia_sample
-            end_idx = integration_end + 1
+            end_idx = dia_idx + 1
             if end_idx - start_idx > 2:
                 segment_time = time[start_idx:end_idx]
                 segment_pressure = pressure_filled[start_idx:end_idx]
@@ -2145,8 +2438,7 @@ def derive_beats(
             if start_time <= systolic_time <= end_time:
                 reasons.append("long gap interpolation")
                 break
-        is_post_calibration = sys_idx in post_calibration_targets
-        if is_post_calibration:
+        if config.enable_post_calibration_check and sys_idx in post_gap_targets:
             reasons.append("post calibration gap")
 
         beats.append(
@@ -2162,13 +2454,14 @@ def derive_beats(
                 systolic_prominence=float(prominences[idx]),
                 is_artifact=False,
                 artifact_reasons=reasons,
-                is_post_calibration_recovery=is_post_calibration,
             )
         )
 
         prev_dia_sample = dia_idx
 
     apply_artifact_rules(beats, config=config)
+    if apply_scipy_artifact_logic:
+        _apply_scipy_artifact_fallback(beats, config=config)
     return beats
 
 
@@ -2185,23 +2478,8 @@ def _rolling_median_and_mad(values: np.ndarray, window: int) -> Tuple[np.ndarray
     if values.size == 0:
         return medians, mads
 
-    if bn is not None:
-        medians_bn = bn.move_median(values, window=window, center=True, min_count=3)
-        medians[:] = medians_bn
-
-        deviations = np.abs(values - medians_bn)
-        mad_bn = bn.move_median(deviations, window=window, center=True, min_count=3)
-        mad_bn = np.asarray(mad_bn, dtype=float) * 1.4826
-        fallback_mask = (mad_bn < 1e-3) | ~np.isfinite(mad_bn)
-        if np.any(fallback_mask):
-            std_bn = bn.move_std(
-                values, window=window, center=True, ddof=0, min_count=3
-            )
-            std_bn = np.asarray(std_bn, dtype=float)
-            mad_bn = mad_bn.copy()
-            mad_bn[fallback_mask] = std_bn[fallback_mask]
-
-        mads[:] = mad_bn
+    if USE_NUMBA and _rolling_median_and_mad_numba_core is not None:
+        medians, mads = _rolling_median_and_mad_numba_core(values, window, 3)
         return medians, mads
 
     if sliding_window_view is not None:
@@ -2260,25 +2538,63 @@ def _robust_central_tendency(values: np.ndarray) -> Tuple[float, float]:
     return median, mad
 
 
+def _artifact_checks_enabled(config: ArtifactConfig) -> bool:
+    """Return ``True`` when any legacy artifact toggles are enabled."""
+
+    return (
+        config.enable_range_checks
+        or config.enable_pulse_pressure_check
+        or config.enable_pressure_deviation_check
+        or config.enable_rr_bounds_check
+        or config.enable_rr_deviation_check
+        or config.enable_prominence_check
+        or config.enable_gap_checks
+        or config.enable_post_calibration_check
+    )
+
+
 def apply_artifact_rules(beats: List[Beat], *, config: ArtifactConfig) -> None:
     """Flag beats that violate simple physiological heuristics."""
 
     if not beats:
         return
 
+    if not _artifact_checks_enabled(config):
+        for beat in beats:
+            beat.is_artifact = False
+            beat.artifact_reasons = []
+        return
+
     systolic_values = np.array([b.systolic_pressure for b in beats], dtype=float)
     diastolic_values = np.array([b.diastolic_pressure for b in beats], dtype=float)
-    rr_values = np.array([
-        b.rr_interval if b.rr_interval is not None else math.nan for b in beats
-    ])
 
-    sys_med, sys_mad = _robust_central_tendency(systolic_values)
-    dia_med, dia_mad = _robust_central_tendency(diastolic_values)
-    rr_med, rr_mad = _robust_central_tendency(rr_values)
+    if config.enable_pressure_deviation_check:
+        sys_med, sys_mad = _robust_central_tendency(systolic_values)
+        dia_med, dia_mad = _robust_central_tendency(diastolic_values)
+        sys_roll_med, sys_roll_mad = _rolling_median_and_mad(systolic_values, window=9)
+        dia_roll_med, dia_roll_mad = _rolling_median_and_mad(diastolic_values, window=9)
+    else:
+        sys_med = dia_med = math.nan
+        sys_mad = dia_mad = math.nan
+        sys_roll_med = np.full(len(beats), math.nan, dtype=float)
+        sys_roll_mad = np.full(len(beats), math.nan, dtype=float)
+        dia_roll_med = np.full(len(beats), math.nan, dtype=float)
+        dia_roll_mad = np.full(len(beats), math.nan, dtype=float)
 
-    sys_roll_med, sys_roll_mad = _rolling_median_and_mad(systolic_values, window=9)
-    dia_roll_med, dia_roll_mad = _rolling_median_and_mad(diastolic_values, window=9)
-    rr_roll_med, rr_roll_mad = _rolling_median_and_mad(rr_values, window=9)
+    if config.enable_rr_bounds_check or config.enable_rr_deviation_check:
+        rr_values = np.array([
+            b.rr_interval if b.rr_interval is not None else math.nan for b in beats
+        ])
+    else:
+        rr_values = np.array([], dtype=float)
+
+    if config.enable_rr_deviation_check:
+        rr_med, rr_mad = _robust_central_tendency(rr_values)
+        rr_roll_med, rr_roll_mad = _rolling_median_and_mad(rr_values, window=9)
+    else:
+        rr_med = rr_mad = math.nan
+        rr_roll_med = np.full(len(beats), math.nan, dtype=float)
+        rr_roll_mad = np.full(len(beats), math.nan, dtype=float)
 
     min_rr, max_rr = config.rr_bounds
 
@@ -2286,60 +2602,192 @@ def apply_artifact_rules(beats: List[Beat], *, config: ArtifactConfig) -> None:
         severe_reasons: List[str] = []
         soft_reasons: List[str] = []
 
-        if not math.isfinite(beat.systolic_pressure) or not math.isfinite(beat.diastolic_pressure):
-            severe_reasons.append("non-finite pressure")
-        if beat.systolic_pressure < 40 or beat.systolic_pressure > 260:
-            severe_reasons.append("implausible systolic")
-        if beat.diastolic_pressure < 20 or beat.diastolic_pressure > 160:
-            severe_reasons.append("implausible diastolic")
-        if beat.systolic_pressure - beat.diastolic_pressure < config.pulse_pressure_min:
+        if config.enable_range_checks:
+            if not math.isfinite(beat.systolic_pressure) or not math.isfinite(beat.diastolic_pressure):
+                severe_reasons.append("non-finite pressure")
+            if beat.systolic_pressure < 40 or beat.systolic_pressure > 260:
+                severe_reasons.append("implausible systolic")
+            if beat.diastolic_pressure < 20 or beat.diastolic_pressure > 160:
+                severe_reasons.append("implausible diastolic")
+        if config.enable_pulse_pressure_check and (
+            beat.systolic_pressure - beat.diastolic_pressure < config.pulse_pressure_min
+        ):
             severe_reasons.append("low pulse pressure")
 
-        sys_ref = sys_roll_med[idx] if math.isfinite(sys_roll_med[idx]) else sys_med
-        sys_scale = sys_roll_mad[idx] if math.isfinite(sys_roll_mad[idx]) else sys_mad
-        if math.isfinite(sys_ref) and math.isfinite(beat.systolic_pressure) and math.isfinite(sys_scale):
-            limit = max(config.systolic_abs_floor, config.systolic_mad_multiplier * max(sys_scale, 1.0))
-            if abs(beat.systolic_pressure - sys_ref) > limit:
-                soft_reasons.append("systolic deviation")
+        if config.enable_pressure_deviation_check:
+            sys_ref = sys_roll_med[idx] if math.isfinite(sys_roll_med[idx]) else sys_med
+            sys_scale = sys_roll_mad[idx] if math.isfinite(sys_roll_mad[idx]) else sys_mad
+            if (
+                math.isfinite(sys_ref)
+                and math.isfinite(beat.systolic_pressure)
+                and math.isfinite(sys_scale)
+            ):
+                limit = max(
+                    config.systolic_abs_floor,
+                    config.systolic_mad_multiplier * max(sys_scale, 1.0),
+                )
+                if abs(beat.systolic_pressure - sys_ref) > limit:
+                    soft_reasons.append("systolic deviation")
 
-        dia_ref = dia_roll_med[idx] if math.isfinite(dia_roll_med[idx]) else dia_med
-        dia_scale = dia_roll_mad[idx] if math.isfinite(dia_roll_mad[idx]) else dia_mad
-        if math.isfinite(dia_ref) and math.isfinite(beat.diastolic_pressure) and math.isfinite(dia_scale):
-            limit = max(config.diastolic_abs_floor, config.diastolic_mad_multiplier * max(dia_scale, 1.0))
-            if abs(beat.diastolic_pressure - dia_ref) > limit:
-                soft_reasons.append("diastolic deviation")
+            dia_ref = dia_roll_med[idx] if math.isfinite(dia_roll_med[idx]) else dia_med
+            dia_scale = dia_roll_mad[idx] if math.isfinite(dia_roll_mad[idx]) else dia_mad
+            if (
+                math.isfinite(dia_ref)
+                and math.isfinite(beat.diastolic_pressure)
+                and math.isfinite(dia_scale)
+            ):
+                limit = max(
+                    config.diastolic_abs_floor,
+                    config.diastolic_mad_multiplier * max(dia_scale, 1.0),
+                )
+                if abs(beat.diastolic_pressure - dia_ref) > limit:
+                    soft_reasons.append("diastolic deviation")
 
         if beat.rr_interval is not None and math.isfinite(beat.rr_interval):
-            if beat.rr_interval < min_rr * 0.7 or beat.rr_interval > max_rr * 1.3:
+            if config.enable_rr_bounds_check and (
+                beat.rr_interval < min_rr * 0.7 or beat.rr_interval > max_rr * 1.3
+            ):
                 severe_reasons.append("rr outside bounds")
-            rr_ref = rr_roll_med[idx] if math.isfinite(rr_roll_med[idx]) else rr_med
-            rr_scale = rr_roll_mad[idx] if math.isfinite(rr_roll_mad[idx]) else rr_mad
-            if math.isfinite(rr_ref) and math.isfinite(rr_scale):
-                limit = max(0.1, config.rr_mad_multiplier * max(rr_scale, 0.05))
-                if abs(beat.rr_interval - rr_ref) > limit:
-                    soft_reasons.append("rr deviation")
+            if config.enable_rr_deviation_check:
+                rr_ref = rr_roll_med[idx] if math.isfinite(rr_roll_med[idx]) else rr_med
+                rr_scale = rr_roll_mad[idx] if math.isfinite(rr_roll_mad[idx]) else rr_mad
+                if math.isfinite(rr_ref) and math.isfinite(rr_scale):
+                    limit = max(0.1, config.rr_mad_multiplier * max(rr_scale, 0.05))
+                    if abs(beat.rr_interval - rr_ref) > limit:
+                        soft_reasons.append("rr deviation")
 
-        if beat.systolic_prominence < config.min_prominence:
+        if config.enable_prominence_check and beat.systolic_prominence < config.min_prominence:
             soft_reasons.append("low prominence")
 
-        combined_reasons = list(beat.artifact_reasons)
-        if any(reason == "long gap interpolation" for reason in beat.artifact_reasons):
+        combined_reasons = [
+            reason
+            for reason in beat.artifact_reasons
+            if (
+                (reason != "long gap interpolation" or config.enable_gap_checks)
+                and (reason != "post calibration gap" or config.enable_post_calibration_check)
+            )
+        ]
+        if config.enable_gap_checks and any(
+            reason == "long gap interpolation" for reason in combined_reasons
+        ):
             severe_reasons.append("long gap interpolation")
         combined_reasons.extend(severe_reasons)
         combined_reasons.extend(soft_reasons)
         beat.is_artifact = bool(severe_reasons or len(soft_reasons) >= 2)
-        if (
-            beat.is_post_calibration_recovery
-            and beat.is_artifact
-            and not severe_reasons
-        ):
-            beat.is_artifact = False
-            combined_reasons = [
-                reason
-                for reason in combined_reasons
-                if reason not in soft_reasons
-            ]
         beat.artifact_reasons = combined_reasons if beat.is_artifact else []
+
+
+def _apply_scipy_artifact_fallback(beats: List[Beat], *, config: ArtifactConfig) -> None:
+    """Apply SciPy-only artifact logic for beats detected via the SciPy backend."""
+
+    if not beats:
+        return
+
+    systolic = np.asarray([beat.systolic_pressure for beat in beats], dtype=float)
+    diastolic = np.asarray([beat.diastolic_pressure for beat in beats], dtype=float)
+    mean_arterial = np.asarray([beat.map_pressure for beat in beats], dtype=float)
+    rr_intervals = np.asarray(
+        [beat.rr_interval if beat.rr_interval is not None else math.nan for beat in beats],
+        dtype=float,
+    )
+
+    sys_median, sys_mad = _robust_central_tendency(systolic)
+    dia_median, dia_mad = _robust_central_tendency(diastolic)
+    rr_median, rr_mad = _robust_central_tendency(rr_intervals)
+    map_median, map_mad = _robust_central_tendency(mean_arterial)
+
+    mad_multiplier = max(config.scipy_mad_multiplier, 0.0)
+
+    for idx, beat in enumerate(beats):
+        triggered: List[str] = []
+
+        if (
+            idx > 0
+            and math.isfinite(sys_median)
+            and math.isfinite(sys_mad)
+            and math.isfinite(systolic[idx])
+            and math.isfinite(systolic[idx - 1])
+        ):
+            deviation = abs(systolic[idx] - sys_median)
+            diff_prev = abs(systolic[idx] - systolic[idx - 1])
+            if (
+                deviation > mad_multiplier * sys_mad
+                and diff_prev > config.abs_sys_difference_artifact
+            ):
+                triggered.append("systolic deviation")
+
+        if (
+            idx >= 2
+            and math.isfinite(dia_median)
+            and math.isfinite(dia_mad)
+            and math.isfinite(diastolic[idx - 1])
+            and math.isfinite(diastolic[idx - 2])
+        ):
+            prev_dev = abs(diastolic[idx - 1] - dia_median)
+            prev_diff = abs(diastolic[idx - 1] - diastolic[idx - 2])
+            if (
+                prev_dev > mad_multiplier * dia_mad
+                and prev_diff > config.abs_dia_difference_artifact
+            ):
+                triggered.append("preceding diastolic deviation")
+
+        if (
+            idx > 0
+            and math.isfinite(rr_median)
+            and math.isfinite(rr_mad)
+            and math.isfinite(rr_intervals[idx])
+        ):
+            rr_dev = abs(rr_intervals[idx] - rr_median)
+            if (
+                rr_dev > mad_multiplier * rr_mad
+                and rr_intervals[idx] < config.max_rr_artifact
+            ):
+                triggered.append("short RR interval")
+
+        criteria_count = len(triggered)
+        if criteria_count >= 2:
+            beat.is_artifact = True
+            action = "exclusion" if criteria_count == 3 else "flag"
+            beat.artifact_reasons.append(
+                "SciPy artifact {} ({} criteria: {})".format(
+                    action,
+                    f"{criteria_count}/3",
+                    ", ".join(triggered),
+                )
+            )
+
+        point_flags: List[str] = []
+        if (
+            math.isfinite(sys_median)
+            and math.isfinite(sys_mad)
+            and math.isfinite(systolic[idx])
+            and abs(systolic[idx] - sys_median) > mad_multiplier * sys_mad
+        ):
+            point_flags.append("systolic")
+        if (
+            math.isfinite(dia_median)
+            and math.isfinite(dia_mad)
+            and math.isfinite(diastolic[idx])
+            and abs(diastolic[idx] - dia_median) > mad_multiplier * dia_mad
+        ):
+            point_flags.append("diastolic")
+        if (
+            math.isfinite(map_median)
+            and math.isfinite(map_mad)
+            and math.isfinite(mean_arterial[idx])
+            and abs(mean_arterial[idx] - map_median) > mad_multiplier * map_mad
+        ):
+            point_flags.append("MAP")
+
+        if point_flags:
+            beat.is_artifact = True
+            beat.artifact_reasons.append(
+                "SciPy MAD flag for {}".format(", ".join(point_flags))
+            )
+
+    for beat in beats:
+        if beat.artifact_reasons:
+            beat.artifact_reasons = sorted(set(beat.artifact_reasons))
 
 
 def plot_waveform(
@@ -2349,7 +2797,7 @@ def plot_waveform(
     *,
     show: bool = True,
     save_path: Optional[Path] = None,
-    max_points: Optional[int] = 50000,
+    downsample_stride: int = 1,
 ) -> None:
     """Plot the waveform with annotated beat landmarks."""
 
@@ -2360,16 +2808,15 @@ def plot_waveform(
     time_values = np.asarray(time, dtype=float)
     pressure_values = np.asarray(pressure, dtype=float)
 
-    if max_points is not None and max_points > 0 and time_values.size > max_points:
-        stride = int(math.ceil(time_values.size / float(max_points)))
-        stride = max(1, stride)
-        downsampled_time = time_values[::stride]
-        downsampled_pressure = pressure_values[::stride]
-        if downsampled_time.size == 0 or downsampled_time[-1] != time_values[-1]:
-            downsampled_time = np.append(downsampled_time, time_values[-1])
-            downsampled_pressure = np.append(downsampled_pressure, pressure_values[-1])
-        plot_time = downsampled_time
-        plot_pressure = downsampled_pressure
+    if downsample_stride is None or downsample_stride <= 0:
+        downsample_stride = 1
+
+    if downsample_stride > 1:
+        plot_time = time_values[::downsample_stride]
+        plot_pressure = pressure_values[::downsample_stride]
+        if plot_time.size == 0 or plot_time[-1] != time_values[-1]:
+            plot_time = np.append(plot_time, time_values[-1])
+            plot_pressure = np.append(plot_pressure, pressure_values[-1])
     else:
         plot_time = time_values
         plot_pressure = pressure_values
@@ -2430,7 +2877,7 @@ def plot_waveform(
         plt.close()
 
 
-def summarise_beats(beats: Sequence[Beat]) -> DataFrame:
+def summarise_beats(beats: Sequence[Beat]) -> pd.DataFrame:
     """Build a DataFrame summarising the detected beats."""
 
     base_columns = {
@@ -2559,8 +3006,12 @@ def compute_rr_metrics(rr_intervals: np.ndarray, *, pnn_threshold: float) -> Dic
     }
 
 
-def print_column_overview(frame: DataFrame) -> None:
+def print_column_overview(frame: Optional[pd.DataFrame]) -> None:
     """Display column names, dtypes, and first numeric samples to aid selection."""
+
+    if frame is None:
+        print("  Preview unavailable; data will be loaded during import.")
+        return
 
     print("\nAvailable columns:")
     for name in frame.columns:
@@ -2610,6 +3061,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Multiplier for adaptive prominence threshold based on noise.",
     )
     parser.add_argument(
+        "--beat-detector",
+        choices=("scipy", "hybrid"),
+        default="hybrid",
+        help="Select 'scipy' for plain SciPy peak detection or 'hybrid' to include rolling median/MAD heuristics.",
+    )
+    parser.add_argument(
         "--systolic-mad-multiplier",
         type=float,
         default=4.5,
@@ -2647,6 +3104,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Maximum tolerated gap (s) before interpolated beats are flagged.",
     )
     parser.add_argument(
+        "--scipy-mad-multiplier",
+        type=float,
+        default=3.0,
+        help="MAD multiplier used by the SciPy fallback artifact logic.",
+    )
+    parser.add_argument(
+        "--scipy-abs-sys-diff",
+        type=float,
+        default=10.0,
+        help="Absolute systolic difference (mmHg) threshold for SciPy artifact exclusion.",
+    )
+    parser.add_argument(
+        "--scipy-abs-dia-diff",
+        type=float,
+        default=10.0,
+        help="Absolute diastolic difference (mmHg) threshold for SciPy artifact exclusion.",
+    )
+    parser.add_argument(
+        "--scipy-max-rr",
+        type=float,
+        default=0.5,
+        help="Maximum RR interval (s) considered in SciPy artifact exclusion.",
+    )
+    parser.add_argument(
         "--pnn-threshold",
         type=float,
         default=50.0,
@@ -2659,15 +3140,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--separator",
         help="Override the column separator if auto-detection fails (e.g., ',' or \\t).",
     )
-    parser.add_argument(
-        "--plot-max-points",
-        type=int,
-        default=50000,
-        help="Maximum waveform samples to render (set to 0 to disable downsampling).",
-    )
     parser.add_argument("--out", type=Path, help="Optional path to export the beat summary CSV.")
     parser.add_argument("--savefig", type=Path, help="Save the plot to this path instead of/as well as showing it.")
     parser.add_argument("--no-plot", action="store_true", help="Skip interactive plot display.")
+    parser.add_argument(
+        "--disable-numba",
+        action="store_true",
+        help="Disable Numba JIT acceleration even if it is installed.",
+    )
     return parser
 
 
@@ -2675,11 +3155,10 @@ def main(argv: Sequence[str]) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv[1:])
 
+    configure_numba(not getattr(args, "disable_numba", False))
+
     if args.min_rr >= args.max_rr:
         parser.error("--min-rr must be less than --max-rr")
-
-    if args.plot_max_points is not None and args.plot_max_points < 0:
-        parser.error("--plot-max-points must be zero or a positive integer")
 
     separator_override: Optional[str] = None
     if args.separator:
@@ -2710,13 +3189,17 @@ def main(argv: Sequence[str]) -> int:
     try:
         preview = _scan_bp_file(file_path, separator_override=separator_override)
     except Exception as exc:  # pragma: no cover - interactive feedback
-        print(f"Failed to load file preview: {exc}")
+        print(f"Failed to parse file header: {exc}")
         return 1
 
-    time_default = _default_column_selection(preview.column_names, args.time_column, fallback="Time")
-    remaining_columns = [name for name in preview.column_names if name != time_default]
+    time_default = _default_column_selection(
+        preview.column_names,
+        args.time_column,
+        fallback="Time",
+    )
+    remaining = [name for name in preview.column_names if name != time_default]
     pressure_default = _default_column_selection(
-        remaining_columns if remaining_columns else preview.column_names,
+        remaining if remaining else preview.column_names,
         args.column if args.column != time_default else None,
         fallback="reBAP",
     )
@@ -2725,6 +3208,18 @@ def main(argv: Sequence[str]) -> int:
     selected_pressure_column: Optional[str] = None
     dialog_shown = False
     dialog_result: Optional[ImportDialogResult] = None
+    analysis_downsample = 1
+    plot_downsample = 10
+    artifact_options = {
+        "enable_range_checks": True,
+        "enable_pulse_pressure_check": True,
+        "enable_pressure_deviation_check": True,
+        "enable_rr_bounds_check": True,
+        "enable_rr_deviation_check": True,
+        "enable_prominence_check": True,
+        "enable_gap_checks": True,
+        "enable_post_calibration_check": True,
+    }
 
     if tk is not None:
         try:
@@ -2744,9 +3239,23 @@ def main(argv: Sequence[str]) -> int:
             separator_override = dialog_result.separator
             selected_time_column = dialog_result.time_column
             selected_pressure_column = dialog_result.pressure_column
+            analysis_downsample = max(1, int(dialog_result.analysis_downsample))
+            plot_downsample = max(1, int(dialog_result.plot_downsample))
+            artifact_options.update(
+                {
+                    "enable_range_checks": dialog_result.enable_range_checks,
+                    "enable_pulse_pressure_check": dialog_result.enable_pulse_pressure_check,
+                    "enable_pressure_deviation_check": dialog_result.enable_pressure_deviation_check,
+                    "enable_rr_bounds_check": dialog_result.enable_rr_bounds_check,
+                    "enable_rr_deviation_check": dialog_result.enable_rr_deviation_check,
+                    "enable_prominence_check": dialog_result.enable_prominence_check,
+                    "enable_gap_checks": dialog_result.enable_gap_checks,
+                    "enable_post_calibration_check": dialog_result.enable_post_calibration_check,
+                }
+            )
 
     print(f"Loaded file preview: {file_path}")
-    print("\nColumn preview (first 200 rows loaded for preview):")
+    print(f"\nColumn preview (first {preview.preview_rows} rows loaded for preview):")
     preview_frame = preview.preview
     if preview_frame is None:
         try:
@@ -2761,10 +3270,7 @@ def main(argv: Sequence[str]) -> int:
         except Exception as exc:  # pragma: no cover - interactive feedback
             print(f"  Unable to build preview table: {exc}")
             preview_frame = None
-    if preview_frame is not None:
-        print_column_overview(preview_frame)
-    else:
-        print("  Preview will be available after import.")
+    print_column_overview(preview_frame)
 
     if selected_time_column is None or selected_pressure_column is None:
         selected_time_column, selected_pressure_column = select_time_pressure_columns(
@@ -2781,7 +3287,6 @@ def main(argv: Sequence[str]) -> int:
             time_column=selected_time_column,
             pressure_column=selected_pressure_column,
             separator=separator_override,
-            import_settings=dialog_result,
         )
     except Exception as exc:  # pragma: no cover - interactive feedback
         print(f"Failed to load file: {exc}")
@@ -2808,6 +3313,24 @@ def main(argv: Sequence[str]) -> int:
     if time is None or not np.any(np.isfinite(time)):
         time = np.arange(len(frame), dtype=np.float32) * np.float32(interval)
 
+    if analysis_downsample > 1:
+        downsampled_time = time[::analysis_downsample]
+        downsampled_pressure = pressure[::analysis_downsample]
+        if downsampled_time.size == 0 or downsampled_pressure.size == 0:
+            print(
+                "Warning: analysis downsampling factor removed all samples; using full resolution."
+            )
+            analysis_downsample = 1
+        else:
+            time = downsampled_time
+            pressure = downsampled_pressure
+            interval *= analysis_downsample
+            fs = 1.0 / interval if interval > 0 else fs / analysis_downsample
+            print(
+                "Applying analysis downsampling: "
+                f"using every {analysis_downsample}th sample (effective fs {fs:.3f} Hz)."
+            )
+
     config = ArtifactConfig(
         systolic_mad_multiplier=args.systolic_mad_multiplier,
         diastolic_mad_multiplier=args.diastolic_mad_multiplier,
@@ -2819,10 +3342,25 @@ def main(argv: Sequence[str]) -> int:
         min_prominence=args.min_prominence,
         prominence_noise_factor=args.prominence_factor,
         max_missing_gap=args.max_gap,
+        scipy_mad_multiplier=args.scipy_mad_multiplier,
+        abs_sys_difference_artifact=args.scipy_abs_sys_diff,
+        abs_dia_difference_artifact=args.scipy_abs_dia_diff,
+        max_rr_artifact=args.scipy_max_rr,
+        **artifact_options,
     )
 
+    use_rolling_statistics = args.beat_detector != "scipy"
+    apply_scipy_artifact_logic = args.beat_detector == "scipy"
+
     try:
-        beats = derive_beats(time, pressure, fs=fs, config=config)
+        beats = derive_beats(
+            time,
+            pressure,
+            fs=fs,
+            config=config,
+            use_rolling_statistics=use_rolling_statistics,
+            apply_scipy_artifact_logic=apply_scipy_artifact_logic,
+        )
     except Exception as exc:  # pragma: no cover - interactive feedback
         print(f"Beat detection failed: {exc}")
         return 1
@@ -2923,7 +3461,7 @@ def main(argv: Sequence[str]) -> int:
             beats,
             show=show_plot,
             save_path=args.savefig,
-            max_points=None if args.plot_max_points == 0 else args.plot_max_points,
+            downsample_stride=plot_downsample,
         )
 
     return 0
