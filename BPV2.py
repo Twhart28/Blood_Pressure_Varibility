@@ -256,7 +256,7 @@ def plot_selected_columns(file_path: Path, selection: ImportSelection) -> None:
     time_series = df.iloc[:, selection.time_column - 1]
     pressure_series = df.iloc[:, selection.pressure_column - 1]
 
-plt.figure(figsize=(10, 4))
+    plt.figure(figsize=(10, 4))
     plt.plot(time_series, pressure_series, marker="o", linestyle="-", linewidth=1)
     plt.title("Raw pressure trace")
     plt.xlabel(time_series.name or "Time")
