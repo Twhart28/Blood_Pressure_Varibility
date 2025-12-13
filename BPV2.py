@@ -374,25 +374,42 @@ def plot_selected_columns(file_path: Path, selection: ImportSelection) -> None:
     first_data_idx = selection.first_data_row - 1
     skip_rows = [idx for idx in range(first_data_idx) if idx != header_idx]
 
-    try:
-        df = pd.read_csv(
+    selected_columns = [selection.time_column - 1, selection.pressure_column - 1]
+
+    def _load_dataframe(engine: str, on_bad_lines: str | None = None) -> pd.DataFrame:
+        return pd.read_csv(
             file_path,
             delimiter=selection.separator,
             header=header_idx,
-            usecols=[selection.time_column - 1, selection.pressure_column - 1],
+            usecols=selected_columns,
             skiprows=skip_rows,
-            engine="c",
+            engine=engine,
+            on_bad_lines=on_bad_lines,
         )
+
+    try:
+        try:
+            df = _load_dataframe(engine="c")
+        except pd.errors.ParserError:
+            # Fall back to the Python engine to tolerate ragged rows.
+            df = _load_dataframe(engine="python", on_bad_lines="skip")
     except Exception as exc:
         messagebox.showerror(
             "Import error",
-            "Failed to parse the selected file with the fast C parser.\n"
+            "Failed to parse the selected file.\n"
             f"Details: {exc}",
         )
         return
 
-    time_series = df.iloc[:, selection.time_column - 1]
-    pressure_series = df.iloc[:, selection.pressure_column - 1]
+    if df.shape[1] < 2:
+        messagebox.showerror(
+            "Import error",
+            "Unable to read both selected columns. Please check your selections and try again.",
+        )
+        return
+
+    time_series = df.iloc[:, 0]
+    pressure_series = df.iloc[:, 1]
 
     plt.figure(figsize=(10, 4))
     plt.plot(time_series, pressure_series, marker="o", linestyle="-", linewidth=1)
