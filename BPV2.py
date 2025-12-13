@@ -370,18 +370,26 @@ def _read_raw_lines(path: Path, limit: int = 200) -> list[str]:
 
 
 def plot_selected_columns(file_path: Path, selection: ImportSelection) -> None:
-    def skip_logic(index: int) -> bool:
-        zero_based = index
-        header_idx = selection.header_row - 1
-        first_data_idx = selection.first_data_row - 1
-        return zero_based < first_data_idx and zero_based != header_idx
+    header_idx = selection.header_row - 1
+    first_data_idx = selection.first_data_row - 1
+    skip_rows = [idx for idx in range(first_data_idx) if idx != header_idx]
 
-    df = pd.read_csv(
-        file_path,
-        delimiter=selection.separator,
-        header=selection.header_row - 1,
-        skiprows=lambda x: skip_logic(x),
-    )
+    try:
+        df = pd.read_csv(
+            file_path,
+            delimiter=selection.separator,
+            header=header_idx,
+            usecols=[selection.time_column - 1, selection.pressure_column - 1],
+            skiprows=skip_rows,
+            engine="c",
+        )
+    except Exception as exc:
+        messagebox.showerror(
+            "Import error",
+            "Failed to parse the selected file with the fast C parser.\n"
+            f"Details: {exc}",
+        )
+        return
 
     time_series = df.iloc[:, selection.time_column - 1]
     pressure_series = df.iloc[:, selection.pressure_column - 1]
